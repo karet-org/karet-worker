@@ -1,0 +1,9 @@
+target
+**/target
+.git
+.gitignore
+*.md
+.kiro
+.vscode
+*.log
+.env*

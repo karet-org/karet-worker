@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+
+# Cargo backup
+**/*.rs.bk
+
+# env files
+.env*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# OS
+.DS_Store
+
+# debug
+*.log
