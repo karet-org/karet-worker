@@ -16,9 +16,10 @@ All required to start the worker; it fails fast if any is unset.
 | Variable | Description |
 |----------|-------------|
 | `S3_BUCKET` | S3 bucket name |
-| `S3_ENDPOINT` | S3 endpoint URL (e.g. `http://rustfs:9000`) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | S3 credentials |
-| `PORT` | HTTP server port (default `8080`) |
+| `AWS_ENDPOINT_URL` | S3 endpoint URL (e.g. `http://rustfs:9000` for local dev, `https://s3.<region>.amazonaws.com` for real AWS). |
+| `PORT` | Optional HTTP server port (default `8080`). |
+| `POLARS_MAX_THREADS` | Optional cap on Polars thread pool size. |
 
 ## HTTP API
 

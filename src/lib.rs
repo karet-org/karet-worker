@@ -19,10 +19,10 @@ pub mod testgen;
 /// Env vars the worker cannot start without.
 pub const REQUIRED_ENV_VARS: &[&str] = &[
     "S3_BUCKET",
-    "S3_ENDPOINT",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_REGION",
+    "AWS_ENDPOINT_URL",
 ];
 
 /// Assert every env var in `names` is set to a non-empty value.
