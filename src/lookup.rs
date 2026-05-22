@@ -434,7 +434,7 @@ mod tests {
     fn child_catch_all_does_not_shadow_parent_rows() {
         // Child has a catch-all and one row; parent has a row the child
         // doesn't know about. When we query the parent with input the
-        // child doesn't match, the parent's row must still win —
+        // child doesn't match, the parent's row must still win --
         // otherwise a single child catch-all would blackhole every
         // parent input.
         let child = LookupMapping {

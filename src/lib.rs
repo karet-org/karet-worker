@@ -1,4 +1,4 @@
-//! `karet-worker` — data pipeline worker for the Karet analytics platform.
+//! `karet-worker` -- data pipeline worker for the Karet analytics platform.
 //!
 //! Reads `Pipeline_Config` from S3, ingests CSVs with Polars, evaluates
 //! AST-JSON mapping expressions, and writes partitioned Parquet to S3.
@@ -46,7 +46,7 @@ pub fn require_env_vars(names: &[&str]) -> Result<(), String> {
     }
 }
 
-/// Binary entry point — builds the HTTP router and serves it on `PORT`.
+/// Binary entry point -- builds the HTTP router and serves it on `PORT`.
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("starting karet-worker");
 

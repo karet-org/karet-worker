@@ -17,7 +17,7 @@ use crate::lookup::LookupMatcher;
 /// `headers`. Otherwise returns `Err(missing)` where `missing` lists the
 /// schema column names not found in `headers`, in schema declaration order.
 ///
-/// Extra columns present in `headers` but not in `schema` are not an error —
+/// Extra columns present in `headers` but not in `schema` are not an error --
 /// they are ignored by the caller.
 pub fn validate_csv_headers(
     headers: &[String],
@@ -59,7 +59,7 @@ pub fn project_schema_columns(
 /// Resolve the [`SourceContainer`] whose `path_prefix` is a prefix of `key`.
 ///
 /// Walks `cfg.source_containers` in declaration order and returns the first
-/// match. Returns [`PipelineError::UnknownSourceContainer`] if none match —
+/// match. Returns [`PipelineError::UnknownSourceContainer`] if none match --
 /// we refuse to guess a schema for an unknown key.
 fn resolve_source_container<'a>(
     key: &str,
@@ -151,7 +151,7 @@ pub fn ingest_file(
 /// Ingest many CSV files through their respective mappings and return the
 /// union of their rows as a single [`LazyFrame`].
 ///
-/// Per-file failures are logged and skipped — a single malformed or
+/// Per-file failures are logged and skipped -- a single malformed or
 /// schema-violating CSV must not abort the whole job. If **every** file
 /// fails we return [`PipelineError::NoFilesSucceeded`].
 pub fn ingest_many(
@@ -193,7 +193,7 @@ pub struct PartitionOutput {
 /// Partition a [`DataFrame`] by `(year, month)` of a date-typed column.
 ///
 /// Returns one `((year, month), sub_df)` entry per distinct calendar month
-/// present in `partition_col`. Order is unspecified — callers that need
+/// present in `partition_col`. Order is unspecified -- callers that need
 /// stable ordering should sort by the key themselves.
 pub fn partition_by_month(
     df: &DataFrame,
@@ -215,7 +215,7 @@ pub fn partition_by_month(
 
     let mut out: Vec<((i32, u32), DataFrame)> = Vec::with_capacity(partitions.height());
     for i in 0..partitions.height() {
-        // Skip null partition-key values — a null date can't be assigned
+        // Skip null partition-key values -- a null date can't be assigned
         // to a `(year, month)` partition.
         let (Some(year), Some(month)) = (years.get(i), months.get(i)) else {
             continue;
@@ -320,7 +320,7 @@ pub fn produce_partitions(
 /// Abstraction over the partition uploader.
 ///
 /// The worker's real S3 client implements this trait; tests provide a
-/// mock. The interface is synchronous — pulling in `async_trait` solely
+/// mock. The interface is synchronous -- pulling in `async_trait` solely
 /// for test doubles would be premature.
 ///
 /// The `bytes` slice is borrowed so callers can pass a reference into a
@@ -409,7 +409,7 @@ mod tests {
     ///
     /// Broken out so the two call sites (with-extras and without-extras) use
     /// identical machinery; this keeps the property test's equality check
-    /// honest — any projection difference is attributable to
+    /// honest -- any projection difference is attributable to
     /// `project_schema_columns`, not to how we built the inputs.
     fn str_column(name: &str, val: &str) -> Column {
         Column::new(name.into(), &[val])
@@ -421,7 +421,7 @@ mod tests {
         // Given a DataFrame whose columns are `schema_names ∪ extras`, projecting
         // it through the schema yields the same DataFrame as projecting a
         // DataFrame built from `schema_names` alone. In other words, extras are
-        // invisible to the downstream evaluator — which is how 
+        // invisible to the downstream evaluator -- which is how 
         // manifests at this layer of the pipeline.
         #[test]
         fn project_schema_columns_ignores_extras(
@@ -745,7 +745,7 @@ mod tests {
                 .collect();
 
             // Single-file path: call ingest_file per input and append rows
-            // into a single Vec — this is the explicit multiset-union.
+            // into a single Vec -- this is the explicit multiset-union.
             let mut single_file_sum: Vec<String> = Vec::new();
             for (key, bytes) in &files {
                 let single_df = ingest_file(key, bytes, &cfg, &matchers).unwrap();
@@ -809,7 +809,7 @@ mod tests {
 
     /// Build a mapping targeting `table_id` with the given (optional)
     /// partition configuration. The mapping's columns list is empty because
-    /// these tests operate on DataFrames built by hand — produce_partitions
+    /// these tests operate on DataFrames built by hand -- produce_partitions
     /// doesn't inspect `columns`.
     fn test_mapping(table_id: &str, partition_by: Option<PartitionBy>) -> Mapping {
         Mapping {
@@ -866,7 +866,7 @@ mod tests {
             !outs[0].bytes.is_empty(),
             "parquet bytes should be non-empty for a non-empty frame"
         );
-        // Parquet magic header (PAR1) — a cheap sanity check that we
+        // Parquet magic header (PAR1) -- a cheap sanity check that we
         // actually produced a parquet file and not some other encoding.
         assert_eq!(&outs[0].bytes[..4], b"PAR1");
     }
@@ -938,7 +938,7 @@ mod tests {
         //
         // We restrict day-of-month to 1..=28 so every `(year, month, day)`
         // triple is a valid calendar date regardless of month length or
-        // leap-year rules — we're testing partition coverage here, not date
+        // leap-year rules -- we're testing partition coverage here, not date
         // parsing.
         #[test]
         fn partitions_cover_input_date_range(
@@ -989,7 +989,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // upload_partitions — partition upload failures identify the bad key.
+    // upload_partitions -- partition upload failures identify the bad key.
     // -----------------------------------------------------------------------
 
     #[test]

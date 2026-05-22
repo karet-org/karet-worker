@@ -222,7 +222,7 @@ fn arb_lookup_row() -> impl Strategy<Value = LookupRow> {
         })
 }
 
-/// Generator for [`LookupMapping`] (flat — no recursive children).
+/// Generator for [`LookupMapping`] (flat -- no recursive children).
 ///
 /// 1..=5 rows, each with 1..=3 patterns. `children` is always empty so this
 /// generator stays bounded; validator tests can construct trees explicitly.
@@ -306,7 +306,7 @@ fn arb_layout_position() -> impl Strategy<Value = LayoutPosition> {
 ///
 /// `version = 1`, 1..=3 source_containers, 0..=3 lookup_mappings,
 /// 1..=3 mappings, 1..=3 analytic_tables. References across collections are
-/// NOT guaranteed to resolve — validator tests build valid configs explicitly.
+/// NOT guaranteed to resolve -- validator tests build valid configs explicitly.
 pub fn arb_pipeline_config() -> impl Strategy<Value = PipelineConfig> {
     (
         vec(arb_source_container(), 1..=3),

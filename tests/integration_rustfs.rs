@@ -59,7 +59,7 @@ const CONFIG_KEY: &str = "config/pipeline.json";
 /// uppercases the description and passes date/amount through, and one
 /// analytic table (`transactions`) partitioned by month on `date`.
 ///
-/// Deliberately narrow — we want to prove the S3 <-> worker seam, not
+/// Deliberately narrow -- we want to prove the S3 <-> worker seam, not
 /// re-test every AST node. The full AST/evaluator behaviour is covered by
 /// unit and property tests elsewhere.
 const PIPELINE_CONFIG: &str = r#"{
@@ -157,7 +157,7 @@ fn seed_csvs() -> Vec<(&'static str, &'static str)> {
 ///
 /// The `PartitionUploader` trait is synchronous (see `pipeline.rs`), so we
 /// hold a reference to a Tokio runtime handle and `block_on` each `put_object`
-/// call. For a test this is fine — we're uploading a handful of tiny
+/// call. For a test this is fine -- we're uploading a handful of tiny
 /// Parquet files and already running inside a multi-threaded runtime, so
 /// the `block_on` only blocks the caller's worker, not the whole runtime.
 struct S3Uploader {
@@ -232,7 +232,7 @@ async fn get_bytes(client: &Client, bucket: &str, key: &str) -> Vec<u8> {
         .to_vec()
 }
 
-/// List every object key under `prefix` in `bucket`. Handles pagination —
+/// List every object key under `prefix` in `bucket`. Handles pagination --
 /// `list_objects_v2` returns up to 1000 keys per page, which is more than
 /// enough for this test, but paginating explicitly keeps the helper
 /// correct if someone later expands the seed set.
@@ -379,7 +379,7 @@ async fn worker_reads_raw_csvs_and_writes_partitioned_parquet() {
     let lf = ingest_many(&files, &cfg, &matchers).expect("ingest_many succeeds on seeded CSVs");
     let df = lf.collect().expect("collect ingested frame");
 
-    // Sanity check on row count — 2 + 2 + 1 = 5 rows across the three CSVs.
+    // Sanity check on row count -- 2 + 2 + 1 = 5 rows across the three CSVs.
     assert_eq!(
         df.height(),
         5,

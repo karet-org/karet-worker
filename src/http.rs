@@ -34,12 +34,12 @@ pub fn router(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
-/// `GET /health` — liveness probe.
+/// `GET /health` -- liveness probe.
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// `POST /config/validate` — deserialize the body as a `PipelineConfig`
+/// `POST /config/validate` -- deserialize the body as a `PipelineConfig`
 /// and run [`config::validate`]. Always returns 200; the `ok` field
 /// reflects the result and `errors` lists details.
 async fn post_config_validate(body: String) -> impl IntoResponse {
@@ -75,7 +75,7 @@ struct RunPipelineRequest {
     clean_run: bool,
 }
 
-/// `POST /jobs/run` — execute a pipeline run for the given prefix.
+/// `POST /jobs/run` -- execute a pipeline run for the given prefix.
 /// Reads `<prefix>pipeline.json`, lists raw CSVs, runs the pipeline, writes
 /// Parquet output.
 async fn run_pipeline(
