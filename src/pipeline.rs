@@ -248,18 +248,26 @@ pub fn write_parquet_bytes(df: &mut DataFrame) -> Result<Vec<u8>, PolarsError> {
 }
 
 /// Build the S3 object key for a `(year, month)` partition.
-/// Format: `clean/<analytic_table_id>/year=YYYY/month=MM/data.parquet`.
+/// Format: `clean/<analytic_table_id>/year=YYYY/month=MM/<mapping_id>.parquet`.
 ///
-/// The filename is deterministic so re-running a pipeline overwrites the
-/// previous run's output for the same partition in place.
-pub fn partition_key(analytic_table_id: &str, year: i32, month: u32) -> String {
-    format!("clean/{analytic_table_id}/year={year:04}/month={month:02}/data.parquet")
+/// The mapping id is in the filename so multiple mappings writing to the
+/// same analytic table don't overwrite each other's partitions; re-running
+/// the same mapping still overwrites its own previous output in place.
+pub fn partition_key(
+    analytic_table_id: &str,
+    mapping_id: &str,
+    year: i32,
+    month: u32,
+) -> String {
+    format!(
+        "clean/{analytic_table_id}/year={year:04}/month={month:02}/{mapping_id}.parquet"
+    )
 }
 
 /// Build the S3 object key for an unpartitioned output.
-/// Format: `clean/<analytic_table_id>/data.parquet`.
-fn unpartitioned_key(analytic_table_id: &str) -> String {
-    format!("clean/{analytic_table_id}/data.parquet")
+/// Format: `clean/<analytic_table_id>/<mapping_id>.parquet`.
+fn unpartitioned_key(analytic_table_id: &str, mapping_id: &str) -> String {
+    format!("clean/{analytic_table_id}/{mapping_id}.parquet")
 }
 
 /// Produce one [`PartitionOutput`] per partition of `df` according to the
@@ -286,7 +294,7 @@ pub fn produce_partitions(
             let mut owned = df.clone();
             let bytes = write_parquet_bytes(&mut owned).map_err(|e| PipelineError::polars("<partition>", e))?;
             Ok(vec![PartitionOutput {
-                key: unpartitioned_key(&table.id),
+                key: unpartitioned_key(&table.id, &mapping.id),
                 bytes,
             }])
         }
@@ -300,7 +308,7 @@ pub fn produce_partitions(
                 let bytes = write_parquet_bytes(&mut sub_df)
                     .map_err(|e| PipelineError::polars("<partition>", e))?;
                 out.push(PartitionOutput {
-                    key: partition_key(&table.id, year, month),
+                    key: partition_key(&table.id, &mapping.id, year, month),
                     bytes,
                 });
             }
@@ -905,6 +913,34 @@ mod tests {
             assert!(out.key.ends_with(".parquet"));
             assert_eq!(&out.bytes[..4], b"PAR1");
         }
+    }
+
+    #[test]
+    fn produce_partitions_distinct_keys_per_mapping() {
+        // Two mappings writing the same analytic table at the same (year,
+        // month) must produce different keys, otherwise the second upload
+        // overwrites the first.
+        let df = df_with_dates(&["2024-01-15"]);
+        let table = test_table("transactions");
+
+        let mut visa = test_mapping(
+            "transactions",
+            Some(PartitionBy { column: "d".into(), granularity: "month".into() }),
+        );
+        visa.id = "scotia_visa_mapping".into();
+
+        let mut chq = test_mapping(
+            "transactions",
+            Some(PartitionBy { column: "d".into(), granularity: "month".into() }),
+        );
+        chq.id = "scotia_chq_mapping".into();
+
+        let visa_key = produce_partitions(&df, &visa, &table).unwrap()[0].key.clone();
+        let chq_key = produce_partitions(&df, &chq, &table).unwrap()[0].key.clone();
+
+        assert_ne!(visa_key, chq_key);
+        assert!(visa_key.contains("scotia_visa_mapping"));
+        assert!(chq_key.contains("scotia_chq_mapping"));
     }
 
     #[test]
