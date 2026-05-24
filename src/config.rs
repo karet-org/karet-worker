@@ -408,6 +408,12 @@ fn walk_ast(node: &AstNode, visit: &mut impl FnMut(&AstNode)) {
             }
         }
 
+        AstNode::Coalesce { args } => {
+            for arg in args {
+                walk_ast(arg, visit);
+            }
+        }
+
         AstNode::Upper { input }
         | AstNode::Lower { input }
         | AstNode::Trim { input }

@@ -90,6 +90,18 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
             .then(compile(then, ctx)?)
             .otherwise(compile(r#else, ctx)?)),
 
+        // Empty `args` -> NULL literal; otherwise Polars `coalesce`.
+        AstNode::Coalesce { args } => {
+            if args.is_empty() {
+                return Ok(lit(NULL));
+            }
+            let exprs: Vec<Expr> = args
+                .iter()
+                .map(|a| compile(a, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(coalesce(&exprs))
+        }
+
         // --- Cast ---
         AstNode::Cast { input, to } => {
             let dtype = match to {
@@ -180,6 +192,74 @@ mod tests {
 
         assert!(dates.phys.get(0).is_some(), "valid date should parse");
         assert!(dates.phys.get(1).is_none(), "malformed date should be null");
+    }
+
+    // Two-row coalesce: `[("HIT", _), (null, "FB")]` -> `["HIT", "FB"]`.
+    #[test]
+    fn coalesce_returns_first_non_null() {
+        let df = DataFrame::new(
+            2,
+            vec![
+                Column::new("a".into(), &[Some("HIT"), None]),
+                Column::new("b".into(), &["FALLBACK", "FALLBACK"]),
+            ],
+        )
+        .unwrap();
+
+        let ast = AstNode::Coalesce {
+            args: vec![
+                AstNode::Col { name: "a".into() },
+                AstNode::Col { name: "b".into() },
+            ],
+        };
+        let registry = HashMap::new();
+        let expr = compile(&ast, &CompileCtx::new(&registry)).unwrap();
+
+        let out = df.lazy().select([expr.alias("v")]).collect().unwrap();
+        let series = out.column("v").unwrap().as_materialized_series();
+        let s = series.str().unwrap();
+        assert_eq!(s.get(0), Some("HIT"));
+        assert_eq!(s.get(1), Some("FALLBACK"));
+    }
+
+    #[test]
+    fn coalesce_all_null_returns_null() {
+        let df = DataFrame::new(
+            1,
+            vec![Column::new("a".into(), &[None::<&str>])],
+        )
+        .unwrap();
+
+        let ast = AstNode::Coalesce {
+            args: vec![
+                AstNode::Col { name: "a".into() },
+                AstNode::Null,
+            ],
+        };
+        let registry = HashMap::new();
+        let expr = compile(&ast, &CompileCtx::new(&registry)).unwrap();
+
+        let out = df.lazy().select([expr.alias("v")]).collect().unwrap();
+        let series = out.column("v").unwrap().as_materialized_series();
+        let s = series.str().unwrap();
+        assert_eq!(s.get(0), None);
+    }
+
+    #[test]
+    fn coalesce_empty_args_is_null() {
+        let df = DataFrame::new(
+            1,
+            vec![Column::new("a".into(), &["irrelevant"])],
+        )
+        .unwrap();
+
+        let ast = AstNode::Coalesce { args: vec![] };
+        let registry = HashMap::new();
+        let expr = compile(&ast, &CompileCtx::new(&registry)).unwrap();
+
+        let out = df.lazy().select([expr.alias("v")]).collect().unwrap();
+        let series = out.column("v").unwrap().as_materialized_series();
+        assert!(series.is_null().get(0).unwrap_or(false));
     }
 
     fn arb_column_name() -> impl Strategy<Value = String> {

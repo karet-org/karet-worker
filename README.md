@@ -3,8 +3,9 @@
 [![Publish Docker image](https://github.com/karet-org/karet-worker/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/karet-org/karet-worker/actions/workflows/docker-publish.yml)
 
 Rust/Axum data pipeline worker for the Karet analytics platform. Ingests
-CSVs from S3, evaluates AST-JSON mapping expressions (including keyword
-lookups), and writes partitioned Parquet output back to S3.
+CSVs from S3, evaluates AST-JSON mapping expressions (parse_date, cast,
+upper/lower/trim, arithmetic, comparisons, `if`, `coalesce`, keyword
+lookups, etc.), and writes partitioned Parquet output back to S3.
 
 See the top-level `docker-compose.yaml` for the full stack (rustfs +
 worker + web).

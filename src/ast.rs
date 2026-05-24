@@ -63,6 +63,10 @@ pub enum AstNode {
         then: Box<AstNode>,
         r#else: Box<AstNode>,
     },
+    /// First non-null `args[i]`; `null` for empty `args`. Pairs well
+    /// with `lookup_ref` (which yields null on a miss): e.g.
+    /// `coalesce(lookup_ref("merchants", desc), desc)`.
+    Coalesce { args: Vec<AstNode> },
 
     // --- Date and lookup ---
     /// Parse a string column into a date using a strftime format.

@@ -169,6 +169,8 @@ pub fn arb_ast_node() -> impl Strategy<Value = AstNode> {
                         r#else: Box::new(r#else),
                     }
                 ),
+                vec(inner.clone(), 0..5)
+                    .prop_map(|args| AstNode::Coalesce { args }),
                 // Date and lookup
                 (inner.clone(), "[%A-Za-z0-9_/-]{1,10}").prop_map(|(input, format)| {
                     AstNode::ParseDate {
