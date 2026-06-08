@@ -13,7 +13,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends mold clang && \
     rm -rf /var/lib/apt/lists/* && \
     cargo install cargo-chef --locked --version 0.1.68
-# Tell cargo to link with mold via clang. ~30–60s off the final link.
+# Tell cargo to link with mold via clang. ~30-60s off the final link.
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang
@@ -28,7 +28,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ---------- Stage 2: build deps against the recipe ----------
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-# Cook the recipe — this layer is cached until Cargo.lock or a dep feature
+# Cook the recipe. This layer is cached until Cargo.lock or a dep feature
 # changes. Everything heavy (polars, aws-sdk-s3) gets built here exactly
 # once per dep-graph change.
 RUN cargo chef cook --release --recipe-path recipe.json

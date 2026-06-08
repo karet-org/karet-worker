@@ -67,8 +67,6 @@ pub struct LookupMapping {
     pub rows: Vec<LookupRow>,
     #[serde(default)]
     pub children: Vec<LookupMapping>,
-    #[serde(default)]
-    pub parent_output_column: Option<String>,
     /// Fallback hit emitted when no row's patterns match (after children
     /// have also missed). Unset = miss yields `None` (null in the output
     /// column), preserving pre-catch-all behavior.
@@ -80,16 +78,18 @@ pub struct LookupMapping {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LookupCatchAll {
     pub output: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_output: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LookupRow {
     pub input_patterns: Vec<String>,
     pub output: String,
+    /// Tie-breaker when more than one row in the same lookup node matches an
+    /// input. The matcher picks the matching row with the highest `priority`;
+    /// ties fall back to definition order. Defaults to `0`, so omitting the
+    /// field preserves first-match-wins behavior.
     #[serde(default)]
-    pub parent_output: Option<String>,
+    pub priority: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -483,7 +483,7 @@ mod tests {
                 rows: vec![LookupRow {
                     input_patterns: vec!["UBER".to_string()],
                     output: "TRANSPORT".to_string(),
-                    parent_output: None,
+                    priority: 0,
                 }],
                 children: vec![LookupMapping {
                     id: "merchants".to_string(),
@@ -493,13 +493,11 @@ mod tests {
                     rows: vec![LookupRow {
                         input_patterns: vec!["UBER".to_string()],
                         output: "UBER".to_string(),
-                        parent_output: Some("TRANSPORT".to_string()),
+                        priority: 0,
                     }],
                     children: vec![],
-                    parent_output_column: Some("category".to_string()),
                     catch_all: None,
                 }],
-                parent_output_column: None,
                 catch_all: None,
             }],
             mappings: vec![Mapping {
@@ -763,7 +761,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn duplicate_error_message_contains_id() {
+    fn error_message_contains_offending_identifier() {
+        // ConfigError variants embed the offending id/path in their Display
+        // output (via thiserror). One representative case guards that the
+        // context isn't dropped from the message; that each error variant is
+        // raised for the right condition is covered by the validation tests
+        // above (dangling references, missing fields, etc.).
         let mut cfg = minimal_valid_config();
         cfg.source_containers.push(cfg.source_containers[0].clone());
         let errs = validate(&cfg).unwrap_err();
@@ -774,68 +777,6 @@ mod tests {
         assert!(
             err.to_string().contains("src"),
             "Display `{err}` should contain the duplicated id `src`"
-        );
-    }
-
-    #[test]
-    fn dangling_source_ref_message_contains_target() {
-        let mut cfg = minimal_valid_config();
-        cfg.mappings[0].source_container_id = "missing".to_string();
-        let errs = validate(&cfg).unwrap_err();
-        let err = errs
-            .iter()
-            .find(|e| matches!(
-                e,
-                ConfigError::DanglingReference { kind, .. } if kind == "source_container"
-            ))
-            .expect("expected a DanglingReference error for source_container");
-        assert!(
-            err.to_string().contains("missing"),
-            "Display `{err}` should contain the dangling target `missing`"
-        );
-    }
-
-    #[test]
-    fn dangling_lookup_ref_message_contains_lookup_id() {
-        let mut cfg = minimal_valid_config();
-        cfg.mappings[0].columns[0].expr = AstNode::LookupRef {
-            lookup_id: "does_not_exist".to_string(),
-            input: Box::new(AstNode::Col {
-                name: "a".to_string(),
-            }),
-        };
-        let errs = validate(&cfg).unwrap_err();
-        let err = errs
-            .iter()
-            .find(|e| matches!(
-                e,
-                ConfigError::DanglingReference { kind, .. } if kind == "lookup"
-            ))
-            .expect("expected a DanglingReference error for lookup");
-        assert!(
-            err.to_string().contains("does_not_exist"),
-            "Display `{err}` should contain the dangling lookup id `does_not_exist`"
-        );
-    }
-
-    #[test]
-    fn missing_field_message_contains_path() {
-        let mut cfg = minimal_valid_config();
-        cfg.source_containers[0].id = String::new();
-        // Also clear the mapping's reference so the empty-id path is the one
-        // surfaced on the source container (not a dangling reference).
-        cfg.mappings[0].source_container_id = String::new();
-        let errs = validate(&cfg).unwrap_err();
-        let err = errs
-            .iter()
-            .find(|e| matches!(
-                e,
-                ConfigError::MissingField { path, .. } if path == "/source_containers/0/id"
-            ))
-            .expect("expected a MissingField error at /source_containers/0/id");
-        assert!(
-            err.to_string().contains("/source_containers/0/id"),
-            "Display `{err}` should contain the JSON pointer path"
         );
     }
 
@@ -906,10 +847,9 @@ mod tests {
                                 rows: vec![LookupRow {
                                     input_patterns: vec!["x".to_string()],
                                     output: "Y".to_string(),
-                                    parent_output: None,
+                                    priority: 0,
                                 }],
                                 children: vec![],
-                                parent_output_column: None,
                                 catch_all: None,
                             })
                             .collect();

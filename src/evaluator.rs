@@ -152,7 +152,7 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
                     let result: StringChunked = column
                         .str()?
                         .iter()
-                        .map(|s_opt| s_opt.and_then(|s| matcher.match_first(s).map(|h| h.output)))
+                        .map(|s_opt| s_opt.and_then(|s| matcher.match_first(s)))
                         .collect();
                     Ok(result.into_column())
                 },
@@ -320,7 +320,7 @@ mod tests {
         // `LookupRef { lookup_id: "l", input: Col { name: "x" } }` against a
         // registry built from a randomly generated flat `LookupMapping`, and
         // collecting the result must yield the same scalar as calling
-        // `LookupMatcher::from_config(&cfg).match_first(&input).map(|h| h.output)`
+        // `LookupMatcher::from_config(&cfg).match_first(&input)`
         // directly. This pins down the contract that the Polars `map` wiring
         // in the `LookupRef` compile arm is a faithful lift of the matcher.
         //
@@ -337,7 +337,7 @@ mod tests {
                 crate::config::LookupRow {
                     input_patterns: pats.clone(),
                     output: out.clone(),
-                    parent_output: None,
+                    priority: 0,
                 }
             }).collect();
 
@@ -348,7 +348,6 @@ mod tests {
                 case_insensitive: Some(case_insensitive),
                 rows: cfg_rows,
                 children: vec![],
-                parent_output_column: None,
                 catch_all: None,
             };
 
@@ -372,7 +371,7 @@ mod tests {
             let s = series.str().unwrap();
             let got: Option<String> = s.get(0).map(|v| v.to_string());
 
-            let expected: Option<String> = direct_matcher.match_first(&input).map(|h| h.output);
+            let expected: Option<String> = direct_matcher.match_first(&input);
 
             prop_assert_eq!(got, expected);
         }

@@ -7,8 +7,8 @@ CSVs from S3, evaluates AST-JSON mapping expressions (parse_date, cast,
 upper/lower/trim, arithmetic, comparisons, `if`, `coalesce`, keyword
 lookups, etc.), and writes partitioned Parquet output back to S3.
 
-See the top-level `docker-compose.yaml` for the full stack (rustfs +
-worker + web).
+See the `compose.yml` in the [`karet`](https://github.com/karet-org/karet)
+repo for the full stack (rustfs + worker + web).
 
 ## Environment variables
 

@@ -8,12 +8,6 @@ use std::sync::Arc;
 
 use crate::config::LookupMapping;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LookupHit {
-    pub output: String,
-    pub parent_output: Option<String>,
-}
-
 /// Precompiled lookup table; scan order follows definition order.
 pub struct LookupMatcher {
     rows: Vec<CompiledRow>,
@@ -22,13 +16,13 @@ pub struct LookupMatcher {
     /// Fallback emitted by [`match_first`] when the child+row scan finds
     /// nothing. `None` preserves the historical behavior: a miss maps to
     /// `None` (and null in the output column).
-    catch_all: Option<LookupHit>,
+    catch_all: Option<String>,
 }
 
 struct CompiledRow {
     patterns: Vec<String>,
     output: String,
-    parent_output: Option<String>,
+    priority: i64,
 }
 
 impl LookupMatcher {
@@ -50,14 +44,11 @@ impl LookupMatcher {
                     })
                     .collect(),
                 output: row.output.clone(),
-                parent_output: row.parent_output.clone(),
+                priority: row.priority,
             })
             .collect();
         let children = cfg.children.iter().map(LookupMatcher::from_config).collect();
-        let catch_all = cfg.catch_all.as_ref().map(|ca| LookupHit {
-            output: ca.output.clone(),
-            parent_output: ca.parent_output.clone(),
-        });
+        let catch_all = cfg.catch_all.as_ref().map(|ca| ca.output.clone());
         Self {
             rows,
             case_insensitive,
@@ -66,10 +57,10 @@ impl LookupMatcher {
         }
     }
 
-    /// Return the first matching row's output/parent_output, consulting
-    /// children before our own rows. Falls back to the matcher's
-    /// [`Self::catch_all`] when nothing matches.
-    pub fn match_first(&self, input: &str) -> Option<LookupHit> {
+    /// Return the first matching row's output, consulting children before
+    /// our own rows. Falls back to the matcher's [`Self::catch_all`] when
+    /// nothing matches.
+    pub fn match_first(&self, input: &str) -> Option<String> {
         if let Some(hit) = self.scan(input) {
             return Some(hit);
         }
@@ -80,7 +71,7 @@ impl LookupMatcher {
     /// recursively for child matchers so a child's catch-all only fires
     /// when the user queried the child directly (by dotted lookup id),
     /// not while the parent is walking its children for row matches.
-    fn scan(&self, input: &str) -> Option<LookupHit> {
+    fn scan(&self, input: &str) -> Option<String> {
         for child in &self.children {
             if let Some(hit) = child.scan(input) {
                 return Some(hit);
@@ -95,15 +86,20 @@ impl LookupMatcher {
             input
         };
 
+        // Among our own rows, pick the matching row with the highest
+        // `priority`. Ties resolve to definition order (the first row at the
+        // winning priority wins), so a config with all-equal priorities keeps
+        // the historical first-match-wins behavior.
+        let mut best: Option<&CompiledRow> = None;
         for row in &self.rows {
             if row.patterns.iter().any(|p| haystack_ref.contains(p.as_str())) {
-                return Some(LookupHit {
-                    output: row.output.clone(),
-                    parent_output: row.parent_output.clone(),
-                });
+                match best {
+                    Some(current) if current.priority >= row.priority => {}
+                    _ => best = Some(row),
+                }
             }
         }
-        None
+        best.map(|row| row.output.clone())
     }
 }
 
@@ -145,7 +141,6 @@ mod tests {
             case_insensitive: Some(case_insensitive),
             rows,
             children: vec![],
-            parent_output_column: None,
             catch_all: None,
         }
     }
@@ -154,7 +149,15 @@ mod tests {
         LookupRow {
             input_patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
             output: output.to_string(),
-            parent_output: None,
+            priority: 0,
+        }
+    }
+
+    fn row_p(patterns: &[&str], output: &str, priority: i64) -> LookupRow {
+        LookupRow {
+            input_patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+            output: output.to_string(),
+            priority,
         }
     }
 
@@ -162,19 +165,10 @@ mod tests {
     fn matches_first_in_definition_order() {
         let cfg = mapping(
             false,
-            vec![
-                row(&["FOO"], "FIRST"),
-                row(&["FOO", "BAR"], "SECOND"),
-            ],
+            vec![row(&["FOO"], "FIRST"), row(&["FOO", "BAR"], "SECOND")],
         );
         let m = LookupMatcher::from_config(&cfg);
-        assert_eq!(
-            m.match_first("FOO BAR"),
-            Some(LookupHit {
-                output: "FIRST".into(),
-                parent_output: None,
-            })
-        );
+        assert_eq!(m.match_first("FOO BAR"), Some("FIRST".to_string()));
     }
 
     #[test]
@@ -183,10 +177,7 @@ mod tests {
         let m = LookupMatcher::from_config(&cfg);
         assert_eq!(
             m.match_first("visit STARBUCKS today"),
-            Some(LookupHit {
-                output: "FOOD".into(),
-                parent_output: None,
-            })
+            Some("FOOD".to_string())
         );
     }
 
@@ -204,24 +195,62 @@ mod tests {
         assert_eq!(m.match_first("grocery store"), None);
     }
 
+    // -----------------------------------------------------------------------
+    // Priority selection
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn parent_output_is_preserved_on_hit() {
+    fn higher_priority_row_wins_over_earlier_row() {
+        // Regression for the Amazon-payroll bug: SHOPPING (AMAZON) is defined
+        // before INCOME (PAYROLL), but INCOME has the higher priority, so an
+        // "AMAZON PAYROLL" deposit must resolve to INCOME.
         let cfg = mapping(
             true,
-            vec![LookupRow {
-                input_patterns: vec!["uber".into()],
-                output: "UBER".into(),
-                parent_output: Some("TRANSPORT".into()),
-            }],
+            vec![
+                row_p(&["AMAZON"], "SHOPPING", 0),
+                row_p(&["PAYROLL", "DEPOSIT"], "INCOME", 10),
+            ],
         );
         let m = LookupMatcher::from_config(&cfg);
         assert_eq!(
-            m.match_first("UBER TRIP"),
-            Some(LookupHit {
-                output: "UBER".into(),
-                parent_output: Some("TRANSPORT".into()),
-            })
+            m.match_first("AMAZON PAYROLL DEPOSIT"),
+            Some("INCOME".to_string())
         );
+    }
+
+    #[test]
+    fn equal_priority_falls_back_to_definition_order() {
+        let cfg = mapping(
+            true,
+            vec![row_p(&["FOO"], "FIRST", 5), row_p(&["FOO", "BAR"], "SECOND", 5)],
+        );
+        let m = LookupMatcher::from_config(&cfg);
+        assert_eq!(m.match_first("FOO BAR"), Some("FIRST".to_string()));
+    }
+
+    #[test]
+    fn priority_only_compares_matching_rows() {
+        // A high-priority row that doesn't match must not suppress a
+        // lower-priority row that does.
+        let cfg = mapping(
+            true,
+            vec![
+                row_p(&["NETFLIX"], "ENTERTAINMENT", 100),
+                row_p(&["UBER"], "TRANSPORT", 1),
+            ],
+        );
+        let m = LookupMatcher::from_config(&cfg);
+        assert_eq!(m.match_first("TOOK AN UBER"), Some("TRANSPORT".to_string()));
+    }
+
+    #[test]
+    fn negative_priority_is_deprioritized() {
+        let cfg = mapping(
+            true,
+            vec![row_p(&["AMAZON"], "SHOPPING", -1), row_p(&["AMAZON"], "DEFAULT", 0)],
+        );
+        let m = LookupMatcher::from_config(&cfg);
+        assert_eq!(m.match_first("AMAZON.COM"), Some("DEFAULT".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -240,16 +269,7 @@ mod tests {
             case_insensitive: Some(case_insensitive),
             rows,
             children,
-            parent_output_column: None,
             catch_all: None,
-        }
-    }
-
-    fn child_row(patterns: &[&str], output: &str, parent_output: &str) -> LookupRow {
-        LookupRow {
-            input_patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
-            output: output.to_string(),
-            parent_output: Some(parent_output.to_string()),
         }
     }
 
@@ -257,99 +277,35 @@ mod tests {
     fn child_match_wins_over_parent() {
         // Parent would bucket anything mentioning FOOD; child recognizes the
         // more specific STARBUCKS merchant and should take precedence.
-        let child = mapping_with_children(
-            true,
-            vec![child_row(&["STARBUCKS"], "STARBUCKS", "FOOD")],
-            vec![],
-        );
-        let parent = mapping_with_children(
-            true,
-            vec![row(&["FOOD"], "FOOD")],
-            vec![child],
-        );
+        let child = mapping_with_children(true, vec![row(&["STARBUCKS"], "STARBUCKS")], vec![]);
+        let parent = mapping_with_children(true, vec![row(&["FOOD"], "FOOD")], vec![child]);
         let m = LookupMatcher::from_config(&parent);
-        assert_eq!(
-            m.match_first("MY STARBUCKS"),
-            Some(LookupHit {
-                output: "STARBUCKS".into(),
-                parent_output: Some("FOOD".into()),
-            })
-        );
+        assert_eq!(m.match_first("MY STARBUCKS"), Some("STARBUCKS".to_string()));
     }
 
     #[test]
     fn parent_match_when_no_child_matches() {
         // Child only knows TAXI; input mentions UBER, which only the parent's
-        // own rows catch. Parent rows have no parent_output so result is None.
-        let child = mapping_with_children(
-            true,
-            vec![child_row(&["TAXI"], "TAXI", "TRANSPORT")],
-            vec![],
-        );
-        let parent = mapping_with_children(
-            true,
-            vec![row(&["UBER"], "TRANSPORT")],
-            vec![child],
-        );
+        // own rows catch.
+        let child = mapping_with_children(true, vec![row(&["TAXI"], "TAXI")], vec![]);
+        let parent = mapping_with_children(true, vec![row(&["UBER"], "TRANSPORT")], vec![child]);
         let m = LookupMatcher::from_config(&parent);
-        assert_eq!(
-            m.match_first("UBER RIDE"),
-            Some(LookupHit {
-                output: "TRANSPORT".into(),
-                parent_output: None,
-            })
-        );
+        assert_eq!(m.match_first("UBER RIDE"), Some("TRANSPORT".to_string()));
     }
 
     #[test]
     fn nested_grandchild_match() {
         // parent -> child -> grandchild. Input matches only the grandchild;
         // recursion must walk all the way down.
-        let grandchild = mapping_with_children(
-            true,
-            vec![child_row(&["BLUE_BOTTLE"], "BLUE_BOTTLE", "COFFEE")],
-            vec![],
-        );
-        let child = mapping_with_children(
-            true,
-            vec![child_row(&["STARBUCKS"], "STARBUCKS", "COFFEE")],
-            vec![grandchild],
-        );
-        let parent = mapping_with_children(
-            true,
-            vec![row(&["FOOD"], "FOOD")],
-            vec![child],
-        );
+        let grandchild =
+            mapping_with_children(true, vec![row(&["BLUE_BOTTLE"], "BLUE_BOTTLE")], vec![]);
+        let child =
+            mapping_with_children(true, vec![row(&["STARBUCKS"], "STARBUCKS")], vec![grandchild]);
+        let parent = mapping_with_children(true, vec![row(&["FOOD"], "FOOD")], vec![child]);
         let m = LookupMatcher::from_config(&parent);
         assert_eq!(
             m.match_first("BLUE_BOTTLE COFFEE"),
-            Some(LookupHit {
-                output: "BLUE_BOTTLE".into(),
-                parent_output: Some("COFFEE".into()),
-            })
-        );
-    }
-
-    #[test]
-    fn children_iterated_before_parent() {
-        // Both parent and child would match the same input; child must win.
-        let child = mapping_with_children(
-            true,
-            vec![child_row(&["UBER"], "UBER", "TRANSPORT")],
-            vec![],
-        );
-        let parent = mapping_with_children(
-            true,
-            vec![row(&["UBER"], "GENERIC")],
-            vec![child],
-        );
-        let m = LookupMatcher::from_config(&parent);
-        assert_eq!(
-            m.match_first("TOOK AN UBER"),
-            Some(LookupHit {
-                output: "UBER".into(),
-                parent_output: Some("TRANSPORT".into()),
-            })
+            Some("BLUE_BOTTLE".to_string())
         );
     }
 
@@ -368,7 +324,6 @@ mod tests {
             case_insensitive: Some(true),
             rows,
             children: vec![],
-            parent_output_column: None,
             catch_all,
         }
     }
@@ -379,17 +334,10 @@ mod tests {
             vec![row(&["UBER"], "TRANSPORT")],
             Some(crate::config::LookupCatchAll {
                 output: "OTHER".into(),
-                parent_output: None,
             }),
         );
         let m = LookupMatcher::from_config(&cfg);
-        assert_eq!(
-            m.match_first("grocery store"),
-            Some(LookupHit {
-                output: "OTHER".into(),
-                parent_output: None,
-            }),
-        );
+        assert_eq!(m.match_first("grocery store"), Some("OTHER".to_string()));
     }
 
     #[test]
@@ -398,36 +346,10 @@ mod tests {
             vec![row(&["UBER"], "TRANSPORT")],
             Some(crate::config::LookupCatchAll {
                 output: "OTHER".into(),
-                parent_output: None,
             }),
         );
         let m = LookupMatcher::from_config(&cfg);
-        assert_eq!(
-            m.match_first("UBER TRIP"),
-            Some(LookupHit {
-                output: "TRANSPORT".into(),
-                parent_output: None,
-            }),
-        );
-    }
-
-    #[test]
-    fn catch_all_carries_parent_output() {
-        let cfg = mapping_with_catch_all(
-            vec![row(&["UBER"], "TRANSPORT")],
-            Some(crate::config::LookupCatchAll {
-                output: "UNKNOWN_MERCHANT".into(),
-                parent_output: Some("OTHER".into()),
-            }),
-        );
-        let m = LookupMatcher::from_config(&cfg);
-        assert_eq!(
-            m.match_first("grocery store"),
-            Some(LookupHit {
-                output: "UNKNOWN_MERCHANT".into(),
-                parent_output: Some("OTHER".into()),
-            }),
-        );
+        assert_eq!(m.match_first("UBER TRIP"), Some("TRANSPORT".to_string()));
     }
 
     #[test]
@@ -442,12 +364,10 @@ mod tests {
             name: None,
             match_: Some("keyword_substring".into()),
             case_insensitive: Some(true),
-            rows: vec![child_row(&["TAXI"], "TAXI", "TRANSPORT")],
+            rows: vec![row(&["TAXI"], "TAXI")],
             children: vec![],
-            parent_output_column: None,
             catch_all: Some(crate::config::LookupCatchAll {
                 output: "CHILD_OTHER".into(),
-                parent_output: None,
             }),
         };
         let parent = LookupMapping {
@@ -457,27 +377,17 @@ mod tests {
             case_insensitive: Some(true),
             rows: vec![row(&["UBER"], "TRANSPORT")],
             children: vec![child],
-            parent_output_column: None,
             catch_all: None,
         };
 
         let m = LookupMatcher::from_config(&parent);
         // "UBER RIDE" matches the parent's row, not the child's.
-        assert_eq!(
-            m.match_first("UBER RIDE"),
-            Some(LookupHit {
-                output: "TRANSPORT".into(),
-                parent_output: None,
-            }),
-        );
+        assert_eq!(m.match_first("UBER RIDE"), Some("TRANSPORT".to_string()));
     }
 
     #[test]
     fn no_catch_all_still_returns_none_on_miss() {
-        let cfg = mapping_with_catch_all(
-            vec![row(&["UBER"], "TRANSPORT")],
-            None,
-        );
+        let cfg = mapping_with_catch_all(vec![row(&["UBER"], "TRANSPORT")], None);
         let m = LookupMatcher::from_config(&cfg);
         assert_eq!(m.match_first("grocery store"), None);
     }
@@ -507,7 +417,7 @@ mod tests {
                 .map(|(pats, out)| LookupRow {
                     input_patterns: pats.clone(),
                     output: out.clone(),
-                    parent_output: None,
+                    priority: 0,
                 })
                 .collect();
 
@@ -518,7 +428,6 @@ mod tests {
                 case_insensitive: Some(case_insensitive),
                 rows: cfg_rows,
                 children: vec![],
-                parent_output_column: None,
                 catch_all: None,
             };
 
@@ -533,7 +442,7 @@ mod tests {
             } else {
                 input.clone()
             };
-            let mut expected: Option<LookupHit> = None;
+            let mut expected: Option<String> = None;
             for (pats, out) in &rows {
                 let hit = pats.iter().any(|p| {
                     let p_ref: String = if case_insensitive {
@@ -544,10 +453,7 @@ mod tests {
                     haystack_ref.contains(&p_ref)
                 });
                 if hit {
-                    expected = Some(LookupHit {
-                        output: out.clone(),
-                        parent_output: None,
-                    });
+                    expected = Some(out.clone());
                     break;
                 }
             }
@@ -566,7 +472,7 @@ mod tests {
                 1..=3,
             ),
             child_rows in proptest::collection::vec(
-                (proptest::collection::vec("[a-zA-Z]{1,8}", 1..=3), "[A-Z]{1,8}", "[A-Z]{1,8}"),
+                (proptest::collection::vec("[a-zA-Z]{1,8}", 1..=3), "[A-Z]{1,8}"),
                 1..=3,
             ),
             input in ".{0,30}",
@@ -574,13 +480,13 @@ mod tests {
             let parent_cfg_rows: Vec<LookupRow> = parent_rows.iter().map(|(pats, out)| LookupRow {
                 input_patterns: pats.clone(),
                 output: out.clone(),
-                parent_output: None,
+                priority: 0,
             }).collect();
 
-            let child_cfg_rows: Vec<LookupRow> = child_rows.iter().map(|(pats, out, parent_out)| LookupRow {
+            let child_cfg_rows: Vec<LookupRow> = child_rows.iter().map(|(pats, out)| LookupRow {
                 input_patterns: pats.clone(),
                 output: out.clone(),
-                parent_output: Some(parent_out.clone()),
+                priority: 0,
             }).collect();
 
             let child = LookupMapping {
@@ -590,7 +496,6 @@ mod tests {
                 case_insensitive: Some(case_insensitive),
                 rows: child_cfg_rows,
                 children: vec![],
-                parent_output_column: Some("category".into()),
                 catch_all: None,
             };
 
@@ -601,7 +506,6 @@ mod tests {
                 case_insensitive: Some(case_insensitive),
                 rows: parent_cfg_rows,
                 children: vec![child],
-                parent_output_column: None,
                 catch_all: None,
             };
 
@@ -615,13 +519,10 @@ mod tests {
             };
 
             // Try child rows first, in order.
-            let mut expected: Option<LookupHit> = None;
-            for (pats, out, parent_out) in &child_rows {
+            let mut expected: Option<String> = None;
+            for (pats, out) in &child_rows {
                 if pats.iter().any(|p| haystack.contains(&transform(p))) {
-                    expected = Some(LookupHit {
-                        output: out.clone(),
-                        parent_output: Some(parent_out.clone()),
-                    });
+                    expected = Some(out.clone());
                     break;
                 }
             }
@@ -629,10 +530,7 @@ mod tests {
             if expected.is_none() {
                 for (pats, out) in &parent_rows {
                     if pats.iter().any(|p| haystack.contains(&transform(p))) {
-                        expected = Some(LookupHit {
-                            output: out.clone(),
-                            parent_output: None,
-                        });
+                        expected = Some(out.clone());
                         break;
                     }
                 }

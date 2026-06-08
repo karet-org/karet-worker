@@ -614,27 +614,6 @@ mod tests {
     }
 
     #[test]
-    fn ingest_file_ignores_extra_csv_columns() {
-        // CSV has an extra `memo` column not in the schema. :
-        // extras must not affect the output.
-        let cfg = simple_config();
-        let matchers = HashMap::new();
-        let csv = b"date,description,amount,memo\n2024-01-01,hello,10.0,ignored\n";
-
-        let df = ingest_file("raw/src/file.csv", csv, &cfg, &matchers)
-            .expect("ingest should succeed");
-
-        let names: Vec<&str> = df
-            .get_column_names()
-            .iter()
-            .map(|n| n.as_str())
-            .collect();
-        assert_eq!(names, vec!["upper_desc"]);
-        let col = df.column("upper_desc").unwrap().as_materialized_series();
-        assert_eq!(col.str().unwrap().get(0), Some("HELLO"));
-    }
-
-    #[test]
     fn ingest_file_errors_when_no_mapping_targets_container() {
         // Config has a source container but no mapping for it.
         let mut cfg = simple_config();

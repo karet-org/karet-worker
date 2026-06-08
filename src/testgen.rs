@@ -212,16 +212,13 @@ pub fn arb_source_container() -> impl Strategy<Value = SourceContainer> {
 
 /// Generator for a [`LookupRow`]: 1..=3 input_patterns.
 fn arb_lookup_row() -> impl Strategy<Value = LookupRow> {
-    (
-        vec(arb_name(), 1..=3),
-        arb_name(),
-        any::<Option<String>>().prop_map(|o| o.map(|s| s.chars().take(8).collect::<String>())),
-    )
-        .prop_map(|(input_patterns, output, parent_output)| LookupRow {
+    (vec(arb_name(), 1..=3), arb_name(), -10i64..=10i64).prop_map(
+        |(input_patterns, output, priority)| LookupRow {
             input_patterns,
             output,
-            parent_output,
-        })
+            priority,
+        },
+    )
 }
 
 /// Generator for [`LookupMapping`] (flat -- no recursive children).
@@ -235,17 +232,15 @@ pub fn arb_lookup_mapping() -> impl Strategy<Value = LookupMapping> {
         proptest::option::of(Just("keyword_substring".to_string())),
         any::<Option<bool>>(),
         vec(arb_lookup_row(), 1..=5),
-        proptest::option::of(arb_name()),
     )
         .prop_map(
-            |(id, name, match_, case_insensitive, rows, parent_output_column)| LookupMapping {
+            |(id, name, match_, case_insensitive, rows)| LookupMapping {
                 id,
                 name,
                 match_,
                 case_insensitive,
                 rows,
                 children: Vec::new(),
-                parent_output_column,
                 catch_all: None,
             },
         )
