@@ -82,7 +82,7 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
                 .iter()
                 .map(|a| compile(a, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(concat_str(arg_exprs, sep.as_str(), false))
+            Ok(concat_str(arg_exprs, sep.as_str(), true))
         }
 
         // --- Control flow ---
@@ -260,6 +260,34 @@ mod tests {
         let out = df.lazy().select([expr.alias("v")]).collect().unwrap();
         let series = out.column("v").unwrap().as_materialized_series();
         assert!(series.is_null().get(0).unwrap_or(false));
+    }
+
+    #[test]
+    fn concat_ignores_null_args() {
+        let df = DataFrame::new(
+            2,
+            vec![
+                Column::new("a".into(), &["FROM", "FROM"]),
+                Column::new("b".into(), &[Some("ACCT"), None]),
+            ],
+        )
+        .unwrap();
+
+        let ast = AstNode::Concat {
+            sep: " ".into(),
+            args: vec![
+                AstNode::Col { name: "a".into() },
+                AstNode::Col { name: "b".into() },
+            ],
+        };
+        let registry = HashMap::new();
+        let expr = compile(&ast, &CompileCtx::new(&registry)).unwrap();
+
+        let out = df.lazy().select([expr.alias("v")]).collect().unwrap();
+        let series = out.column("v").unwrap().as_materialized_series();
+        let s = series.str().unwrap();
+        assert_eq!(s.get(0), Some("FROM ACCT"));
+        assert_eq!(s.get(1), Some("FROM"));
     }
 
     fn arb_column_name() -> impl Strategy<Value = String> {
