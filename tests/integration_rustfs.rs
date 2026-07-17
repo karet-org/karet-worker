@@ -3,9 +3,9 @@
 //!
 //! # What this exercises
 //!
-//! - The worker reads CSVs from S3 under `raw/<container_name>/`.
+//! - The worker reads CSVs from S3 under `<container_path_prefix>/`.
 //! - The worker writes Parquet output under
-//!   `clean/<analytic_table_id>/year=YYYY/month=MM/data.parquet`.
+//!   `<analytic_table_id>/year=YYYY/month=MM/<mapping_id>.parquet`.
 //!
 //! # Why it's `#[ignore]` by default
 //!
@@ -25,12 +25,12 @@
 //!    path-style mode.
 //! 3. Create the `karet-data` bucket.
 //! 4. Seed the bucket with a `Pipeline_Config` JSON at `config/pipeline.json`
-//!    and a few CSVs under `raw/visa/`.
+//!    and a few CSVs under `visa/`.
 //! 5. Fetch the CSVs back from S3, pipe them through `ingest_many` +
 //!    `produce_partitions`, then upload the resulting Parquet partitions
 //!    back to S3 via a thin `PartitionUploader` implementation that wraps
 //!    the async SDK.
-//! 6. List the `clean/transactions/` prefix on S3 and assert the expected
+//! 6. List the `transactions/` prefix on S3 and assert the expected
 //!    `year=YYYY/month=MM/*.parquet` partition layout is present.
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
@@ -59,7 +59,7 @@ const CONFIG_KEY: &str = "config/pipeline.json";
 /// uppercases the description and passes date/amount through, and one
 /// analytic table (`transactions`) partitioned by month on `date`.
 ///
-/// Deliberately narrow -- we want to prove the S3 <-> worker seam, not
+/// Deliberately narrow, we want to prove the S3 <-> worker seam, not
 /// re-test every AST node. The full AST/evaluator behaviour is covered by
 /// unit and property tests elsewhere.
 const PIPELINE_CONFIG: &str = r#"{
@@ -68,7 +68,7 @@ const PIPELINE_CONFIG: &str = r#"{
         {
             "id": "visa",
             "name": "Visa Statements",
-            "path_prefix": "raw/visa/",
+            "path_prefix": "visa/",
             "schema": [
                 {"name": "date",        "type": "string"},
                 {"name": "description", "type": "string"},
@@ -110,7 +110,7 @@ const PIPELINE_CONFIG: &str = r#"{
         {
             "id": "transactions",
             "name": "Transactions",
-            "output_prefix": "clean/transactions/",
+            "output_prefix": "transactions/",
             "schema": [
                 {"name": "date",        "type": "date"},
                 {"name": "description", "type": "string"},
@@ -126,17 +126,17 @@ const PIPELINE_CONFIG: &str = r#"{
 /// something non-trivial to check.
 ///
 /// Each tuple is `(s3_key, csv_body)`. Keys live under the container's
-/// `path_prefix` (`raw/visa/`).
+/// `path_prefix` (`visa/`).
 fn seed_csvs() -> Vec<(&'static str, &'static str)> {
     vec![
         (
-            "raw/visa/january.csv",
+            "visa/january.csv",
             "date,description,amount\n\
              2024-01-05,starbucks,7.25\n\
              2024-01-18,uber,12.80\n",
         ),
         (
-            "raw/visa/february.csv",
+            "visa/february.csv",
             "date,description,amount\n\
              2024-02-02,whole foods,45.10\n\
              2024-02-22,netflix,15.99\n",
@@ -146,7 +146,7 @@ fn seed_csvs() -> Vec<(&'static str, &'static str)> {
         // tangentially exercised too, even though this test is scoped
         // to 2.1 + 5.1).
         (
-            "raw/visa/january_extra.csv",
+            "visa/january_extra.csv",
             "date,description,amount\n\
              2024-01-29,blue bottle,5.00\n",
         ),
@@ -157,7 +157,7 @@ fn seed_csvs() -> Vec<(&'static str, &'static str)> {
 ///
 /// The `PartitionUploader` trait is synchronous (see `pipeline.rs`), so we
 /// hold a reference to a Tokio runtime handle and `block_on` each `put_object`
-/// call. For a test this is fine -- we're uploading a handful of tiny
+/// call. For a test this is fine, we're uploading a handful of tiny
 /// Parquet files and already running inside a multi-threaded runtime, so
 /// the `block_on` only blocks the caller's worker, not the whole runtime.
 struct S3Uploader {
@@ -232,7 +232,7 @@ async fn get_bytes(client: &Client, bucket: &str, key: &str) -> Vec<u8> {
         .to_vec()
 }
 
-/// List every object key under `prefix` in `bucket`. Handles pagination --
+/// List every object key under `prefix` in `bucket`. Handles pagination,
 /// `list_objects_v2` returns up to 1000 keys per page, which is more than
 /// enough for this test, but paginating explicitly keeps the helper
 /// correct if someone later expands the seed set.
@@ -310,8 +310,8 @@ async fn worker_reads_raw_csvs_and_writes_partitioned_parquet() {
     // ---- 3. Seed Pipeline_Config + raw CSVs ------------------------------
     //
     // Both live in the same bucket under the prefixes the worker expects
-    // (`config/pipeline.json` and `raw/visa/*.csv`). The config's
-    // `path_prefix` must match `raw/visa/` for ingest_file's prefix-based
+    // (`config/pipeline.json` and `visa/*.csv`). The config's
+    // `path_prefix` must match `visa/` for ingest_file's prefix-based
     // container resolution to work.
     client
         .put_object()
@@ -345,16 +345,15 @@ async fn worker_reads_raw_csvs_and_writes_partitioned_parquet() {
 
     // ---- 5. Fetch raw CSVs from S3 ---------------------------------------
     //
-    // : "THE Worker SHALL read Source_Files (CSV format)
-    // from S3_Store under a path pattern defined in the Source_Container
-    // configuration (e.g., `raw/<container_name>/`)."
+    // The worker reads Source_Files (CSV format) from S3 under a path
+    // pattern defined by the Source_Container's `path_prefix`.
     //
-    // We list every key under `raw/visa/` (the container's `path_prefix`)
+    // We list every key under `visa/` (the container's `path_prefix`)
     // and pull each one into memory. In production the worker will stream
     // each CSV through Polars; for this integration harness the one-bucket
     // read-into-memory shape is enough to prove the seam.
     let container = &cfg.source_containers[0];
-    assert_eq!(container.path_prefix, "raw/visa/", "sanity check");
+    assert_eq!(container.path_prefix, "visa/", "sanity check");
 
     let raw_keys = list_keys(&client, BUCKET, &container.path_prefix).await;
     assert_eq!(
@@ -379,7 +378,7 @@ async fn worker_reads_raw_csvs_and_writes_partitioned_parquet() {
     let lf = ingest_many(&files, &cfg, &matchers).expect("ingest_many succeeds on seeded CSVs");
     let df = lf.collect().expect("collect ingested frame");
 
-    // Sanity check on row count -- 2 + 2 + 1 = 5 rows across the three CSVs.
+    // Sanity check on row count, 2 + 2 + 1 = 5 rows across the three CSVs.
     assert_eq!(
         df.height(),
         5,
@@ -426,17 +425,17 @@ async fn worker_reads_raw_csvs_and_writes_partitioned_parquet() {
 
     // ---- 8. Assert the output partition layout on S3 ---------------------
     //
-    // Pattern: `clean/<analytic_table_id>/year=YYYY/month=MM/<uuid>.parquet`.
+    // Pattern: `<analytic_table_id>/year=YYYY/month=MM/<mapping_id>.parquet`.
     // We assert:
-    //   - Every uploaded key lives under `clean/transactions/`.
+    //   - Every uploaded key lives under `transactions/`.
     //   - Exactly one key exists under `year=2024/month=01/`.
     //   - Exactly one key exists under `year=2024/month=02/`.
     //   - Each key ends with `.parquet` and the blob starts with `PAR1`.
-    let clean_keys = list_keys(&client, BUCKET, "clean/transactions/").await;
+    let clean_keys = list_keys(&client, BUCKET, "transactions/").await;
     assert_eq!(
         clean_keys.len(),
         2,
-        "expected exactly 2 Parquet objects under clean/transactions/ but found {clean_keys:?}",
+        "expected exactly 2 Parquet objects under transactions/ but found {clean_keys:?}",
     );
 
     let has_jan = clean_keys

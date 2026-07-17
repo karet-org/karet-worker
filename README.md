@@ -3,9 +3,10 @@
 [![Publish Docker image](https://github.com/karet-org/karet-worker/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/karet-org/karet-worker/actions/workflows/docker-publish.yml)
 
 Rust/Axum data pipeline worker for the Karet analytics platform. Ingests
-CSVs from S3, evaluates AST-JSON mapping expressions (parse_date, cast,
-upper/lower/trim, arithmetic, comparisons, `if`, `coalesce`, keyword
-lookups, etc.), and writes partitioned Parquet output back to S3.
+source CSVs from S3 (karet-lake bucket), evaluates AST-JSON mapping
+expressions (parse_date, cast, upper/lower/trim, arithmetic, comparisons,
+`if`, `coalesce`, keyword lookups, etc.) with Polars, and writes
+partitioned Parquet output to S3 (karet-warehouse bucket).
 
 See the `compose.yml` in the [`karet`](https://github.com/karet-org/karet)
 repo for the full stack (rustfs + worker + web).
@@ -16,11 +17,12 @@ All required to start the worker; it fails fast if any is unset.
 
 | Variable | Description |
 |----------|-------------|
-| `S3_BUCKET` | S3 bucket name |
+| `S3_BUCKET_PIPELINES` | Bucket for pipeline configs (default `karet-pipelines`). |
+| `S3_BUCKET_LAKE` | Bucket for raw CSV data (default `karet-lake`). |
+| `S3_BUCKET_WAREHOUSE` | Bucket for partitioned Parquet output (default `karet-warehouse`). |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | S3 credentials |
 | `AWS_ENDPOINT_URL` | S3 endpoint URL (e.g. `http://rustfs:9000` for local dev, `https://s3.<region>.amazonaws.com` for real AWS). |
 | `PORT` | Optional HTTP server port (default `8080`). |
-| `POLARS_MAX_THREADS` | Optional cap on Polars thread pool size. |
 
 ## HTTP API
 

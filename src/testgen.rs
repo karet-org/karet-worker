@@ -1,20 +1,14 @@
-//! Shared proptest generators for [`AstNode`] and `Pipeline_Config` values.
+//! Shared proptest generators for [`AstNode`] values.
 //!
 //! Exposed under `#[cfg(any(test, feature = "test-support"))]` so unit tests
 //! in this crate and integration tests (built with `--features test-support`)
 //! can pull the same generators. All generators are intentionally bounded so
 //! shrinking stays fast.
 
-use std::collections::HashMap;
-
 use proptest::collection::vec;
 use proptest::prelude::*;
 
 use crate::ast::{AstNode, CastType};
-use crate::config::{
-    AnalyticTable, ColumnSchema, LayoutPosition, LookupMapping, LookupRow, Mapping, MappingColumn,
-    PartitionBy, PipelineConfig, SourceContainer,
-};
 
 /// ASCII-lowercase identifier: starts with a letter, 1..=8 chars total.
 fn arb_id() -> impl Strategy<Value = String> {
@@ -24,35 +18,6 @@ fn arb_id() -> impl Strategy<Value = String> {
 /// Non-empty ASCII alphanumeric string, 1..=12 chars.
 fn arb_name() -> impl Strategy<Value = String> {
     "[A-Za-z0-9]{1,12}".prop_map(|s| s)
-}
-
-/// Short path prefix like `raw/foo/`.
-fn arb_path_prefix() -> impl Strategy<Value = String> {
-    "[a-z][a-z0-9/_-]{0,15}".prop_map(|s| s)
-}
-
-/// One of the supported logical column types.
-fn arb_column_type() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just("string".to_string()),
-        Just("number".to_string()),
-        Just("int64".to_string()),
-        Just("float64".to_string()),
-        Just("date".to_string()),
-        Just("bool".to_string()),
-    ]
-}
-
-/// A single [`ColumnSchema`] with a short name and a random logical type.
-fn arb_column_schema() -> impl Strategy<Value = ColumnSchema> {
-    (arb_name(), arb_column_type(), any::<Option<bool>>()).prop_map(|(name, type_, nullable)| {
-        ColumnSchema {
-            name,
-            type_,
-            nullable,
-            assertions: None,
-        }
-    })
 }
 
 /// One of the four [`CastType`] targets, uniformly chosen.
@@ -190,142 +155,4 @@ pub fn arb_ast_node() -> impl Strategy<Value = AstNode> {
             ]
         },
     )
-}
-
-/// Generator for [`SourceContainer`].
-///
-/// Non-empty ASCII id/name/path_prefix, schema of 1..=5 columns.
-pub fn arb_source_container() -> impl Strategy<Value = SourceContainer> {
-    (
-        arb_id(),
-        arb_name(),
-        arb_path_prefix(),
-        vec(arb_column_schema(), 1..=5),
-    )
-        .prop_map(|(id, name, path_prefix, schema)| SourceContainer {
-            id,
-            name,
-            path_prefix,
-            schema,
-        })
-}
-
-/// Generator for a [`LookupRow`]: 1..=3 input_patterns.
-fn arb_lookup_row() -> impl Strategy<Value = LookupRow> {
-    (vec(arb_name(), 1..=3), arb_name(), -10i64..=10i64).prop_map(
-        |(input_patterns, output, priority)| LookupRow {
-            input_patterns,
-            output,
-            priority,
-        },
-    )
-}
-
-/// Generator for [`LookupMapping`] (flat -- no recursive children).
-///
-/// 1..=5 rows, each with 1..=3 patterns. `children` is always empty so this
-/// generator stays bounded; validator tests can construct trees explicitly.
-pub fn arb_lookup_mapping() -> impl Strategy<Value = LookupMapping> {
-    (
-        arb_id(),
-        proptest::option::of(arb_name()),
-        proptest::option::of(Just("keyword_substring".to_string())),
-        any::<Option<bool>>(),
-        vec(arb_lookup_row(), 1..=5),
-    )
-        .prop_map(
-            |(id, name, match_, case_insensitive, rows)| LookupMapping {
-                id,
-                name,
-                match_,
-                case_insensitive,
-                rows,
-                children: Vec::new(),
-                catch_all: None,
-            },
-        )
-}
-
-/// Generator for a single [`MappingColumn`] (name + fresh AST).
-fn arb_mapping_column() -> impl Strategy<Value = MappingColumn> {
-    (arb_name(), arb_ast_node()).prop_map(|(name, expr)| MappingColumn { name, expr })
-}
-
-/// Generator for [`PartitionBy`] with a `"month"` granularity.
-fn arb_partition_by() -> impl Strategy<Value = PartitionBy> {
-    (arb_name(), Just("month".to_string()))
-        .prop_map(|(column, granularity)| PartitionBy { column, granularity })
-}
-
-/// Generator for [`Mapping`]: non-empty ids and 1..=5 columns.
-pub fn arb_mapping() -> impl Strategy<Value = Mapping> {
-    (
-        arb_id(),
-        arb_id(),
-        arb_id(),
-        proptest::option::of(arb_partition_by()),
-        vec(arb_mapping_column(), 1..=5),
-    )
-        .prop_map(
-            |(id, source_container_id, analytic_table_id, partition_by, columns)| Mapping {
-                id,
-                name: String::new(),
-                source_container_id,
-                analytic_table_id,
-                partition_by,
-                columns,
-            },
-        )
-}
-
-/// Generator for [`AnalyticTable`] used inside `arb_pipeline_config`.
-fn arb_analytic_table() -> impl Strategy<Value = AnalyticTable> {
-    (
-        arb_id(),
-        arb_name(),
-        arb_path_prefix(),
-        vec(arb_column_schema(), 1..=5),
-    )
-        .prop_map(|(id, name, output_prefix, schema)| AnalyticTable {
-            id,
-            name,
-            output_prefix,
-            schema,
-        })
-}
-
-/// Generator for [`LayoutPosition`].
-fn arb_layout_position() -> impl Strategy<Value = LayoutPosition> {
-    (any::<f64>(), any::<f64>()).prop_map(|(x, y)| LayoutPosition { x, y })
-}
-
-/// Generator for [`PipelineConfig`].
-///
-/// `version = 1`, 1..=3 source_containers, 0..=3 lookup_mappings,
-/// 1..=3 mappings, 1..=3 analytic_tables. References across collections are
-/// NOT guaranteed to resolve -- validator tests build valid configs explicitly.
-pub fn arb_pipeline_config() -> impl Strategy<Value = PipelineConfig> {
-    (
-        vec(arb_source_container(), 1..=3),
-        vec(arb_lookup_mapping(), 0..=3),
-        vec(arb_mapping(), 1..=3),
-        vec(arb_analytic_table(), 1..=3),
-        vec((arb_id(), arb_layout_position()), 0..=4),
-    )
-        .prop_map(
-            |(source_containers, lookup_mappings, mappings, analytic_tables, layout_pairs)| {
-                let mut layout = HashMap::new();
-                for (k, v) in layout_pairs {
-                    layout.insert(k, v);
-                }
-                PipelineConfig {
-                    version: 1,
-                    source_containers,
-                    lookup_mappings,
-                    mappings,
-                    analytic_tables,
-                    layout,
-                }
-            },
-        )
 }

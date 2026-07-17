@@ -1,4 +1,4 @@
-//! `karet-worker` -- data pipeline worker for the Karet analytics platform.
+//! `karet-worker`, data pipeline worker for the Karet analytics platform.
 //!
 //! Reads `Pipeline_Config` from S3, ingests CSVs with Polars, evaluates
 //! AST-JSON mapping expressions, and writes partitioned Parquet to S3.
@@ -18,7 +18,9 @@ pub mod testgen;
 
 /// Env vars the worker cannot start without.
 pub const REQUIRED_ENV_VARS: &[&str] = &[
-    "S3_BUCKET",
+    "S3_BUCKET_PIPELINES",
+    "S3_BUCKET_LAKE",
+    "S3_BUCKET_WAREHOUSE",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_REGION",
@@ -46,7 +48,7 @@ pub fn require_env_vars(names: &[&str]) -> Result<(), String> {
     }
 }
 
-/// Binary entry point -- builds the HTTP router and serves it on `PORT`.
+/// Binary entry point, builds the HTTP router and serves it on `PORT`.
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("starting karet-worker");
 
@@ -55,7 +57,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err(message.into());
     }
 
-    let bucket = std::env::var("S3_BUCKET").expect("S3_BUCKET checked above");
+    let pipelines_bucket = std::env::var("S3_BUCKET_PIPELINES").expect("checked above");
+    let lake_bucket = std::env::var("S3_BUCKET_LAKE").expect("checked above");
+    let warehouse_bucket = std::env::var("S3_BUCKET_WAREHOUSE").expect("checked above");
 
     let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .endpoint_url(std::env::var("AWS_ENDPOINT_URL").unwrap_or_default())
@@ -67,7 +71,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
 
     let state = http::AppState {
-        s3_bucket: bucket,
+        pipelines_bucket,
+        lake_bucket,
+        warehouse_bucket,
         s3_client: Some(s3_client),
     };
 

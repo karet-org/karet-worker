@@ -69,7 +69,7 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
         // TRIM semantics.
         AstNode::Trim { input } => Ok(compile(input, ctx)?.str().strip_chars(lit(NULL))),
         AstNode::Substring { input, start, length } => {
-            // Polars `str().slice(offset: Expr, length: Expr)` -- `lit(NULL)`
+            // Polars `str().slice(offset: Expr, length: Expr)`, `lit(NULL)`
             // for length means "to end".
             let len_expr = match length {
                 Some(l) => lit(*l),
@@ -117,7 +117,7 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
         // Polars 0.53's `StrptimeOptions::strict` defaults to `true`, which
         // errors on malformed input. We set it to `false` so malformed
         // strings parse to null instead of failing the whole pipeline
-        // (Req 3.6 -- malformed AST structures surface as JSON parse errors
+        // (Req 3.6, malformed AST structures surface as JSON parse errors
         // at config-load time, malformed *data* must not).
         AstNode::ParseDate { input, format } => {
             let options = StrptimeOptions {
@@ -133,8 +133,7 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
         // Resolve the dotted lookup id against the registry; compile the
         // `input` expression; wrap the matcher in a Polars `map` closure that
         // runs `match_first` over each string in the input column. On a hit
-        // we return the matcher's `output` value; on a miss we yield `None`
-        //.
+        // we return the matcher's `output` value; on a miss we yield `None`.
         //
         // The closure must be `Fn + Send + Sync + 'static`, so we clone an
         // `Arc<LookupMatcher>` into it rather than capturing `ctx`.
@@ -168,8 +167,8 @@ mod tests {
     use crate::ast::AstNode;
     use proptest::prelude::*;
 
-    // Malformed date strings must parse to null rather than erroring
-    //. Mixed input `["2024-01-01", "not-a-date"]` should yield
+    // Malformed date strings must parse to null rather than erroring.
+    // Mixed input `["2024-01-01", "not-a-date"]` should yield
     // `[Some(_), None]`.
     #[test]
     fn parse_date_produces_null_on_malformed() {

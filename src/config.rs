@@ -530,7 +530,7 @@ mod tests {
             analytic_tables: vec![AnalyticTable {
                 id: "t".to_string(),
                 name: "T".to_string(),
-                output_prefix: "clean/t/".to_string(),
+                output_prefix: "t/".to_string(),
                 schema: vec![
                     ColumnSchema {
                         name: "cat".to_string(),
@@ -663,7 +663,7 @@ mod tests {
             analytic_tables: vec![AnalyticTable {
                 id: "t".to_string(),
                 name: "T".to_string(),
-                output_prefix: "clean/t/".to_string(),
+                output_prefix: "t/".to_string(),
                 schema: vec![ColumnSchema {
                     name: "out".to_string(),
                     type_: "string".to_string(),
@@ -858,7 +858,7 @@ mod tests {
                             .map(|i| AnalyticTable {
                                 id: format!("t{i}"),
                                 name: format!("T{i}"),
-                                output_prefix: format!("clean/t{i}/"),
+                                output_prefix: format!("t{i}/"),
                                 schema: vec![ColumnSchema {
                                     name: "out0".to_string(),
                                     type_: "string".to_string(),

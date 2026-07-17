@@ -2285,7 +2285,6 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
- "futures-util",
  "http-body-util",
  "polars",
  "proptest",

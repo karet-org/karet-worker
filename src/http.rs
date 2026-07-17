@@ -22,7 +22,12 @@ use crate::s3 as s3mod;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub s3_bucket: String,
+    /// Bucket for ELT control-plane data (configs, dashboards, jobs).
+    pub pipelines_bucket: String,
+    /// Bucket for raw ingested CSV data.
+    pub lake_bucket: String,
+    /// Bucket for query-ready partitioned Parquet output.
+    pub warehouse_bucket: String,
     pub s3_client: Option<aws_sdk_s3::Client>,
 }
 
@@ -34,12 +39,12 @@ pub fn router(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
-/// `GET /health` -- liveness probe.
+/// `GET /health`, liveness probe.
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// `POST /config/validate` -- deserialize the body as a `PipelineConfig`
+/// `POST /config/validate`, deserialize the body as a `PipelineConfig`
 /// and run [`config::validate`]. Always returns 200; the `ok` field
 /// reflects the result and `errors` lists details.
 async fn post_config_validate(body: String) -> impl IntoResponse {
@@ -75,7 +80,7 @@ struct RunPipelineRequest {
     clean_run: bool,
 }
 
-/// `POST /jobs/run` -- execute a pipeline run for the given prefix.
+/// `POST /jobs/run`, execute a pipeline run for the given prefix.
 /// Reads `<prefix>pipeline.json`, lists raw CSVs, runs the pipeline, writes
 /// Parquet output.
 async fn run_pipeline(
@@ -97,7 +102,7 @@ async fn run_pipeline(
     let prefix = &body.pipeline_prefix;
     let config_key = format!("{prefix}pipeline.json");
 
-    let config_bytes = match s3mod::get_bytes(&s3_client, &state.s3_bucket, &config_key).await {
+    let config_bytes = match s3mod::get_bytes(&s3_client, &state.pipelines_bucket, &config_key).await {
         Ok(b) => b,
         Err(e) => {
             return error_response(
@@ -120,19 +125,18 @@ async fn run_pipeline(
         }
     };
 
-    let matchers = lookup::build_registry(&cfg.lookup_mappings);
-
-    // clean_run: delete existing clean output under the tables the current
-    // config declares (so stale tables from prior configs aren't wiped).
+    // clean_run: delete existing warehouse output under the tables the
+    // current config declares (so stale tables from prior configs aren't
+    // wiped).
     if body.clean_run {
         for table in &cfg.analytic_tables {
-            let table_prefix = format!("{prefix}clean/{}/", table.id);
-            match s3mod::list_keys(&s3_client, &state.s3_bucket, &table_prefix).await {
+            let table_prefix = format!("{prefix}{}/", table.id);
+            match s3mod::list_keys(&s3_client, &state.warehouse_bucket, &table_prefix).await {
                 Ok(keys) => {
                     for key in keys {
                         let _ = s3_client
                             .delete_object()
-                            .bucket(&state.s3_bucket)
+                            .bucket(&state.warehouse_bucket)
                             .key(&key)
                             .send()
                             .await;
@@ -146,11 +150,13 @@ async fn run_pipeline(
         }
     }
 
-    // Download every raw CSV under each source container's path_prefix.
+    // Download every raw CSV file under each source container's path_prefix
+    // from the lake bucket.
     let mut all_files: Vec<(String, Vec<u8>)> = Vec::new();
     for sc in &cfg.source_containers {
         let raw_prefix = format!("{prefix}{}", sc.path_prefix);
-        let keys = match s3mod::list_keys(&s3_client, &state.s3_bucket, &raw_prefix).await {
+        let ext = ".csv";
+        let keys = match s3mod::list_keys(&s3_client, &state.lake_bucket, &raw_prefix).await {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!("failed to list keys for {raw_prefix}: {e}");
@@ -158,10 +164,10 @@ async fn run_pipeline(
             }
         };
         for key in keys {
-            if !key.ends_with(".csv") {
+            if !key.ends_with(ext) {
                 continue;
             }
-            match s3mod::get_bytes(&s3_client, &state.s3_bucket, &key).await {
+            match s3mod::get_bytes(&s3_client, &state.lake_bucket, &key).await {
                 Ok(bytes) => {
                     // Strip pipeline prefix so the key matches path_prefix.
                     let rel_key = key.strip_prefix(prefix).unwrap_or(&key).to_string();
@@ -183,12 +189,16 @@ async fn run_pipeline(
 
     let uploader = s3mod::S3PartitionUploader::new(
         s3_client.clone(),
-        state.s3_bucket.clone(),
+        state.warehouse_bucket.clone(),
         prefix.to_string(),
     );
 
+    // Precompile the lookup registry once per job; shared by every mapping.
+    let matchers = lookup::build_registry(&cfg.lookup_mappings);
+
     let mut total_partitions = 0usize;
     let mut errors: Vec<String> = Vec::new();
+    let files_processed = all_files.len();
 
     for mapping in &cfg.mappings {
         let sc = match cfg
@@ -274,7 +284,7 @@ async fn run_pipeline(
         Json(serde_json::json!({
             "job_id": job_id,
             "partitions_written": total_partitions,
-            "files_processed": all_files.len(),
+            "files_processed": files_processed,
             "errors": errors,
         })),
     )
@@ -339,7 +349,9 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState {
-            s3_bucket: "karet-data".into(),
+            pipelines_bucket: "karet-pipelines".into(),
+            lake_bucket: "karet-lake".into(),
+            warehouse_bucket: "karet-warehouse".into(),
             s3_client: None,
         }
     }

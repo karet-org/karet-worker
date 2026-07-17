@@ -17,7 +17,7 @@ use crate::lookup::LookupMatcher;
 /// `headers`. Otherwise returns `Err(missing)` where `missing` lists the
 /// schema column names not found in `headers`, in schema declaration order.
 ///
-/// Extra columns present in `headers` but not in `schema` are not an error --
+/// Extra columns present in `headers` but not in `schema` are not an error,
 /// they are ignored by the caller.
 pub fn validate_csv_headers(
     headers: &[String],
@@ -59,7 +59,7 @@ pub fn project_schema_columns(
 /// Resolve the [`SourceContainer`] whose `path_prefix` is a prefix of `key`.
 ///
 /// Walks `cfg.source_containers` in declaration order and returns the first
-/// match. Returns [`PipelineError::UnknownSourceContainer`] if none match --
+/// match. Returns [`PipelineError::UnknownSourceContainer`] if none match,
 /// we refuse to guess a schema for an unknown key.
 fn resolve_source_container<'a>(
     key: &str,
@@ -90,7 +90,19 @@ fn resolve_mapping<'a>(
         })
 }
 
-/// Ingest a single CSV file through one mapping and return the output
+/// Read a CSV source file (header row, comma-delimited) into a [`DataFrame`].
+///
+/// The schema is inferred from the data; downstream mapping expressions
+/// handle any type coercion (e.g. `parse_date`, `cast`).
+fn read_source(key: &str, bytes: &[u8]) -> Result<DataFrame, PipelineError> {
+    CsvReadOptions::default()
+        .with_has_header(true)
+        .into_reader_with_file_handle(Cursor::new(bytes))
+        .finish()
+        .map_err(|e| PipelineError::polars(key, e))
+}
+
+/// Ingest a single source file through one mapping and return the output
 /// [`DataFrame`].
 ///
 /// Resolves the source container by path prefix, picks the first mapping
@@ -108,11 +120,7 @@ pub fn ingest_file(
     let source_container = resolve_source_container(key, cfg)?;
     let mapping = resolve_mapping(&source_container.id, cfg)?;
 
-    let df = CsvReadOptions::default()
-        .with_has_header(true)
-        .into_reader_with_file_handle(Cursor::new(csv_bytes))
-        .finish()
-        .map_err(|e| PipelineError::polars(key, e))?;
+    let df = read_source(key, csv_bytes)?;
 
     // Collect header names as owned strings so the borrow against `df` is
     // released before `df.select` below.
@@ -151,7 +159,7 @@ pub fn ingest_file(
 /// Ingest many CSV files through their respective mappings and return the
 /// union of their rows as a single [`LazyFrame`].
 ///
-/// Per-file failures are logged and skipped -- a single malformed or
+/// Per-file failures are logged and skipped, a single malformed or
 /// schema-violating CSV must not abort the whole job. If **every** file
 /// fails we return [`PipelineError::NoFilesSucceeded`].
 pub fn ingest_many(
@@ -184,7 +192,7 @@ pub fn ingest_many(
 /// A single partition's worth of Parquet-encoded output.
 #[derive(Debug, Clone)]
 pub struct PartitionOutput {
-    /// S3 object key, e.g. `clean/transactions/year=2024/month=01/data.parquet`.
+    /// S3 object key, e.g. `transactions/year=2024/month=01/data.parquet`.
     pub key: String,
     /// Parquet-encoded bytes ready to upload.
     pub bytes: Vec<u8>,
@@ -193,7 +201,7 @@ pub struct PartitionOutput {
 /// Partition a [`DataFrame`] by `(year, month)` of a date-typed column.
 ///
 /// Returns one `((year, month), sub_df)` entry per distinct calendar month
-/// present in `partition_col`. Order is unspecified -- callers that need
+/// present in `partition_col`. Order is unspecified, callers that need
 /// stable ordering should sort by the key themselves.
 pub fn partition_by_month(
     df: &DataFrame,
@@ -215,7 +223,7 @@ pub fn partition_by_month(
 
     let mut out: Vec<((i32, u32), DataFrame)> = Vec::with_capacity(partitions.height());
     for i in 0..partitions.height() {
-        // Skip null partition-key values -- a null date can't be assigned
+        // Skip null partition-key values, a null date can't be assigned
         // to a `(year, month)` partition.
         let (Some(year), Some(month)) = (years.get(i), months.get(i)) else {
             continue;
@@ -247,8 +255,9 @@ pub fn write_parquet_bytes(df: &mut DataFrame) -> Result<Vec<u8>, PolarsError> {
     Ok(buf.into_inner())
 }
 
-/// Build the S3 object key for a `(year, month)` partition.
-/// Format: `clean/<analytic_table_id>/year=YYYY/month=MM/<mapping_id>.parquet`.
+/// Build the S3 object key (relative to the pipeline prefix) for a
+/// `(year, month)` partition.
+/// Format: `<analytic_table_id>/year=YYYY/month=MM/<mapping_id>.parquet`.
 ///
 /// The mapping id is in the filename so multiple mappings writing to the
 /// same analytic table don't overwrite each other's partitions; re-running
@@ -260,21 +269,21 @@ pub fn partition_key(
     month: u32,
 ) -> String {
     format!(
-        "clean/{analytic_table_id}/year={year:04}/month={month:02}/{mapping_id}.parquet"
+        "{analytic_table_id}/year={year:04}/month={month:02}/{mapping_id}.parquet"
     )
 }
 
 /// Build the S3 object key for an unpartitioned output.
-/// Format: `clean/<analytic_table_id>/<mapping_id>.parquet`.
+/// Format: `<analytic_table_id>/<mapping_id>.parquet`.
 fn unpartitioned_key(analytic_table_id: &str, mapping_id: &str) -> String {
-    format!("clean/{analytic_table_id}/{mapping_id}.parquet")
+    format!("{analytic_table_id}/{mapping_id}.parquet")
 }
 
 /// Produce one [`PartitionOutput`] per partition of `df` according to the
 /// mapping's `partition_by` configuration.
 ///
 /// - `partition_by == None`: the whole frame becomes a single output
-///   under `clean/<table_id>/data.parquet`.
+///   under `<table_id>/data.parquet`.
 /// - `partition_by.granularity == "month"`: one output per `(year,
 ///   month)` of the declared date column.
 /// - Any other granularity returns [`PipelineError::UnsupportedGranularity`].
@@ -328,7 +337,7 @@ pub fn produce_partitions(
 /// Abstraction over the partition uploader.
 ///
 /// The worker's real S3 client implements this trait; tests provide a
-/// mock. The interface is synchronous -- pulling in `async_trait` solely
+/// mock. The interface is synchronous, pulling in `async_trait` solely
 /// for test doubles would be premature.
 ///
 /// The `bytes` slice is borrowed so callers can pass a reference into a
@@ -417,7 +426,7 @@ mod tests {
     ///
     /// Broken out so the two call sites (with-extras and without-extras) use
     /// identical machinery; this keeps the property test's equality check
-    /// honest -- any projection difference is attributable to
+    /// honest, any projection difference is attributable to
     /// `project_schema_columns`, not to how we built the inputs.
     fn str_column(name: &str, val: &str) -> Column {
         Column::new(name.into(), &[val])
@@ -429,7 +438,7 @@ mod tests {
         // Given a DataFrame whose columns are `schema_names ∪ extras`, projecting
         // it through the schema yields the same DataFrame as projecting a
         // DataFrame built from `schema_names` alone. In other words, extras are
-        // invisible to the downstream evaluator -- which is how 
+        // invisible to the downstream evaluator, which is how 
         // manifests at this layer of the pipeline.
         #[test]
         fn project_schema_columns_ignores_extras(
@@ -556,7 +565,7 @@ mod tests {
             analytic_tables: vec![AnalyticTable {
                 id: "t".into(),
                 name: "T".into(),
-                output_prefix: "clean/t/".into(),
+                output_prefix: "t/".into(),
                 schema: vec![ColumnSchema {
                     name: "upper_desc".into(),
                     type_: "string".into(),
@@ -732,7 +741,7 @@ mod tests {
                 .collect();
 
             // Single-file path: call ingest_file per input and append rows
-            // into a single Vec -- this is the explicit multiset-union.
+            // into a single Vec, this is the explicit multiset-union.
             let mut single_file_sum: Vec<String> = Vec::new();
             for (key, bytes) in &files {
                 let single_df = ingest_file(key, bytes, &cfg, &matchers).unwrap();
@@ -789,14 +798,14 @@ mod tests {
         AnalyticTable {
             id: id.into(),
             name: id.into(),
-            output_prefix: format!("clean/{id}/"),
+            output_prefix: format!("{id}/"),
             schema: vec![],
         }
     }
 
     /// Build a mapping targeting `table_id` with the given (optional)
     /// partition configuration. The mapping's columns list is empty because
-    /// these tests operate on DataFrames built by hand -- produce_partitions
+    /// these tests operate on DataFrames built by hand, produce_partitions
     /// doesn't inspect `columns`.
     fn test_mapping(table_id: &str, partition_by: Option<PartitionBy>) -> Mapping {
         Mapping {
@@ -831,8 +840,8 @@ mod tests {
     #[test]
     fn produce_partitions_no_partitioning() {
         // With `partition_by: None`, the whole frame becomes a single output
-        // under `clean/<id>/<uuid>.parquet`. We can't pin the UUID, but we
-        // can assert the prefix/suffix and that exactly one output came out.
+        // under `<id>/<uuid>.parquet`. We can't pin the UUID, but we can
+        // assert the prefix/suffix and that exactly one output came out.
         let df = df_with_dates(&["2024-01-15", "2024-02-01"]);
         let table = test_table("orders");
         let mapping = test_mapping("orders", None);
@@ -842,7 +851,7 @@ mod tests {
 
         let key = &outs[0].key;
         assert!(
-            key.starts_with("clean/orders/") && key.ends_with(".parquet"),
+            key.starts_with("orders/") && key.ends_with(".parquet"),
             "unexpected key `{key}`"
         );
         assert!(
@@ -853,7 +862,7 @@ mod tests {
             !outs[0].bytes.is_empty(),
             "parquet bytes should be non-empty for a non-empty frame"
         );
-        // Parquet magic header (PAR1) -- a cheap sanity check that we
+        // Parquet magic header (PAR1), a cheap sanity check that we
         // actually produced a parquet file and not some other encoding.
         assert_eq!(&outs[0].bytes[..4], b"PAR1");
     }
@@ -881,10 +890,10 @@ mod tests {
         let keys: Vec<&String> = outs.iter().map(|o| &o.key).collect();
         let has_jan = keys
             .iter()
-            .any(|k| k.contains("year=2024/month=01/") && k.contains("clean/transactions/"));
+            .any(|k| k.contains("year=2024/month=01/") && k.starts_with("transactions/"));
         let has_feb = keys
             .iter()
-            .any(|k| k.contains("year=2024/month=02/") && k.contains("clean/transactions/"));
+            .any(|k| k.contains("year=2024/month=02/") && k.starts_with("transactions/"));
         assert!(has_jan, "missing January partition in keys {:?}", keys);
         assert!(has_feb, "missing February partition in keys {:?}", keys);
 
@@ -953,7 +962,7 @@ mod tests {
         //
         // We restrict day-of-month to 1..=28 so every `(year, month, day)`
         // triple is a valid calendar date regardless of month length or
-        // leap-year rules -- we're testing partition coverage here, not date
+        // leap-year rules, we're testing partition coverage here, not date
         // parsing.
         #[test]
         fn partitions_cover_input_date_range(
@@ -983,7 +992,7 @@ mod tests {
             let outs = produce_partitions(&df, &mapping, &table).unwrap();
 
             // Extract `(year, month)` pairs from the output keys. The key
-            // format `clean/<id>/year=YYYY/month=MM/<uuid>.parquet` is pinned
+            // format `<id>/year=YYYY/month=MM/<uuid>.parquet` is pinned
             // by `partition_key()`; we locate the `year=` and `month=` tags
             // and read their fixed-width numeric values.
             let mut got: std::collections::HashSet<(i32, u32)> = std::collections::HashSet::new();
@@ -1004,7 +1013,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // upload_partitions -- partition upload failures identify the bad key.
+    // upload_partitions, partition upload failures identify the bad key.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1025,26 +1034,26 @@ mod tests {
 
         let partitions = vec![
             PartitionOutput {
-                key: "clean/t/year=2024/month=01/a.parquet".into(),
+                key: "t/year=2024/month=01/a.parquet".into(),
                 bytes: vec![0u8],
             },
             PartitionOutput {
-                key: "clean/t/year=2024/month=02/b.parquet".into(),
+                key: "t/year=2024/month=02/b.parquet".into(),
                 bytes: vec![0u8],
             },
             PartitionOutput {
-                key: "clean/t/year=2024/month=03/c.parquet".into(),
+                key: "t/year=2024/month=03/c.parquet".into(),
                 bytes: vec![0u8],
             },
         ];
         let uploader = MockUploader {
-            fail_on: "clean/t/year=2024/month=02/b.parquet".into(),
+            fail_on: "t/year=2024/month=02/b.parquet".into(),
         };
 
         let err = upload_partitions(&uploader, &partitions).unwrap_err();
         match err {
             PipelineError::PartitionUploadFailed { key, message } => {
-                assert_eq!(key, "clean/t/year=2024/month=02/b.parquet");
+                assert_eq!(key, "t/year=2024/month=02/b.parquet");
                 assert!(
                     message.contains("simulated"),
                     "expected failure message to carry uploader's text; got `{message}`"
