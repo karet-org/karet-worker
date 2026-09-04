@@ -1,9 +1,6 @@
-//! S3-backed `PartitionUploader` plus thin helpers for raw reads/lists.
+//! Thin S3 helpers for raw reads/lists, plus error-chain rendering.
 
-use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-
-use crate::pipeline::PartitionUploader;
 
 /// Render an error together with its full [`std::error::Error::source`] chain.
 ///
@@ -26,41 +23,6 @@ pub(crate) fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {
         source = inner.source();
     }
     out
-}
-
-pub struct S3PartitionUploader {
-    client: Client,
-    bucket: String,
-    /// Prefix prepended to partition keys, e.g. `pipelines/visa-spending/`.
-    prefix: String,
-}
-
-impl S3PartitionUploader {
-    pub fn new(client: Client, bucket: String, prefix: String) -> Self {
-        Self { client, bucket, prefix }
-    }
-}
-
-impl PartitionUploader for S3PartitionUploader {
-    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), String> {
-        let full_key = format!("{}{}", self.prefix, key);
-        let body = ByteStream::from(bytes.to_vec());
-        tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                self.client
-                    .put_object()
-                    .bucket(&self.bucket)
-                    .key(&full_key)
-                    .body(body)
-                    .content_type("application/octet-stream")
-                    .send()
-                    .await
-                    .map_err(|e| format!("S3 PutObject failed for {full_key}: {}", err_chain(&e)))?;
-                Ok(())
-            })
-        })
-    }
 }
 
 pub async fn list_keys(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<String>, String> {

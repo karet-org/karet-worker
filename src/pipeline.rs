@@ -327,14 +327,13 @@ pub fn produce_partitions(
 
 /// Abstraction over the partition uploader.
 ///
-/// The worker's real S3 client implements this trait; tests provide a
-/// mock. The interface is synchronous, pulling in `async_trait` solely
-/// for test doubles would be premature.
+/// Upload seam for partition output. Production uploads are async in
+/// `job.rs`; this sync trait exists so unit and integration tests can run
+/// the partition pipeline against in-memory or custom uploaders.
 ///
-/// The `bytes` slice is borrowed so callers can pass a reference into a
-/// [`PartitionOutput`] without cloning its `Vec<u8>`. On failure,
-/// implementations return a `String` that [`upload_partitions`] wraps
-/// into [`PipelineError::PartitionUploadFailed`] alongside the key.
+/// `bytes` is borrowed so callers can pass a [`PartitionOutput`] slice
+/// without cloning. Failures are wrapped into
+/// [`PipelineError::PartitionUploadFailed`] alongside the key.
 pub trait PartitionUploader {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), String>;
 }

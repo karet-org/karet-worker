@@ -194,12 +194,9 @@ pub async fn execute_job(
             continue;
         }
 
-        // The Polars pipeline for one mapping (parse, evaluate, encode
-        // Parquet) is CPU-bound; run it on the blocking pool so heartbeats
-        // and health checks stay responsive during large collects. Uploads
-        // happen back on the async runtime: the sync `PartitionUploader`
-        // bridge uses `block_in_place`, which panics on blocking-pool
-        // threads.
+        // Polars work is CPU-bound: run it on the blocking pool so
+        // heartbeats and health checks stay responsive. Uploads happen
+        // back on the async runtime.
         let cfg_cloned = cfg.clone();
         let mapping_id = mapping.id.clone();
         let table_id = mapping.analytic_table_id.clone();
@@ -274,10 +271,7 @@ pub async fn execute_job(
     })
 }
 
-/// Async equivalent of [`pipeline::upload_partitions`] +
-/// [`s3mod::S3PartitionUploader`]: same key layout, same
-/// short-circuit-on-first-failure semantics, same error text, but native
-/// `await` instead of the `block_in_place` bridge.
+/// Upload partitions under `prefix`, short-circuiting on first failure.
 async fn upload_partitions_async(
     ctx: &JobContext,
     prefix: &str,
