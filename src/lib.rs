@@ -9,8 +9,10 @@ pub mod config;
 pub mod error;
 pub mod evaluator;
 pub mod http;
+pub mod job;
 pub mod lookup;
 pub mod pipeline;
+pub mod queue;
 pub mod s3;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -50,6 +52,8 @@ pub fn require_env_vars(names: &[&str]) -> Result<(), String> {
 }
 
 /// Binary entry point, builds the HTTP router and serves it on `PORT`.
+/// When `REDIS_URL` is set, also starts the queue loops (consumer,
+/// delayed mover, reclaimer, debounce scheduler).
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("starting karet-worker");
 
@@ -72,13 +76,79 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build();
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
 
+    // Queue mode (REDIS_URL set): start consumer + maintenance loops and
+    // enable /events/s3. Requires a non-empty webhook secret so the
+    // endpoint can never run open.
+    let redis_url = std::env::var("REDIS_URL").ok().filter(|s| !s.is_empty());
+    let webhook_secret = std::env::var("KARET_WEBHOOK_SECRET").ok().filter(|s| !s.is_empty());
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let queue_ctx = match &redis_url {
+        Some(url) => {
+            if webhook_secret.is_none() {
+                let message =
+                    "REDIS_URL is set but KARET_WEBHOOK_SECRET is empty; the webhook \
+                     endpoint must have a secret. Generate one with `openssl rand -hex 32`.";
+                tracing::error!("{message}");
+                return Err(message.into());
+            }
+            let client = redis::Client::open(url.as_str())?;
+            let consumer_name = format!(
+                "worker-{}-{}",
+                std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into()),
+                std::process::id()
+            );
+            let settings = queue::QueueSettings {
+                max_attempts: env_parse("MAX_ATTEMPTS", 3),
+                lock_ttl_ms: env_parse("JOB_LOCK_TTL_MS", 90_000),
+                heartbeat_ms: env_parse("HEARTBEAT_MS", 30_000),
+                ..queue::QueueSettings::default()
+            };
+            Some(std::sync::Arc::new(queue::QueueCtx {
+                client,
+                job_ctx: job::JobContext {
+                    s3_client: s3_client.clone(),
+                    pipelines_bucket: pipelines_bucket.clone(),
+                    lake_bucket: lake_bucket.clone(),
+                    warehouse_bucket: warehouse_bucket.clone(),
+                },
+                consumer_name,
+                settings,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                shutdown: shutdown_rx.clone(),
+            }))
+        }
+        None => {
+            tracing::info!("REDIS_URL not set; running in legacy HTTP-only mode");
+            None
+        }
+    };
+
     let state = http::AppState {
         pipelines_bucket,
         lake_bucket,
         warehouse_bucket,
         s3_client: Some(s3_client),
         auth_token,
+        queue: queue_ctx.clone(),
+        webhook_secret,
     };
+
+    let mut loop_handles = Vec::new();
+    if let Some(ctx) = &queue_ctx {
+        let concurrency: usize = env_parse("WORKER_CONCURRENCY", 1);
+        tracing::info!(
+            "queue mode enabled: consumer={} concurrency={concurrency}",
+            ctx.consumer_name
+        );
+        for _ in 0..concurrency.max(1) {
+            loop_handles.push(tokio::spawn(queue::consumer_loop(ctx.clone())));
+        }
+        loop_handles.push(tokio::spawn(queue::delayed_mover_loop(ctx.clone())));
+        loop_handles.push(tokio::spawn(queue::reclaimer_loop(ctx.clone())));
+        loop_handles.push(tokio::spawn(queue::debounce_scheduler_loop(ctx.clone())));
+    }
 
     let app = http::router(state);
 
@@ -86,8 +156,54 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
-    axum::serve(listener, app).await?;
+
+    // Graceful shutdown: SIGTERM/SIGINT stops the HTTP server and flips
+    // the watch flag; queue loops exit at their next check and in-flight
+    // jobs run to completion before the process exits.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    tracing::info!("http server stopped; draining queue loops");
+    let _ = shutdown_tx.send(true);
+    for handle in loop_handles {
+        let _ = handle.await;
+    }
+    tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Resolves when SIGTERM or SIGINT arrives.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received");
+}
+
+/// Parse an env var with a default; invalid values fall back with a warning.
+fn env_parse<T: std::str::FromStr + std::fmt::Display + Copy>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            tracing::warn!("invalid {name}={raw}; using default {default}");
+            default
+        }),
+        Err(_) => default,
+    }
 }
 
 #[cfg(test)]

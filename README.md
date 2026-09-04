@@ -23,7 +23,30 @@ All required to start the worker; it fails fast if any is unset.
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | S3 credentials |
 | `AWS_ENDPOINT_URL` | S3 endpoint URL (e.g. `http://rustfs:9000` for local dev, `https://s3.<region>.amazonaws.com` for real AWS). |
 | `KARET_WORKER_TOKEN` | Shared bearer token required on `POST /config/validate` and `POST /jobs/run`. Generate with `openssl rand -hex 32`; the web service must send the same value. |
+| `REDIS_URL` | Optional. When set (e.g. `redis://redis:6379`), the worker consumes jobs from the Redis stream `karet:jobs:stream` instead of relying on `POST /jobs/run`, serves `POST /events/s3` for RustFS webhooks, and reports queue status on `/health`. |
+| `KARET_WEBHOOK_SECRET` | Required non-empty when `REDIS_URL` is set. Shared secret for `POST /events/s3` (send as `X-Karet-Webhook-Secret` or `Authorization: Bearer`). |
+| `WORKER_CONCURRENCY` | Optional, queue mode. Jobs processed concurrently per worker (default `1`). |
+| `MAX_ATTEMPTS` | Optional, queue mode. Delivery attempts before a job is terminally failed (default `3`). |
+| `JOB_LOCK_TTL_MS` / `HEARTBEAT_MS` | Optional, queue mode. Per-pipeline lock TTL and heartbeat interval (defaults `90000` / `30000`). |
 | `PORT` | Optional HTTP server port (default `8080`). |
+
+## Job queue (Redis mode)
+
+With `REDIS_URL` set the worker owns the full job lifecycle
+(design: `karet-jobs-redis-design.html` in the workspace):
+
+- Claims jobs from the `karet:jobs:stream` consumer group; a per-pipeline
+  lock serializes runs; busy jobs defer to a delayed ZSET.
+- Publishes live status + progress to `karet:jobs:live:<id>` hashes.
+- Retries transient failures with exponential backoff, up to
+  `MAX_ATTEMPTS`; crashed workers' entries are reclaimed automatically.
+- Writes the terminal job record to S3
+  (`pipelines/<slug>/jobs/<id>.json`), then acks.
+- Debounces RustFS upload events (5s quiet / 30s max) and enqueues
+  webhook-triggered jobs itself; point
+  `RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY` at `http://worker:8080/events/s3`.
+- Shuts down gracefully on SIGTERM: stops claiming, finishes in-flight
+  jobs, then exits.
 
 ## HTTP API
 

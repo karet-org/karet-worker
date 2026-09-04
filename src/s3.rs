@@ -12,7 +12,7 @@ use crate::pipeline::PartitionUploader;
 /// chain surfaces the underlying reason (e.g. `connection refused`, a DNS
 /// failure, or a TLS error) so the message points at what actually needs
 /// fixing, such as an unreachable `AWS_ENDPOINT_URL`.
-fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {
     let mut out = e.to_string();
     let mut source = e.source();
     while let Some(inner) = source {
