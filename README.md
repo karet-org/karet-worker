@@ -22,18 +22,18 @@ All required to start the worker; it fails fast if any is unset.
 | `S3_BUCKET_WAREHOUSE` | Bucket for partitioned Parquet output (default `karet-warehouse`). |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | S3 credentials |
 | `AWS_ENDPOINT_URL` | S3 endpoint URL (e.g. `http://rustfs:9000` for local dev, `https://s3.<region>.amazonaws.com` for real AWS). |
-| `KARET_WORKER_TOKEN` | Shared bearer token required on `POST /config/validate` and `POST /jobs/run`. Generate with `openssl rand -hex 32`; the web service must send the same value. |
-| `REDIS_URL` | Optional. When set (e.g. `redis://redis:6379`), the worker consumes jobs from the Redis stream `karet:jobs:stream` instead of relying on `POST /jobs/run`, serves `POST /events/s3` for RustFS webhooks, and reports queue status on `/health`. |
-| `KARET_WEBHOOK_SECRET` | Required non-empty when `REDIS_URL` is set. Shared secret for `POST /events/s3` (send as `X-Karet-Webhook-Secret` or `Authorization: Bearer`). |
-| `WORKER_CONCURRENCY` | Optional, queue mode. Jobs processed concurrently per worker (default `1`). |
-| `MAX_ATTEMPTS` | Optional, queue mode. Delivery attempts before a job is terminally failed (default `3`). |
-| `JOB_LOCK_TTL_MS` / `HEARTBEAT_MS` | Optional, queue mode. Per-pipeline lock TTL and heartbeat interval (defaults `90000` / `30000`). |
+| `KARET_WORKER_TOKEN` | Shared bearer token required on `POST /config/validate`. Generate with `openssl rand -hex 32`; the web service must send the same value. |
+| `REDIS_URL` | Valkey/Redis connection string (e.g. `redis://valkey:6379`). Jobs arrive via the `karet:jobs:stream` consumer group. |
+| `KARET_WEBHOOK_SECRET` | Shared secret for `POST /events/s3` (send as `X-Karet-Webhook-Secret`, or via `RUSTFS_NOTIFY_WEBHOOK_AUTH_TOKEN_PRIMARY`). |
+| `WORKER_CONCURRENCY` | Optional. Jobs processed concurrently per worker (default `1`). |
+| `MAX_ATTEMPTS` | Optional. Delivery attempts before a job is terminally failed (default `3`). |
+| `JOB_LOCK_TTL_MS` / `HEARTBEAT_MS` | Optional. Per-pipeline lock TTL and heartbeat interval (defaults `90000` / `30000`). |
 | `PORT` | Optional HTTP server port (default `8080`). |
 
-## Job queue (Redis mode)
+## Job queue
 
-With `REDIS_URL` set the worker owns the full job lifecycle
-(design: `karet-jobs-redis-design.html` in the workspace):
+The Redis stream is the only job transport (design:
+`karet-jobs-redis-design.html` in the workspace):
 
 - Claims jobs from the `karet:jobs:stream` consumer group; a per-pipeline
   lock serializes runs; busy jobs defer to a delayed ZSET.
@@ -50,14 +50,15 @@ With `REDIS_URL` set the worker owns the full job lifecycle
 
 ## HTTP API
 
-`POST` endpoints require an `Authorization: Bearer $KARET_WORKER_TOKEN`
-header; `GET /health` is open for liveness probes.
+`POST /config/validate` requires an `Authorization: Bearer
+$KARET_WORKER_TOKEN` header; `POST /events/s3` enforces the webhook
+secret; `GET /health` is open for liveness probes.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/health` | Liveness check |
+| `GET` | `/health` | Liveness/readiness: Redis status, queue depth, in-flight count |
 | `POST` | `/config/validate` | Validate a candidate `Pipeline_Config` body |
-| `POST` | `/jobs/run` | Execute a pipeline run for the given `pipeline_prefix` |
+| `POST` | `/events/s3` | RustFS object-created notifications (debounced into job runs) |
 
 ## Development
 

@@ -1,6 +1,7 @@
 //! HTTP API (Axum).
 //!
-//! Routes: `GET /health`, `POST /config/validate`, `POST /jobs/run`.
+//! Routes: `GET /health`, `POST /config/validate`, `POST /events/s3`.
+//! Jobs arrive via the Redis stream (see `queue.rs`), not HTTP.
 
 use std::sync::Arc;
 
@@ -13,7 +14,6 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::config::{self, ConfigError, PipelineConfig};
 
@@ -39,13 +39,14 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     let state = Arc::new(state);
-    // Mutating routes sit behind the bearer-token check. `route_layer`
+    // The one remaining mutating route sits behind the bearer-token
+    // check; `/health` stays open so liveness probes need no credentials,
+    // and `/events/s3` enforces its own webhook secret. `route_layer`
     // (not `layer`) so the middleware wraps only matched routes — with
     // plain `layer` the router's 404 fallback answers 401 for every
     // unknown path, which broke RustFS's HEAD health probe of `/`.
     let protected = Router::new()
         .route("/config/validate", post(post_config_validate))
-        .route("/jobs/run", post(run_pipeline))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -305,6 +306,9 @@ async fn post_s3_events(
     };
 
     let headers = request.headers();
+    // Three accepted channels: our own header, `Authorization: Bearer x`,
+    // and a raw `Authorization: x` — RustFS's `WEBHOOK_AUTH_TOKEN` sends
+    // the configured value verbatim, whose exact shape is undocumented.
     let provided = headers
         .get("x-karet-webhook-secret")
         .and_then(|v| v.to_str().ok())
@@ -312,7 +316,7 @@ async fn post_s3_events(
             headers
                 .get(header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|v| v.strip_prefix("Bearer ").unwrap_or(v))
         });
     match provided {
         Some(secret) if constant_time_eq(secret.as_bytes(), expected.as_bytes()) => {}
@@ -417,90 +421,6 @@ async fn post_config_validate(body: String) -> impl IntoResponse {
                 }],
             })),
         ),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct RunPipelineRequest {
-    pipeline_prefix: String,
-    #[serde(default)]
-    clean_run: bool,
-}
-
-/// `POST /jobs/run` (legacy synchronous path; the Redis consumer is the
-/// preferred transport). Executes a pipeline run for the given prefix via
-/// the shared executor and reports the outcome in the original response
-/// shape.
-async fn run_pipeline(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<RunPipelineRequest>,
-) -> axum::response::Response {
-    // Reject malformed/traversal-shaped prefixes before any S3 operation;
-    // this string is interpolated into read, write, and delete keys.
-    if let Err(message) = validate_pipeline_prefix(&body.pipeline_prefix) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_prefix",
-            &message,
-            Vec::new(),
-        );
-    }
-
-    let s3_client = match &state.s3_client {
-        Some(c) => c.clone(),
-        None => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "no_s3_client",
-                "S3 client not configured",
-                Vec::new(),
-            );
-        }
-    };
-
-    let ctx = crate::job::JobContext {
-        s3_client,
-        pipelines_bucket: state.pipelines_bucket.clone(),
-        lake_bucket: state.lake_bucket.clone(),
-        warehouse_bucket: state.warehouse_bucket.clone(),
-    };
-
-    match crate::job::execute_job(
-        &ctx,
-        &body.pipeline_prefix,
-        body.clean_run,
-        &crate::job::NoopProgress,
-    )
-    .await
-    {
-        Ok(outcome) => {
-            let job_id = Uuid::new_v4().to_string();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "job_id": job_id,
-                    "partitions_written": outcome.partitions_written,
-                    "files_processed": outcome.files_processed,
-                    "errors": outcome.errors,
-                })),
-            )
-                .into_response()
-        }
-        Err(crate::job::JobError::NoFiles) => error_response(
-            StatusCode::OK,
-            "no_files",
-            "No CSV files found to process",
-            Vec::new(),
-        ),
-        Err(crate::job::JobError::ConfigRead(e)) => {
-            error_response(StatusCode::BAD_REQUEST, "config_read_failed", &e, Vec::new())
-        }
-        Err(crate::job::JobError::ConfigParse(e)) => {
-            error_response(StatusCode::BAD_REQUEST, "config_parse_failed", &e, Vec::new())
-        }
-        Err(crate::job::JobError::ConfigInvalid(e)) => {
-            error_response(StatusCode::BAD_REQUEST, "config_invalid", &e, Vec::new())
-        }
     }
 }
 
@@ -658,21 +578,17 @@ mod tests {
     // ---- Bearer-token auth ------------------------------------------------
 
     #[tokio::test]
-    async fn post_routes_reject_missing_token() {
-        for uri in ["/config/validate", "/jobs/run"] {
-            let response = post_with_auth(uri, None, "{}").await;
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
-            let v = read_json(response).await;
-            assert_eq!(v["error"]["kind"], "unauthorized", "{uri}");
-        }
+    async fn config_validate_rejects_missing_token() {
+        let response = post_with_auth("/config/validate", None, "{}").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let v = read_json(response).await;
+        assert_eq!(v["error"]["kind"], "unauthorized");
     }
 
     #[tokio::test]
-    async fn post_routes_reject_wrong_token() {
-        for uri in ["/config/validate", "/jobs/run"] {
-            let response = post_with_auth(uri, Some("wrong-token"), "{}").await;
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
-        }
+    async fn config_validate_rejects_wrong_token() {
+        let response = post_with_auth("/config/validate", Some("wrong-token"), "{}").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -728,35 +644,7 @@ mod tests {
     }
 
     // ---- pipeline_prefix validation ----------------------------------------
-
-    #[tokio::test]
-    async fn jobs_run_rejects_traversal_prefix() {
-        let response = post_with_auth(
-            "/jobs/run",
-            Some(TEST_TOKEN),
-            r#"{"pipeline_prefix": "pipelines/../other/", "clean_run": true}"#,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let v = read_json(response).await;
-        assert_eq!(v["error"]["kind"], "invalid_prefix");
-    }
-
-    #[tokio::test]
-    async fn jobs_run_with_valid_prefix_reaches_s3_client_check() {
-        // Prefix validation passes, so the handler proceeds to the S3
-        // client check, which fails in tests (s3_client: None). Proves
-        // validation runs before, and independently of, S3 access.
-        let response = post_with_auth(
-            "/jobs/run",
-            Some(TEST_TOKEN),
-            r#"{"pipeline_prefix": "pipelines/demo/"}"#,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let v = read_json(response).await;
-        assert_eq!(v["error"]["kind"], "no_s3_client");
-    }
+    // (enforced at claim time in queue.rs; the shape rules live here)
 
     #[test]
     fn validate_pipeline_prefix_accepts_legitimate_shapes() {
