@@ -211,7 +211,7 @@ pub async fn execute_job(
                     .iter()
                     .find(|m| m.id == mapping_id)
                     .expect("mapping exists; cloned from same config");
-                let lf = pipeline::ingest_many(&mapping_files, &cfg_cloned, &matchers_cloned)
+                let lf = pipeline::ingest_many(&mapping_files, &cfg_cloned, mapping, &matchers_cloned)
                     .map_err(|e| format!("ingest {}: {e}", mapping.id))?;
                 let df = lf
                     .collect()
