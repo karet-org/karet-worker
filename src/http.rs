@@ -5,9 +5,10 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Json, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Json, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -29,14 +30,112 @@ pub struct AppState {
     /// Bucket for query-ready partitioned Parquet output.
     pub warehouse_bucket: String,
     pub s3_client: Option<aws_sdk_s3::Client>,
+    /// Shared bearer token (`KARET_WORKER_TOKEN`) required on every
+    /// mutating route. `/health` stays open for liveness probes.
+    pub auth_token: String,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let state = Arc::new(state);
+    // Mutating routes sit behind the bearer-token check; `/health` stays
+    // open so liveness probes need no credentials.
+    let protected = Router::new()
         .route("/config/validate", post(post_config_validate))
         .route("/jobs/run", post(run_pipeline))
-        .with_state(Arc::new(state))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_token,
+        ));
+    Router::new()
+        .route("/health", get(health))
+        .merge(protected)
+        .with_state(state)
+}
+
+/// Middleware: require `Authorization: Bearer <KARET_WORKER_TOKEN>`.
+///
+/// The worker has no user model; possession of the shared token is the
+/// entire authorization signal, mirroring the web app's webhook secret.
+async fn require_bearer_token(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    match provided {
+        Some(token) if constant_time_eq(token.as_bytes(), state.auth_token.as_bytes()) => {
+            next.run(request).await
+        }
+        _ => error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid bearer token",
+            Vec::new(),
+        ),
+    }
+}
+
+/// Constant-time byte comparison so token verification doesn't leak
+/// match-prefix length through response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Maximum accepted `pipeline_prefix` length. Generous for
+/// `pipelines/<slug>/` shapes while still bounding pathological input.
+const MAX_PREFIX_LEN: usize = 512;
+
+/// Validate a caller-supplied pipeline prefix before it is interpolated
+/// into S3 keys for reads, writes, and (with `clean_run`) deletes.
+///
+/// Accepts only `segment/segment/.../` shapes: a trailing slash, no
+/// leading slash, non-empty segments of `[A-Za-z0-9._-]`, and no `.` /
+/// `..` segments. The web app sends `pipelines/<slug>/` where the slug is
+/// already `[a-z0-9-]`, so this is a superset of legitimate traffic.
+pub fn validate_pipeline_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Err("pipeline_prefix must not be empty".into());
+    }
+    if prefix.len() > MAX_PREFIX_LEN {
+        return Err(format!(
+            "pipeline_prefix is too long ({} bytes, max {MAX_PREFIX_LEN})",
+            prefix.len()
+        ));
+    }
+    if prefix.starts_with('/') {
+        return Err("pipeline_prefix must not start with '/'".into());
+    }
+    if !prefix.ends_with('/') {
+        return Err("pipeline_prefix must end with '/'".into());
+    }
+    for segment in prefix[..prefix.len() - 1].split('/') {
+        if segment.is_empty() {
+            return Err("pipeline_prefix must not contain empty path segments".into());
+        }
+        if segment == "." || segment == ".." {
+            return Err("pipeline_prefix must not contain '.' or '..' segments".into());
+        }
+        if !segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(format!(
+                "pipeline_prefix segment '{segment}' contains characters outside [A-Za-z0-9._-]"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `GET /health`, liveness probe.
@@ -87,6 +186,17 @@ async fn run_pipeline(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RunPipelineRequest>,
 ) -> axum::response::Response {
+    // Reject malformed/traversal-shaped prefixes before any S3 operation;
+    // this string is interpolated into read, write, and delete keys.
+    if let Err(message) = validate_pipeline_prefix(&body.pipeline_prefix) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_prefix",
+            &message,
+            Vec::new(),
+        );
+    }
+
     let s3_client = match &state.s3_client {
         Some(c) => c.clone(),
         None => {
@@ -347,13 +457,35 @@ mod tests {
         "layout": {}
     }"#;
 
+    const TEST_TOKEN: &str = "test-token";
+
     fn test_state() -> AppState {
         AppState {
             pipelines_bucket: "karet-pipelines".into(),
             lake_bucket: "karet-lake".into(),
             warehouse_bucket: "karet-warehouse".into(),
             s3_client: None,
+            auth_token: TEST_TOKEN.into(),
         }
+    }
+
+    /// POST `body` to `uri` with the given bearer token (None = no header).
+    async fn post_with_auth(
+        uri: &str,
+        token: Option<&str>,
+        body: &str,
+    ) -> axum::response::Response {
+        let app = router(test_state());
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(builder.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap()
     }
 
     async fn read_json(response: axum::response::Response) -> serde_json::Value {
@@ -379,18 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_validate_returns_ok_on_valid() {
-        let app = router(test_state());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/config/validate")
-                    .header("content-type", "application/json")
-                    .body(Body::from(VALID_CONFIG))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = post_with_auth("/config/validate", Some(TEST_TOKEN), VALID_CONFIG).await;
         assert_eq!(response.status(), StatusCode::OK);
         let v = read_json(response).await;
         assert_eq!(v["ok"], true);
@@ -409,18 +530,7 @@ mod tests {
             "analytic_tables": [],
             "layout": {}
         }"#;
-        let app = router(test_state());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/config/validate")
-                    .header("content-type", "application/json")
-                    .body(Body::from(bad))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = post_with_auth("/config/validate", Some(TEST_TOKEN), bad).await;
         assert_eq!(response.status(), StatusCode::OK);
         let v = read_json(response).await;
         assert_eq!(v["ok"], false);
@@ -433,21 +543,115 @@ mod tests {
 
     #[tokio::test]
     async fn config_validate_reports_schema_on_unparseable_body() {
+        let response = post_with_auth("/config/validate", Some(TEST_TOKEN), "not json").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let v = read_json(response).await;
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["errors"][0]["kind"], "schema");
+    }
+
+    // ---- Bearer-token auth ------------------------------------------------
+
+    #[tokio::test]
+    async fn post_routes_reject_missing_token() {
+        for uri in ["/config/validate", "/jobs/run"] {
+            let response = post_with_auth(uri, None, "{}").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+            let v = read_json(response).await;
+            assert_eq!(v["error"]["kind"], "unauthorized", "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_routes_reject_wrong_token() {
+        for uri in ["/config/validate", "/jobs/run"] {
+            let response = post_with_auth(uri, Some("wrong-token"), "{}").await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_needs_no_token() {
         let app = router(test_state());
         let response = app
             .oneshot(
                 Request::builder()
-                    .method(Method::POST)
-                    .uri("/config/validate")
-                    .header("content-type", "application/json")
-                    .body(Body::from("not json"))
+                    .method(Method::GET)
+                    .uri("/health")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ---- pipeline_prefix validation ----------------------------------------
+
+    #[tokio::test]
+    async fn jobs_run_rejects_traversal_prefix() {
+        let response = post_with_auth(
+            "/jobs/run",
+            Some(TEST_TOKEN),
+            r#"{"pipeline_prefix": "pipelines/../other/", "clean_run": true}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let v = read_json(response).await;
-        assert_eq!(v["ok"], false);
-        assert_eq!(v["errors"][0]["kind"], "schema");
+        assert_eq!(v["error"]["kind"], "invalid_prefix");
+    }
+
+    #[tokio::test]
+    async fn jobs_run_with_valid_prefix_reaches_s3_client_check() {
+        // Prefix validation passes, so the handler proceeds to the S3
+        // client check, which fails in tests (s3_client: None). Proves
+        // validation runs before, and independently of, S3 access.
+        let response = post_with_auth(
+            "/jobs/run",
+            Some(TEST_TOKEN),
+            r#"{"pipeline_prefix": "pipelines/demo/"}"#,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let v = read_json(response).await;
+        assert_eq!(v["error"]["kind"], "no_s3_client");
+    }
+
+    #[test]
+    fn validate_pipeline_prefix_accepts_legitimate_shapes() {
+        for prefix in [
+            "pipelines/demo/",
+            "pipelines/my-pipeline-2/",
+            "a/b.c/d_e/",
+            "single/",
+        ] {
+            assert!(
+                validate_pipeline_prefix(prefix).is_ok(),
+                "expected Ok for {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_pipeline_prefix_rejects_malformed_shapes() {
+        let cases = [
+            "",
+            "no-trailing-slash",
+            "/leading/slash/",
+            "double//slash/",
+            "pipelines/../other/",
+            "./relative/",
+            "pipelines/sp ace/",
+            "pipelines/semi;colon/",
+            "pipelines/quo'te/",
+        ];
+        for prefix in cases {
+            assert!(
+                validate_pipeline_prefix(prefix).is_err(),
+                "expected Err for {prefix:?}"
+            );
+        }
+        let too_long = format!("{}/", "a".repeat(600));
+        assert!(validate_pipeline_prefix(&too_long).is_err());
     }
 }

@@ -25,6 +25,7 @@ pub const REQUIRED_ENV_VARS: &[&str] = &[
     "AWS_SECRET_ACCESS_KEY",
     "AWS_REGION",
     "AWS_ENDPOINT_URL",
+    "KARET_WORKER_TOKEN",
 ];
 
 /// Assert every env var in `names` is set to a non-empty value.
@@ -60,6 +61,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pipelines_bucket = std::env::var("S3_BUCKET_PIPELINES").expect("checked above");
     let lake_bucket = std::env::var("S3_BUCKET_LAKE").expect("checked above");
     let warehouse_bucket = std::env::var("S3_BUCKET_WAREHOUSE").expect("checked above");
+    let auth_token = std::env::var("KARET_WORKER_TOKEN").expect("checked above");
 
     let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .endpoint_url(std::env::var("AWS_ENDPOINT_URL").unwrap_or_default())
@@ -75,6 +77,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         lake_bucket,
         warehouse_bucket,
         s3_client: Some(s3_client),
+        auth_token,
     };
 
     let app = http::router(state);

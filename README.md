@@ -22,9 +22,13 @@ All required to start the worker; it fails fast if any is unset.
 | `S3_BUCKET_WAREHOUSE` | Bucket for partitioned Parquet output (default `karet-warehouse`). |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | S3 credentials |
 | `AWS_ENDPOINT_URL` | S3 endpoint URL (e.g. `http://rustfs:9000` for local dev, `https://s3.<region>.amazonaws.com` for real AWS). |
+| `KARET_WORKER_TOKEN` | Shared bearer token required on `POST /config/validate` and `POST /jobs/run`. Generate with `openssl rand -hex 32`; the web service must send the same value. |
 | `PORT` | Optional HTTP server port (default `8080`). |
 
 ## HTTP API
+
+`POST` endpoints require an `Authorization: Bearer $KARET_WORKER_TOKEN`
+header; `GET /health` is open for liveness probes.
 
 | Method | Path | Purpose |
 |--------|------|---------|

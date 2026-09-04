@@ -198,6 +198,9 @@ pub struct PartitionOutput {
     pub bytes: Vec<u8>,
 }
 
+/// One `(year, month)` partition and the rows belonging to it.
+pub type MonthPartition = ((i32, u32), DataFrame);
+
 /// Partition a [`DataFrame`] by `(year, month)` of a date-typed column.
 ///
 /// Returns one `((year, month), sub_df)` entry per distinct calendar month
@@ -206,7 +209,7 @@ pub struct PartitionOutput {
 pub fn partition_by_month(
     df: &DataFrame,
     partition_col: &str,
-) -> Result<Vec<((i32, u32), DataFrame)>, PolarsError> {
+) -> Result<Vec<MonthPartition>, PolarsError> {
     let partitions = df
         .clone()
         .lazy()
