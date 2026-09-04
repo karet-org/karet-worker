@@ -39,20 +39,30 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     let state = Arc::new(state);
-    // Mutating routes sit behind the bearer-token check; `/health` stays
-    // open so liveness probes need no credentials.
+    // Mutating routes sit behind the bearer-token check. `route_layer`
+    // (not `layer`) so the middleware wraps only matched routes — with
+    // plain `layer` the router's 404 fallback answers 401 for every
+    // unknown path, which broke RustFS's HEAD health probe of `/`.
     let protected = Router::new()
         .route("/config/validate", post(post_config_validate))
         .route("/jobs/run", post(run_pipeline))
-        .layer(middleware::from_fn_with_state(
+        .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
         ));
     Router::new()
+        // RustFS HEAD-probes the webhook endpoint's origin root before
+        // delivering events; axum serves HEAD via the GET handler.
+        .route("/", get(root))
         .route("/health", get(health))
         .route("/events/s3", post(post_s3_events))
         .merge(protected)
         .with_state(state)
+}
+
+/// `GET|HEAD /`: identification + webhook-origin health probe target.
+async fn root() -> impl IntoResponse {
+    (StatusCode::OK, "karet-worker")
 }
 
 /// Middleware: require `Authorization: Bearer <KARET_WORKER_TOKEN>`.
@@ -679,6 +689,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn root_answers_head_probe_without_auth() {
+        // RustFS HEAD-probes the webhook origin's root before delivering.
+        let app = router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unknown_path_is_404_not_401() {
+        // Regression: the auth middleware must wrap only matched routes.
+        // With `.layer` it wrapped the fallback too, turning every
+        // unknown path into a 401 and failing RustFS's health probe.
+        let app = router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     // ---- pipeline_prefix validation ----------------------------------------

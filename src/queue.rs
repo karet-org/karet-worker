@@ -638,7 +638,16 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
 pub async fn consumer_loop(ctx: Arc<QueueCtx>) {
     let mut shutdown = ctx.shutdown.clone();
     let mut conn = loop {
-        match ctx.client.get_multiplexed_async_connection().await {
+        // Response timeout must exceed the XREADGROUP BLOCK duration
+        // (5s); the client default is 500ms, which made every idle
+        // blocking read "fail" with a spurious timeout.
+        let config = redis::AsyncConnectionConfig::new()
+            .set_response_timeout(Some(std::time::Duration::from_secs(15)));
+        match ctx
+            .client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await
+        {
             Ok(c) => break c,
             Err(e) => {
                 tracing::error!("redis connect failed (consumer): {e}; retrying in 5s");
