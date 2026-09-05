@@ -7,7 +7,7 @@
 //!   - `jobs:live:<id>` hash of live job state + progress
 //!   - `jobs:index:<pipeline>` ZSET job_id scored by enqueued_at ms
 //!   - `jobs:delayed` ZSET JSON payload scored by fire-at ms
-//!   - `lock:pipeline:<slug>` run lock, value = job_id, PX + heartbeat
+//!   - `lock:pipeline:<slug>` run lock, value = `job_id:attempt` (fence), PX + heartbeat
 //!   - `debounce` ZSET slug scored by fire-at ms
 //!   - `debounce:first:<slug>` batch-start ms, drives the max-wait cap
 //!
@@ -152,6 +152,9 @@ pub async fn enqueue(
         .hset(live_key(&msg.job_id), "enqueued_at", msg.enqueued_at)
         .hset(live_key(&msg.job_id), "clean_run", msg.clean_run.to_string())
         .zadd(index_key(&msg.pipeline), &msg.job_id, msg.enqueued_at)
+        // Safety net: never-claimed hashes expire eventually; terminal
+        // transitions shorten this to live_terminal_ttl_s.
+        .expire(live_key(&msg.job_id), 7 * 24 * 60 * 60)
         .ignore();
     pipe.query_async::<()>(conn).await
 }
@@ -186,15 +189,29 @@ else
   return 0
 end"#;
 
+const RENEW_LOCK_LUA: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+else
+  return 0
+end"#;
+
+/// Lock value: `<job_id>:<attempt>`. The attempt suffix fences out stale
+/// holders — a presumed-dead worker that is still running cannot renew or
+/// release a lock now owned by a later attempt.
+fn fence(job_id: &str, attempt: u32) -> String {
+    format!("{job_id}:{attempt}")
+}
+
 async fn try_lock(
     conn: &mut MultiplexedConnection,
     pipeline: &str,
-    job_id: &str,
+    fence: &str,
     ttl_ms: u64,
 ) -> Result<bool, RedisError> {
     let result: Option<String> = redis::cmd("SET")
         .arg(lock_key(pipeline))
-        .arg(job_id)
+        .arg(fence)
         .arg("NX")
         .arg("PX")
         .arg(ttl_ms)
@@ -206,13 +223,29 @@ async fn try_lock(
 async fn release_lock(
     conn: &mut MultiplexedConnection,
     pipeline: &str,
-    job_id: &str,
+    fence: &str,
 ) -> Result<(), RedisError> {
     redis::Script::new(RELEASE_LOCK_LUA)
         .key(lock_key(pipeline))
-        .arg(job_id)
+        .arg(fence)
         .invoke_async::<()>(conn)
         .await
+}
+
+/// Renew the lock TTL iff we still hold it. Returns false when fenced out.
+async fn renew_lock(
+    conn: &mut MultiplexedConnection,
+    pipeline: &str,
+    fence: &str,
+    ttl_ms: u64,
+) -> Result<bool, RedisError> {
+    let renewed: i64 = redis::Script::new(RENEW_LOCK_LUA)
+        .key(lock_key(pipeline))
+        .arg(fence)
+        .arg(ttl_ms)
+        .invoke_async(conn)
+        .await?;
+    Ok(renewed == 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +402,7 @@ async fn finish_job(
         .await
         .map_err(|e| format!("live terminal update failed: {e}"))?;
 
-    release_lock(conn, &msg.pipeline, &msg.job_id)
+    release_lock(conn, &msg.pipeline, &fence(&msg.job_id, attempts))
         .await
         .map_err(|e| format!("lock release failed: {e}"))?;
     let _: Result<(), RedisError> = conn.xack(STREAM_KEY, GROUP, &[stream_id]).await;
@@ -467,7 +500,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
     }
 
     // Per-pipeline serialization: busy → defer, don't block the consumer.
-    match try_lock(&mut conn, &msg.pipeline, &msg.job_id, ctx.settings.lock_ttl_ms).await {
+    match try_lock(&mut conn, &msg.pipeline, &fence(&msg.job_id, attempts), ctx.settings.lock_ttl_ms).await {
         Ok(true) => {}
         Ok(false) => {
             // Not this job's fault; don't burn an attempt on lock-busy.
@@ -507,18 +540,38 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
             hb_ctx.settings.heartbeat_ms,
         ));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let Ok(mut conn) = hb_ctx.client.get_multiplexed_async_connection().await else {
-            return;
-        };
+        let hb_fence = fence(&hb_msg.job_id, attempts);
+        let mut conn: Option<MultiplexedConnection> = None;
         loop {
             interval.tick().await;
-            let _: Result<(), RedisError> = redis::cmd("PEXPIRE")
-                .arg(lock_key(&hb_msg.pipeline))
-                .arg(hb_ctx.settings.lock_ttl_ms)
-                .query_async(&mut conn)
-                .await;
+            let c = match &mut conn {
+                Some(c) => c,
+                None => match hb_ctx.client.get_multiplexed_async_connection().await {
+                    Ok(c) => conn.insert(c),
+                    Err(e) => {
+                        tracing::warn!("heartbeat connect failed for {}: {e}; retrying", hb_msg.job_id);
+                        continue;
+                    }
+                },
+            };
+            match renew_lock(c, &hb_msg.pipeline, &hb_fence, hb_ctx.settings.lock_ttl_ms).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Fenced out: another attempt owns the pipeline now.
+                    tracing::error!(
+                        "lock for {} lost to a newer attempt; this run's uploads may overlap",
+                        hb_msg.job_id
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("heartbeat renew failed for {}: {e}", hb_msg.job_id);
+                    conn = None;
+                    continue;
+                }
+            }
             // XCLAIM to self with IDLE 0 resets the PEL idle clock.
-            let _: Result<redis::Value, RedisError> = redis::cmd("XCLAIM")
+            let claimed: Result<redis::Value, RedisError> = redis::cmd("XCLAIM")
                 .arg(STREAM_KEY)
                 .arg(GROUP)
                 .arg(&hb_ctx.consumer_name)
@@ -527,8 +580,12 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
                 .arg("IDLE")
                 .arg(0)
                 .arg("JUSTID")
-                .query_async(&mut conn)
+                .query_async(c)
                 .await;
+            if let Err(e) = claimed {
+                tracing::warn!("heartbeat XCLAIM failed for {}: {e}", hb_msg.job_id);
+                conn = None;
+            }
         }
     });
 
@@ -582,7 +639,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
         // Possibly-transient: config object unreadable (network, S3 5xx).
         Err(JobError::ConfigRead(e)) => {
             tracing::warn!("config read failed for {} (attempt {attempts}): {e}", msg.job_id);
-            release_lock(&mut conn, &msg.pipeline, &msg.job_id)
+            release_lock(&mut conn, &msg.pipeline, &fence(&msg.job_id, attempts))
                 .await
                 .map_err(|err| format!("lock release failed: {err}"))
                 .and(if attempts >= ctx.settings.max_attempts {
@@ -756,32 +813,122 @@ pub async fn reclaimer_loop(ctx: Arc<QueueCtx>) {
         if *shutdown.borrow() {
             return;
         }
-        let reply: Result<redis::streams::StreamAutoClaimReply, RedisError> =
-            redis::cmd("XAUTOCLAIM")
-                .arg(STREAM_KEY)
-                .arg(GROUP)
-                .arg(&ctx.consumer_name)
-                .arg(ctx.settings.reclaim_idle_ms)
-                .arg("0-0")
-                .arg("COUNT")
-                .arg(10)
-                .query_async(&mut conn)
-                .await;
-        match reply {
-            Ok(reply) => {
-                for entry in reply.claimed {
-                    let payload: String = entry
-                        .map
-                        .get("payload")
-                        .and_then(|v| redis::from_redis_value(v.clone()).ok())
-                        .unwrap_or_default();
-                    tracing::warn!("reclaimed stale job entry {}", entry.id);
-                    handle_claimed(&ctx, entry.id.clone(), payload).await;
+        // Claim one entry at a time: entries claimed in a batch but not
+        // yet processed have no heartbeat, so they'd exceed the idle
+        // threshold mid-queue and get double-claimed by another worker.
+        loop {
+            let reply: Result<redis::streams::StreamAutoClaimReply, RedisError> =
+                redis::cmd("XAUTOCLAIM")
+                    .arg(STREAM_KEY)
+                    .arg(GROUP)
+                    .arg(&ctx.consumer_name)
+                    .arg(ctx.settings.reclaim_idle_ms)
+                    .arg("0-0")
+                    .arg("COUNT")
+                    .arg(1)
+                    .query_async(&mut conn)
+                    .await;
+            match reply {
+                Ok(reply) if reply.claimed.is_empty() => break,
+                Ok(reply) => {
+                    for entry in reply.claimed {
+                        let payload: String = entry
+                            .map
+                            .get("payload")
+                            .and_then(|v| redis::from_redis_value(v.clone()).ok())
+                            .unwrap_or_default();
+                        tracing::warn!("reclaimed stale job entry {}", entry.id);
+                        handle_claimed(&ctx, entry.id.clone(), payload).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("XAUTOCLAIM failed: {e}");
+                    break;
                 }
             }
-            Err(e) => tracing::warn!("XAUTOCLAIM failed: {e}"),
+        }
+        if let Err(e) = sweep_orphaned_live_hashes(&ctx, &mut conn).await {
+            tracing::warn!("orphan sweep failed: {e}");
         }
     }
+}
+
+/// Grace before a non-terminal live hash with no stream entry counts as
+/// orphaned; covers the enqueue window between HSET and XADD visibility.
+const ORPHAN_GRACE_MS: i64 = 10 * 60 * 1000;
+
+/// Mark non-terminal live hashes whose stream entry no longer exists as
+/// `abandoned`. Happens when XTRIM drops an unprocessed entry under heavy
+/// backlog; without the sweep the hash shows `queued` forever.
+pub async fn sweep_orphaned_live_hashes(
+    ctx: &Arc<QueueCtx>,
+    conn: &mut MultiplexedConnection,
+) -> Result<(), RedisError> {
+    let reply: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+        .arg(STREAM_KEY)
+        .arg("-")
+        .arg("+")
+        .query_async(&mut *conn)
+        .await?;
+    let mut stream_job_ids = std::collections::HashSet::new();
+    for id in &reply.ids {
+        if let Some(payload) = id
+            .map
+            .get("payload")
+            .and_then(|v| redis::from_redis_value::<String>(v.clone()).ok())
+        {
+            if let Ok(msg) = serde_json::from_str::<JobMessage>(&payload) {
+                stream_job_ids.insert(msg.job_id);
+            }
+        }
+    }
+
+    let mut live_keys: Vec<String> = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("karet:jobs:live:*")
+            .arg("COUNT")
+            .arg(100)
+            .query_async(&mut *conn)
+            .await?;
+        live_keys.extend(batch);
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    let cutoff = now_ms() - ORPHAN_GRACE_MS;
+    for key in live_keys {
+        let job_id = key.trim_start_matches("karet:jobs:live:").to_string();
+        if stream_job_ids.contains(&job_id) {
+            continue;
+        }
+        let (status, enqueued_at): (Option<String>, Option<i64>) = redis::pipe()
+            .hget(&key, "status")
+            .hget(&key, "enqueued_at")
+            .query_async(&mut *conn)
+            .await?;
+        let non_terminal = matches!(status.as_deref(), Some("queued") | Some("running"));
+        if !non_terminal || enqueued_at.unwrap_or(0) > cutoff {
+            continue;
+        }
+        // Running jobs are covered by the PEL reclaim path; only sweep
+        // jobs whose stream entry is truly gone.
+        tracing::warn!("sweeping orphaned live hash for {job_id} (stream entry gone)");
+        redis::pipe()
+            .atomic()
+            .hset(&key, "status", "abandoned")
+            .hset(&key, "error", "queue entry lost (stream trimmed); re-run the job")
+            .hset(&key, "finished_at", now_iso())
+            .expire(&key, ctx.settings.live_terminal_ttl_s as i64)
+            .ignore()
+            .query_async::<()>(&mut *conn)
+            .await?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

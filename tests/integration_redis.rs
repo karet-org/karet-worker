@@ -310,6 +310,37 @@ async fn debounce_extends_quiet_window_and_fires_once() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a running Redis/Valkey; set REDIS_TEST_URL"]
+async fn sweep_marks_trimmed_jobs_abandoned() {
+    let Some(url) = test_url() else {
+        panic!("REDIS_TEST_URL is not set");
+    };
+    let mut conn = flush(&url).await;
+
+    // Live hash without a stream entry (as if XTRIM dropped it), enqueued
+    // beyond the grace window.
+    let stale_ms = queue::now_ms() - 20 * 60 * 1000;
+    let _: () = redis::pipe()
+        .hset("karet:jobs:live:job-orphan-1", "status", "queued")
+        .hset("karet:jobs:live:job-orphan-1", "pipeline", "eps")
+        .hset("karet:jobs:live:job-orphan-1", "enqueued_at", stale_ms)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    // A healthy queued job (stream entry present) must be untouched.
+    queue::enqueue(&mut conn, &msg("job-healthy-1", "zeta")).await.unwrap();
+
+    let (ctx, _shutdown) = make_ctx(&url).await;
+    let mut sweep_conn = ctx.client.get_multiplexed_async_connection().await.unwrap();
+    queue::sweep_orphaned_live_hashes(&ctx, &mut sweep_conn).await.unwrap();
+
+    assert_eq!(hget(&mut conn, "job-orphan-1", "status").await.as_deref(), Some("abandoned"));
+    let ttl: i64 = conn.ttl("karet:jobs:live:job-orphan-1").await.unwrap();
+    assert!(ttl > 0, "abandoned hash should expire, ttl={ttl}");
+    assert_eq!(hget(&mut conn, "job-healthy-1", "status").await.as_deref(), Some("queued"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running Redis/Valkey; set REDIS_TEST_URL"]
 async fn reclaimer_picks_up_dead_consumers_entry() {
     let Some(url) = test_url() else {
         panic!("REDIS_TEST_URL is not set");

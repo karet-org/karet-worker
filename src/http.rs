@@ -223,26 +223,23 @@ struct S3EventPayload {
 }
 
 /// Pull `<slug>` out of a `pipelines/<slug>/...` key (URL-decoded first,
-/// matching the S3 event spec). Slug rule mirrors the web app's
-/// `sanitizeSlug`: `[a-z0-9-]` after lowercasing; anything else → None.
+/// matching the S3 event spec). Slugs are created as `[a-z0-9-]`; keys
+/// with anything else are not pipeline uploads and are dropped, not
+/// normalized — rewriting (e.g. `My_Pipe` → `my-pipe`) used to enqueue
+/// jobs for pipelines that don't exist.
 fn pipeline_slug_from_key(raw_key: &str) -> Option<String> {
     let key = urldecode(raw_key);
     let rest = key.strip_prefix("pipelines/")?;
-    let slug_raw = rest.split('/').next()?;
-    if slug_raw.is_empty() || rest.len() == slug_raw.len() {
-        return None; // no second path segment
+    let (slug, tail) = rest.split_once('/')?;
+    if slug.is_empty()
+        || tail.is_empty()
+        || !slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return None;
     }
-    let slug: String = slug_raw
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-        .collect();
-    let slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() {
-        None
-    } else {
-        Some(slug)
-    }
+    Some(slug.to_string())
 }
 
 /// Minimal percent-decoding (S3 events encode keys like URL query args,
@@ -708,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_slug_from_key_extracts_and_sanitizes() {
+    fn pipeline_slug_from_key_extracts_and_rejects() {
         assert_eq!(
             pipeline_slug_from_key("pipelines/demo/raw/tx/jan.csv"),
             Some("demo".into())
@@ -718,11 +715,10 @@ mod tests {
             pipeline_slug_from_key("pipelines/my-pipe/raw/a%20b.csv"),
             Some("my-pipe".into())
         );
-        // uppercase + illegal chars sanitize like the web app
-        assert_eq!(
-            pipeline_slug_from_key("pipelines/My_Pipe/raw/x.csv"),
-            Some("my-pipe".into())
-        );
+        // Non-canonical slugs are dropped, not rewritten: normalizing
+        // My_Pipe to my-pipe enqueued jobs for nonexistent pipelines.
+        assert_eq!(pipeline_slug_from_key("pipelines/My_Pipe/raw/x.csv"), None);
+        assert_eq!(pipeline_slug_from_key("pipelines/sp ace/raw/x.csv"), None);
         // not under pipelines/ or no second segment
         assert_eq!(pipeline_slug_from_key("other/demo/x.csv"), None);
         assert_eq!(pipeline_slug_from_key("pipelines/demo"), None);
