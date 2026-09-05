@@ -46,6 +46,15 @@ fn lock_key(pipeline: &str) -> String {
 fn debounce_first_key(slug: &str) -> String {
     format!("karet:debounce:first:{slug}")
 }
+fn events_channel(pipeline: &str) -> String {
+    format!("karet:jobs:events:{pipeline}")
+}
+
+/// Notify subscribers (the web app's SSE endpoint) that a job's live
+/// state changed. Best-effort; the UI reconciles by polling anyway.
+async fn publish_job_event(conn: &mut MultiplexedConnection, pipeline: &str, job_id: &str) {
+    let _: Result<(), RedisError> = conn.publish(events_channel(pipeline), job_id).await;
+}
 
 /// Tunables, all env-overridable (see README).
 #[derive(Clone, Debug)]
@@ -156,7 +165,9 @@ pub async fn enqueue(
         // transitions shorten this to live_terminal_ttl_s.
         .expire(live_key(&msg.job_id), 7 * 24 * 60 * 60)
         .ignore();
-    pipe.query_async::<()>(conn).await
+    pipe.query_async::<()>(conn).await?;
+    publish_job_event(conn, &msg.pipeline, &msg.job_id).await;
+    Ok(())
 }
 
 /// Idempotently create the consumer group (and the stream if missing).
@@ -269,6 +280,7 @@ impl RedisProgress {
     /// sink closes the channel, ending the drain task.
     pub fn start(
         mut conn: MultiplexedConnection,
+        pipeline: String,
         job_id: String,
     ) -> (Self, tokio::task::JoinHandle<()>) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Progress>();
@@ -302,6 +314,8 @@ impl RedisProgress {
                 };
                 if let Err(e) = result {
                     tracing::warn!("progress write failed: {e}");
+                } else {
+                    publish_job_event(&mut conn, &pipeline, &job_id).await;
                 }
             }
         });
@@ -401,6 +415,7 @@ async fn finish_job(
     pipe.query_async::<()>(conn)
         .await
         .map_err(|e| format!("live terminal update failed: {e}"))?;
+    publish_job_event(conn, &msg.pipeline, &msg.job_id).await;
 
     release_lock(conn, &msg.pipeline, &fence(&msg.job_id, attempts))
         .await
@@ -529,6 +544,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
         .ignore()
         .query_async(&mut conn)
         .await;
+    publish_job_event(&mut conn, &msg.pipeline, &msg.job_id).await;
 
     // Heartbeat: renew the lock and reset PEL idle time so neither the
     // lock TTL nor the reclaimer fires while we're alive and working.
@@ -589,7 +605,8 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
         }
     });
 
-    let (progress, progress_task) = RedisProgress::start(conn.clone(), msg.job_id.clone());
+    let (progress, progress_task) =
+        RedisProgress::start(conn.clone(), msg.pipeline.clone(), msg.job_id.clone());
     let outcome = job::execute_job(&ctx.job_ctx, &msg.prefix, msg.clean_run, &progress).await;
     drop(progress); // close channel so the drain task ends
     let _ = progress_task.await;
@@ -906,11 +923,13 @@ pub async fn sweep_orphaned_live_hashes(
         if stream_job_ids.contains(&job_id) {
             continue;
         }
-        let (status, enqueued_at): (Option<String>, Option<i64>) = redis::pipe()
-            .hget(&key, "status")
-            .hget(&key, "enqueued_at")
-            .query_async(&mut *conn)
-            .await?;
+        let (status, enqueued_at, pipeline): (Option<String>, Option<i64>, Option<String>) =
+            redis::pipe()
+                .hget(&key, "status")
+                .hget(&key, "enqueued_at")
+                .hget(&key, "pipeline")
+                .query_async(&mut *conn)
+                .await?;
         let non_terminal = matches!(status.as_deref(), Some("queued") | Some("running"));
         if !non_terminal || enqueued_at.unwrap_or(0) > cutoff {
             continue;
@@ -927,6 +946,9 @@ pub async fn sweep_orphaned_live_hashes(
             .ignore()
             .query_async::<()>(&mut *conn)
             .await?;
+        if let Some(pipeline) = pipeline {
+            publish_job_event(conn, &pipeline, &job_id).await;
+        }
     }
     Ok(())
 }
