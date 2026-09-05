@@ -197,7 +197,7 @@ else
 end"#;
 
 /// Lock value: `<job_id>:<attempt>`. The attempt suffix fences out stale
-/// holders — a presumed-dead worker that is still running cannot renew or
+/// holders: a presumed-dead worker that is still running cannot renew or
 /// release a lock now owned by a later attempt.
 fn fence(job_id: &str, attempt: u32) -> String {
     format!("{job_id}:{attempt}")

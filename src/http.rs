@@ -225,7 +225,7 @@ struct S3EventPayload {
 /// Pull `<slug>` out of a `pipelines/<slug>/...` key (URL-decoded first,
 /// matching the S3 event spec). Slugs are created as `[a-z0-9-]`; keys
 /// with anything else are not pipeline uploads and are dropped, not
-/// normalized — rewriting (e.g. `My_Pipe` → `my-pipe`) used to enqueue
+/// normalized. Rewriting (e.g. `My_Pipe` to `my-pipe`) used to enqueue
 /// jobs for pipelines that don't exist.
 fn pipeline_slug_from_key(raw_key: &str) -> Option<String> {
     let key = urldecode(raw_key);
