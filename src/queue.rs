@@ -378,6 +378,22 @@ async fn finish_job(
     attempts: u32,
     terminal: Terminal<'_>,
 ) -> Result<(), String> {
+    // A stale attempt must not write the terminal record or ack the
+    // stream entry: both now belong to the newer attempt.
+    let holder: Option<String> = conn
+        .get(lock_key(&msg.pipeline))
+        .await
+        .map_err(|e| format!("fence check failed: {e}"))?;
+    if let Some(v) = &holder {
+        if v != &fence(&msg.job_id, attempts) {
+            tracing::warn!(
+                "skipping terminal write for {}: lock now held by {v}",
+                msg.job_id
+            );
+            return Ok(());
+        }
+    }
+
     let completed_at = now_iso();
     let mut record = serde_json::json!({
         "id": msg.job_id,
@@ -517,6 +533,14 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
         return;
     }
 
+    // Redelivery guard: a job that already reached a terminal state
+    // (dropped XACK, reclaim edge) must not re-run.
+    let status: Option<String> = conn.hget(live_key(&msg.job_id), "status").await.ok().flatten();
+    if matches!(status.as_deref(), Some("completed") | Some("failed") | Some("abandoned")) {
+        let _: Result<(), RedisError> = conn.xack(STREAM_KEY, GROUP, &[&stream_id]).await;
+        return;
+    }
+
     // Attempt accounting before the lock so a poison job can't loop
     // forever between defer and claim.
     let attempts: u32 = match conn.hincr(live_key(&msg.job_id), "attempts", 1u32).await {
@@ -579,10 +603,15 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
         .await;
     publish_job_event(&mut conn, &msg.pipeline, &msg.job_id).await;
 
+    // Set when the heartbeat discovers the lock was lost to a newer
+    // attempt; the executor checks it between stages and aborts.
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Heartbeat: renew the lock and reset PEL idle time so neither the
     // lock TTL nor the reclaimer fires while we're alive and working.
     let hb_ctx = ctx.clone();
     let hb_msg = msg.clone();
+    let hb_cancelled = cancelled.clone();
     let hb_stream_id = stream_id.clone();
     let heartbeat = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(
@@ -606,9 +635,9 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
             match renew_lock(c, &hb_msg.pipeline, &hb_fence, hb_ctx.settings.lock_ttl_ms).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    // Fenced out: another attempt owns the pipeline now.
+                    hb_cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
                     tracing::error!(
-                        "lock for {} lost to a newer attempt; this run's uploads may overlap",
+                        "lock for {} lost to a newer attempt; cancelling this run",
                         hb_msg.job_id
                     );
                     return;
@@ -640,7 +669,8 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
 
     let (progress, progress_task) =
         RedisProgress::start(conn.clone(), msg.pipeline.clone(), msg.job_id.clone());
-    let outcome = job::execute_job(&ctx.job_ctx, &msg.prefix, msg.clean_run, &progress).await;
+    let outcome =
+        job::execute_job(&ctx.job_ctx, &msg.prefix, msg.clean_run, &progress, &cancelled).await;
     drop(progress); // close channel so the drain task ends
     let _ = progress_task.await;
     heartbeat.abort();
@@ -716,6 +746,12 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
                 })
         }
         // Permanent config problems.
+        // Lock lost to a newer attempt: the new owner runs the job and
+        // owns the record, the PEL entry, and the lock. Touch nothing.
+        Err(JobError::Cancelled) => {
+            tracing::warn!("run cancelled for {} (fenced out)", msg.job_id);
+            Ok(())
+        }
         Err(e @ (JobError::ConfigParse(_) | JobError::ConfigInvalid(_))) => {
             finish_job(
                 ctx, &mut conn, &msg, &stream_id, &started_at_iso, attempts,
@@ -940,13 +976,20 @@ pub async fn sweep_orphaned_live_hashes(
         .await?;
     let mut stream_job_ids = std::collections::HashSet::new();
     for id in &reply.ids {
-        if let Some(payload) = id
+        let parsed = id
             .map
             .get("payload")
             .and_then(|v| redis::from_redis_value::<String>(v.clone()).ok())
-        {
-            if let Ok(msg) = serde_json::from_str::<JobMessage>(&payload) {
+            .and_then(|p| serde_json::from_str::<JobMessage>(&p).ok());
+        match parsed {
+            Some(msg) => {
                 stream_job_ids.insert(msg.job_id);
+            }
+            None => {
+                // Fail closed: an entry we can't attribute to a job id
+                // could be the one keeping a hash alive.
+                tracing::warn!("sweep skipped: unparseable stream entry {}", id.id);
+                return Ok(());
             }
         }
     }
@@ -982,7 +1025,12 @@ pub async fn sweep_orphaned_live_hashes(
                 .query_async(&mut *conn)
                 .await?;
         let non_terminal = matches!(status.as_deref(), Some("queued") | Some("running"));
-        if !non_terminal || enqueued_at.unwrap_or(0) > cutoff {
+        // Fail closed: a missing or unparseable enqueued_at must not look
+        // ancient.
+        let Some(enqueued_at) = enqueued_at else {
+            continue;
+        };
+        if !non_terminal || enqueued_at > cutoff {
             continue;
         }
         // Running jobs are covered by the PEL reclaim path; only sweep

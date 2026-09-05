@@ -345,6 +345,54 @@ async fn lifecycle_publishes_job_events() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a running Redis/Valkey; set REDIS_TEST_URL"]
+async fn redelivered_terminal_job_is_acked_not_rerun() {
+    let Some(url) = test_url() else {
+        panic!("REDIS_TEST_URL is not set");
+    };
+    let mut conn = flush(&url).await;
+
+    // Simulate a dropped XACK: the job finished (terminal hash) but its
+    // stream entry is still deliverable.
+    queue::ensure_group(&mut conn).await.unwrap();
+    queue::enqueue(&mut conn, &msg("job-rerun-1", "theta")).await.unwrap();
+    let _: () = redis::pipe()
+        .hset("karet:jobs:live:job-rerun-1", "status", "completed")
+        .hset("karet:jobs:live:job-rerun-1", "attempts", 1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let (ctx, shutdown) = make_ctx(&url).await;
+    let consumer = tokio::spawn(queue::consumer_loop(ctx.clone()));
+
+    // The entry must be acked (pending drains to zero) without a run:
+    // attempts stays 1 and status stays completed.
+    let start = std::time::Instant::now();
+    loop {
+        let pending: redis::streams::StreamPendingReply =
+            redis::cmd("XPENDING").arg(STREAM_KEY).arg(GROUP).query_async(&mut conn).await.unwrap();
+        let count = match pending {
+            redis::streams::StreamPendingReply::Data(d) => d.count,
+            _ => 0,
+        };
+        let delivered: i64 = redis::cmd("XLEN").arg(STREAM_KEY).query_async(&mut conn).await.unwrap();
+        if count == 0 && delivered > 0 && start.elapsed() > std::time::Duration::from_secs(2) {
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(15) {
+            panic!("redelivered entry never acked");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_eq!(hget(&mut conn, "job-rerun-1", "status").await.as_deref(), Some("completed"));
+    assert_eq!(hget(&mut conn, "job-rerun-1", "attempts").await.as_deref(), Some("1"));
+
+    let _ = shutdown.send(true);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), consumer).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running Redis/Valkey; set REDIS_TEST_URL"]
 async fn sweep_marks_trimmed_jobs_abandoned() {
     let Some(url) = test_url() else {
         panic!("REDIS_TEST_URL is not set");

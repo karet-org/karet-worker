@@ -63,6 +63,9 @@ pub enum JobError {
     /// No CSV files found under any source container prefix.
     #[error("no CSV files found to process")]
     NoFiles,
+    /// The run lock was lost to a newer attempt; abort without writing.
+    #[error("cancelled: lock lost to a newer attempt")]
+    Cancelled,
 }
 
 /// Everything `execute_job` needs from the environment.
@@ -85,7 +88,9 @@ pub async fn execute_job(
     prefix: &str,
     clean_run: bool,
     progress: &dyn ProgressSink,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<JobOutcome, JobError> {
+    use std::sync::atomic::Ordering;
     let config_key = format!("{prefix}pipeline.json");
     let config_bytes = s3mod::get_bytes(&ctx.s3_client, &ctx.pipelines_bucket, &config_key)
         .await
@@ -146,6 +151,9 @@ pub async fn execute_job(
     let mut all_files: Vec<(String, Vec<u8>)> = Vec::new();
     let total = candidate_keys.len();
     for (i, key) in candidate_keys.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(JobError::Cancelled);
+        }
         match s3mod::get_bytes(&ctx.s3_client, &ctx.lake_bucket, key).await {
             Ok(bytes) => {
                 // Strip pipeline prefix so the key matches path_prefix.
@@ -170,6 +178,9 @@ pub async fn execute_job(
     let mappings_total = cfg.mappings.len();
 
     for (mapping_idx, mapping) in cfg.mappings.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(JobError::Cancelled);
+        }
         progress.update(Progress::Ingesting {
             mappings_done: mapping_idx,
             mappings_total,
