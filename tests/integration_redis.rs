@@ -27,6 +27,7 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use karet_worker::job::JobContext;
 use karet_worker::queue::{
     self, JobMessage, QueueCtx, QueueSettings, DEBOUNCE_KEY, DELAYED_KEY, GROUP, STREAM_KEY,
@@ -306,6 +307,39 @@ async fn debounce_extends_quiet_window_and_fires_once() {
 
     let _ = shutdown.send(true);
     scheduler.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running Redis/Valkey; set REDIS_TEST_URL"]
+async fn lifecycle_publishes_job_events() {
+    let Some(url) = test_url() else {
+        panic!("REDIS_TEST_URL is not set");
+    };
+    let mut conn = flush(&url).await;
+
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut pubsub = client.get_async_pubsub().await.unwrap();
+    pubsub.subscribe("karet:jobs:events:eta").await.unwrap();
+
+    queue::enqueue(&mut conn, &msg("job-events-1", "eta")).await.unwrap();
+    let (ctx, shutdown) = make_ctx(&url).await;
+    let consumer = tokio::spawn(queue::consumer_loop(ctx.clone()));
+
+    // Expect at least the enqueue and running events within the deadline.
+    let mut seen = 0;
+    let mut stream = pubsub.on_message();
+    while seen < 2 {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(15), stream.next())
+            .await
+            .expect("timed out waiting for job events")
+            .expect("pubsub stream ended");
+        let payload: String = msg.get_payload().unwrap();
+        assert_eq!(payload, "job-events-1");
+        seen += 1;
+    }
+
+    let _ = shutdown.send(true);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), consumer).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
