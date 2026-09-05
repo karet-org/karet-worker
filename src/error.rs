@@ -7,9 +7,6 @@ pub enum PipelineError {
     #[error("unknown source container for key `{key}`")]
     UnknownSourceContainer { key: String },
 
-    #[error("no mapping found for source container `{source_container_id}`")]
-    NoMapping { source_container_id: String },
-
     #[error("CSV `{key}` missing required columns: {missing:?}")]
     MissingColumns { key: String, missing: Vec<String> },
 

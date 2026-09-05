@@ -1,0 +1,40 @@
+# Run tests and lints on every push and pull request. The toolchain
+# version comes from rust-toolchain.toml (rustup on the runner honors it).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      # rustup's default profile on the runner is minimal, so the pinned
+      # toolchain from rust-toolchain.toml arrives without clippy. Install
+      # it explicitly (this also warms the toolchain itself).
+      - name: Install toolchain with clippy
+        run: rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Redis integration tests
+        env:
+          REDIS_TEST_URL: redis://127.0.0.1:6379
+        run: cargo test --test integration_redis -- --ignored --test-threads=1

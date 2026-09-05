@@ -375,7 +375,7 @@ async fn worker_reads_raw_csvs_and_writes_partitioned_parquet() {
     // to S3 via the uploader wrapper.
     let matchers = lookup::build_registry(&cfg.lookup_mappings);
 
-    let lf = ingest_many(&files, &cfg, &matchers).expect("ingest_many succeeds on seeded CSVs");
+    let lf = ingest_many(&files, &cfg, &cfg.mappings[0], &matchers).expect("ingest_many succeeds on seeded CSVs");
     let df = lf.collect().expect("collect ingested frame");
 
     // Sanity check on row count, 2 + 2 + 1 = 5 rows across the three CSVs.

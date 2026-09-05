@@ -73,23 +73,6 @@ fn resolve_source_container<'a>(
         })
 }
 
-/// Find the first [`Mapping`] targeting `source_container_id`.
-///
-/// Scoped to single-mapping ingestion: a source container with multiple
-/// mappings uses the first in declaration order. If none target this
-/// container, returns [`PipelineError::NoMapping`].
-fn resolve_mapping<'a>(
-    source_container_id: &str,
-    cfg: &'a PipelineConfig,
-) -> Result<&'a Mapping, PipelineError> {
-    cfg.mappings
-        .iter()
-        .find(|m| m.source_container_id == source_container_id)
-        .ok_or_else(|| PipelineError::NoMapping {
-            source_container_id: source_container_id.to_string(),
-        })
-}
-
 /// Read a CSV source file (header row, comma-delimited) into a [`DataFrame`].
 ///
 /// The schema is inferred from the data; downstream mapping expressions
@@ -105,20 +88,24 @@ fn read_source(key: &str, bytes: &[u8]) -> Result<DataFrame, PipelineError> {
 /// Ingest a single source file through one mapping and return the output
 /// [`DataFrame`].
 ///
-/// Resolves the source container by path prefix, picks the first mapping
-/// targeting it, validates headers against the declared schema (extras
-/// allowed, missing flagged), projects to schema columns, and compiles +
-/// executes each `MappingColumn.expr` via Polars. `matchers` is the
+/// Resolves the source container by path prefix, validates headers
+/// against the declared schema (extras allowed, missing flagged),
+/// projects to schema columns, and compiles + executes each
+/// `MappingColumn.expr` of the **caller-supplied** `mapping` via Polars.
+/// The mapping is explicit — not re-derived from the container — so a
+/// container targeted by several mappings ingests each one with its own
+/// columns (previously this silently used the first mapping declared,
+/// writing mapping A's data under mapping B's table). `matchers` is the
 /// per-job precompiled lookup registry produced by
 /// [`crate::lookup::build_registry`].
 pub fn ingest_file(
     key: &str,
     csv_bytes: &[u8],
     cfg: &PipelineConfig,
+    mapping: &Mapping,
     matchers: &HashMap<String, Arc<LookupMatcher>>,
 ) -> Result<DataFrame, PipelineError> {
     let source_container = resolve_source_container(key, cfg)?;
-    let mapping = resolve_mapping(&source_container.id, cfg)?;
 
     let df = read_source(key, csv_bytes)?;
 
@@ -165,12 +152,13 @@ pub fn ingest_file(
 pub fn ingest_many(
     files: &[(String, Vec<u8>)],
     cfg: &PipelineConfig,
+    mapping: &Mapping,
     matchers: &HashMap<String, Arc<LookupMatcher>>,
 ) -> Result<LazyFrame, PipelineError> {
     let mut frames: Vec<LazyFrame> = Vec::with_capacity(files.len());
 
     for (key, csv_bytes) in files {
-        match ingest_file(key, csv_bytes, cfg, matchers) {
+        match ingest_file(key, csv_bytes, cfg, mapping, matchers) {
             Ok(df) => frames.push(df.lazy()),
             Err(e) => {
                 tracing::warn!(key = %key, error = %e, "skipping file during multi-file ingestion");
@@ -198,6 +186,9 @@ pub struct PartitionOutput {
     pub bytes: Vec<u8>,
 }
 
+/// One `(year, month)` partition and the rows belonging to it.
+pub type MonthPartition = ((i32, u32), DataFrame);
+
 /// Partition a [`DataFrame`] by `(year, month)` of a date-typed column.
 ///
 /// Returns one `((year, month), sub_df)` entry per distinct calendar month
@@ -206,7 +197,7 @@ pub struct PartitionOutput {
 pub fn partition_by_month(
     df: &DataFrame,
     partition_col: &str,
-) -> Result<Vec<((i32, u32), DataFrame)>, PolarsError> {
+) -> Result<Vec<MonthPartition>, PolarsError> {
     let partitions = df
         .clone()
         .lazy()
@@ -336,14 +327,13 @@ pub fn produce_partitions(
 
 /// Abstraction over the partition uploader.
 ///
-/// The worker's real S3 client implements this trait; tests provide a
-/// mock. The interface is synchronous, pulling in `async_trait` solely
-/// for test doubles would be premature.
+/// Upload seam for partition output. Production uploads are async in
+/// `job.rs`; this sync trait exists so unit and integration tests can run
+/// the partition pipeline against in-memory or custom uploaders.
 ///
-/// The `bytes` slice is borrowed so callers can pass a reference into a
-/// [`PartitionOutput`] without cloning its `Vec<u8>`. On failure,
-/// implementations return a `String` that [`upload_partitions`] wraps
-/// into [`PipelineError::PartitionUploadFailed`] alongside the key.
+/// `bytes` is borrowed so callers can pass a [`PartitionOutput`] slice
+/// without cloning. Failures are wrapped into
+/// [`PipelineError::PartitionUploadFailed`] alongside the key.
 pub trait PartitionUploader {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), String>;
 }
@@ -583,7 +573,7 @@ mod tests {
         let matchers = HashMap::new();
         let csv = b"date,description,amount\n2024-01-01,hello,10.0\n";
 
-        let df = ingest_file("raw/src/file.csv", csv, &cfg, &matchers)
+        let df = ingest_file("raw/src/file.csv", csv, &cfg, &cfg.mappings[0], &matchers)
             .expect("ingest should succeed");
 
         assert_eq!(df.height(), 1);
@@ -598,7 +588,7 @@ mod tests {
         let matchers = HashMap::new();
         let csv = b"date,description,amount\n2024-01-01,hello,10.0\n";
 
-        let err = ingest_file("raw/other/file.csv", csv, &cfg, &matchers).unwrap_err();
+        let err = ingest_file("raw/other/file.csv", csv, &cfg, &cfg.mappings[0], &matchers).unwrap_err();
         assert!(
             matches!(err, PipelineError::UnknownSourceContainer { ref key } if key == "raw/other/file.csv"),
             "expected UnknownSourceContainer, got {err:?}"
@@ -612,7 +602,7 @@ mod tests {
         // Missing `amount`.
         let csv = b"date,description\n2024-01-01,hello\n";
 
-        let err = ingest_file("raw/src/file.csv", csv, &cfg, &matchers).unwrap_err();
+        let err = ingest_file("raw/src/file.csv", csv, &cfg, &cfg.mappings[0], &matchers).unwrap_err();
         match err {
             PipelineError::MissingColumns { key, missing } => {
                 assert_eq!(key, "raw/src/file.csv");
@@ -623,17 +613,44 @@ mod tests {
     }
 
     #[test]
-    fn ingest_file_errors_when_no_mapping_targets_container() {
-        // Config has a source container but no mapping for it.
+    fn ingest_file_uses_the_supplied_mapping_not_the_first() {
+        // Regression for the v1/v2 review finding: two mappings share one
+        // source container; ingestion previously re-derived "the first
+        // mapping for the container", so mapping B's ingest ran with
+        // mapping A's columns and B's data landed under A's shape.
         let mut cfg = simple_config();
-        cfg.mappings.clear();
+        let mut second = cfg.mappings[0].clone();
+        second.id = "second_mapping".into();
+        second.analytic_table_id = cfg.analytic_tables[0].id.clone();
+        // Same container, different output: only the description, renamed.
+        second.columns = vec![crate::config::MappingColumn {
+            name: "description_upper".into(),
+            expr: crate::ast::AstNode::Upper {
+                input: Box::new(crate::ast::AstNode::Col {
+                    name: "description".into(),
+                }),
+            },
+        }];
+        cfg.mappings.push(second);
+
         let matchers = HashMap::new();
         let csv = b"date,description,amount\n2024-01-01,hello,10.0\n";
 
-        let err = ingest_file("raw/src/file.csv", csv, &cfg, &matchers).unwrap_err();
-        assert!(
-            matches!(err, PipelineError::NoMapping { ref source_container_id } if source_container_id == "src"),
-            "expected NoMapping, got {err:?}"
+        // Ingesting with mapping #2 must produce mapping #2's columns.
+        let df = ingest_file("raw/src/file.csv", csv, &cfg, &cfg.mappings[1], &matchers)
+            .expect("ingest with the second mapping succeeds");
+        let cols: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        assert_eq!(cols, vec!["description_upper".to_string()]);
+        let v = df.column("description_upper").unwrap().str().unwrap().get(0);
+        assert_eq!(v, Some("HELLO"));
+
+        // And mapping #1 still produces its own columns.
+        let df1 = ingest_file("raw/src/file.csv", csv, &cfg, &cfg.mappings[0], &matchers)
+            .expect("ingest with the first mapping succeeds");
+        assert_ne!(
+            df1.get_column_names(),
+            df.get_column_names(),
+            "the two mappings must not produce identical shapes in this fixture"
         );
     }
 
@@ -658,7 +675,7 @@ mod tests {
             ),
         ];
 
-        let lf = ingest_many(&files, &cfg, &matchers).expect("ingest_many should succeed");
+        let lf = ingest_many(&files, &cfg, &cfg.mappings[0], &matchers).expect("ingest_many should succeed");
         let df = lf.collect().expect("collect");
 
         assert_eq!(df.height(), 2);
@@ -687,7 +704,7 @@ mod tests {
             ),
         ];
 
-        let lf = ingest_many(&files, &cfg, &matchers).expect("ingest_many should succeed");
+        let lf = ingest_many(&files, &cfg, &cfg.mappings[0], &matchers).expect("ingest_many should succeed");
         let df = lf.collect().expect("collect");
 
         assert_eq!(df.height(), 1);
@@ -732,7 +749,7 @@ mod tests {
             }
 
             // Multi-file path: one concat'd LazyFrame, collected.
-            let lf = ingest_many(&files, &cfg, &matchers).expect("ingest_many should succeed");
+            let lf = ingest_many(&files, &cfg, &cfg.mappings[0], &matchers).expect("ingest_many should succeed");
             let df = lf.collect().expect("collect multi");
             let col = df.column("upper_desc").unwrap().as_materialized_series();
             let s = col.str().unwrap();
@@ -744,7 +761,7 @@ mod tests {
             // into a single Vec, this is the explicit multiset-union.
             let mut single_file_sum: Vec<String> = Vec::new();
             for (key, bytes) in &files {
-                let single_df = ingest_file(key, bytes, &cfg, &matchers).unwrap();
+                let single_df = ingest_file(key, bytes, &cfg, &cfg.mappings[0], &matchers).unwrap();
                 let c = single_df.column("upper_desc").unwrap().as_materialized_series();
                 let st = c.str().unwrap();
                 for i in 0..single_df.height() {
@@ -778,7 +795,7 @@ mod tests {
             b"date,description\n2024-01-01,hello\n".to_vec(),
         )];
 
-        let err = ingest_many(&files, &cfg, &matchers)
+        let err = ingest_many(&files, &cfg, &cfg.mappings[0], &matchers)
             .err()
             .expect("ingest_many should fail when every file fails");
         assert!(

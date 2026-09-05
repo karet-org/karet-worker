@@ -1,24 +1,21 @@
 //! HTTP API (Axum).
 //!
-//! Routes: `GET /health`, `POST /config/validate`, `POST /jobs/run`.
+//! Routes: `GET /health`, `POST /config/validate`, `POST /events/s3`.
+//! Jobs arrive via the Redis stream (see `queue.rs`), not HTTP.
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{Json, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Json, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use serde::Deserialize;
-use uuid::Uuid;
 
-use crate::assertions::validate_assertions;
 use crate::config::{self, ConfigError, PipelineConfig};
-use crate::lookup;
-use crate::pipeline;
-use crate::s3 as s3mod;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,19 +26,373 @@ pub struct AppState {
     /// Bucket for query-ready partitioned Parquet output.
     pub warehouse_bucket: String,
     pub s3_client: Option<aws_sdk_s3::Client>,
+    /// Shared bearer token (`KARET_WORKER_TOKEN`) required on every
+    /// mutating route. `/health` stays open for liveness probes.
+    pub auth_token: String,
+    /// Present when `REDIS_URL` is set: the queue context shared with the
+    /// consumer loops. Enables `/events/s3` and enriches `/health`.
+    pub queue: Option<Arc<crate::queue::QueueCtx>>,
+    /// Shared secret for `/events/s3` (`KARET_WEBHOOK_SECRET`). Required
+    /// non-empty when the queue is enabled.
+    pub webhook_secret: Option<String>,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let state = Arc::new(state);
+    // The one remaining mutating route sits behind the bearer-token
+    // check; `/health` stays open so liveness probes need no credentials,
+    // and `/events/s3` enforces its own webhook secret. `route_layer`
+    // (not `layer`) so the middleware wraps only matched routes — with
+    // plain `layer` the router's 404 fallback answers 401 for every
+    // unknown path, which broke RustFS's HEAD health probe of `/`.
+    let protected = Router::new()
         .route("/config/validate", post(post_config_validate))
-        .route("/jobs/run", post(run_pipeline))
-        .with_state(Arc::new(state))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_token,
+        ));
+    Router::new()
+        // RustFS HEAD-probes the webhook endpoint's origin root before
+        // delivering events; axum serves HEAD via the GET handler.
+        .route("/", get(root))
+        .route("/health", get(health))
+        .route("/events/s3", post(post_s3_events))
+        .merge(protected)
+        .with_state(state)
 }
 
-/// `GET /health`, liveness probe.
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+/// `GET|HEAD /`: identification + webhook-origin health probe target.
+async fn root() -> impl IntoResponse {
+    (StatusCode::OK, "karet-worker")
+}
+
+/// Middleware: require `Authorization: Bearer <KARET_WORKER_TOKEN>`.
+///
+/// The worker has no user model; possession of the shared token is the
+/// entire authorization signal, mirroring the web app's webhook secret.
+async fn require_bearer_token(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    match provided {
+        Some(token) if constant_time_eq(token.as_bytes(), state.auth_token.as_bytes()) => {
+            next.run(request).await
+        }
+        _ => error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid bearer token",
+            Vec::new(),
+        ),
+    }
+}
+
+/// Constant-time byte comparison so token verification doesn't leak
+/// match-prefix length through response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Maximum accepted `pipeline_prefix` length. Generous for
+/// `pipelines/<slug>/` shapes while still bounding pathological input.
+const MAX_PREFIX_LEN: usize = 512;
+
+/// Validate a caller-supplied pipeline prefix before it is interpolated
+/// into S3 keys for reads, writes, and (with `clean_run`) deletes.
+///
+/// Accepts only `segment/segment/.../` shapes: a trailing slash, no
+/// leading slash, non-empty segments of `[A-Za-z0-9._-]`, and no `.` /
+/// `..` segments. The web app sends `pipelines/<slug>/` where the slug is
+/// already `[a-z0-9-]`, so this is a superset of legitimate traffic.
+pub fn validate_pipeline_prefix(prefix: &str) -> Result<(), String> {
+    if prefix.is_empty() {
+        return Err("pipeline_prefix must not be empty".into());
+    }
+    if prefix.len() > MAX_PREFIX_LEN {
+        return Err(format!(
+            "pipeline_prefix is too long ({} bytes, max {MAX_PREFIX_LEN})",
+            prefix.len()
+        ));
+    }
+    if prefix.starts_with('/') {
+        return Err("pipeline_prefix must not start with '/'".into());
+    }
+    if !prefix.ends_with('/') {
+        return Err("pipeline_prefix must end with '/'".into());
+    }
+    for segment in prefix[..prefix.len() - 1].split('/') {
+        if segment.is_empty() {
+            return Err("pipeline_prefix must not contain empty path segments".into());
+        }
+        if segment == "." || segment == ".." {
+            return Err("pipeline_prefix must not contain '.' or '..' segments".into());
+        }
+        if !segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(format!(
+                "pipeline_prefix segment '{segment}' contains characters outside [A-Za-z0-9._-]"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `GET /health`. Liveness plus, when the queue is enabled, a readiness
+/// signal: Redis reachability, queue depth, and in-flight count. Returns
+/// 503 when the queue is enabled but Redis is unreachable.
+async fn health(State(state): State<Arc<AppState>>) -> axum::response::Response {
+    let Some(queue) = &state.queue else {
+        return (StatusCode::OK, "ok").into_response();
+    };
+    let in_flight = queue.in_flight.load(std::sync::atomic::Ordering::SeqCst);
+    match queue.client.get_multiplexed_async_connection().await {
+        Ok(mut conn) => {
+            let depth: i64 = redis::cmd("XLEN")
+                .arg(crate::queue::STREAM_KEY)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(-1);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "redis": "ok",
+                    "queue_depth": depth,
+                    "in_flight": in_flight,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "redis": format!("error: {e}"),
+                "in_flight": in_flight,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RustFS object-event webhook (moved here from the web app)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct S3EventRecord {
+    #[serde(rename = "eventName", default)]
+    event_name: String,
+    #[serde(default)]
+    s3: Option<S3EventInner>,
+}
+
+#[derive(Debug, Deserialize)]
+struct S3EventInner {
+    bucket: Option<S3EventBucket>,
+    object: Option<S3EventObject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct S3EventBucket {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct S3EventObject {
+    key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct S3EventPayload {
+    #[serde(rename = "Records", default)]
+    records: Vec<S3EventRecord>,
+}
+
+/// Pull `<slug>` out of a `pipelines/<slug>/...` key (URL-decoded first,
+/// matching the S3 event spec). Slug rule mirrors the web app's
+/// `sanitizeSlug`: `[a-z0-9-]` after lowercasing; anything else → None.
+fn pipeline_slug_from_key(raw_key: &str) -> Option<String> {
+    let key = urldecode(raw_key);
+    let rest = key.strip_prefix("pipelines/")?;
+    let slug_raw = rest.split('/').next()?;
+    if slug_raw.is_empty() || rest.len() == slug_raw.len() {
+        return None; // no second path segment
+    }
+    let slug: String = slug_raw
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
+/// Minimal percent-decoding (S3 events encode keys like URL query args,
+/// with `+` for space).
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `POST /events/s3`: RustFS object-created notifications. Auth is the
+/// webhook secret (its own channel, not the worker bearer token, because
+/// RustFS can only be configured with a static URL + headers). Accepts
+/// `X-Karet-Webhook-Secret: <secret>` or `Authorization: Bearer <secret>`.
+async fn post_s3_events(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> axum::response::Response {
+    let Some(queue) = state.queue.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "queue_disabled",
+            "REDIS_URL is not configured; webhook events have nowhere to go",
+            Vec::new(),
+        );
+    };
+    let Some(expected) = state.webhook_secret.as_deref().filter(|s| !s.is_empty()) else {
+        // Fail closed: no secret configured, nothing is accepted.
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "webhook secret is not configured",
+            Vec::new(),
+        );
+    };
+
+    let headers = request.headers();
+    // Three accepted channels: our own header, `Authorization: Bearer x`,
+    // and a raw `Authorization: x` — RustFS's `WEBHOOK_AUTH_TOKEN` sends
+    // the configured value verbatim, whose exact shape is undocumented.
+    let provided = headers
+        .get("x-karet-webhook-secret")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.strip_prefix("Bearer ").unwrap_or(v))
+        });
+    match provided {
+        Some(secret) if constant_time_eq(secret.as_bytes(), expected.as_bytes()) => {}
+        _ => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing or invalid webhook secret",
+                Vec::new(),
+            );
+        }
+    }
+
+    let body = match axum::body::to_bytes(request.into_body(), 1 << 20).await {
+        Ok(b) => b,
+        Err(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_body", "unreadable body", Vec::new());
+        }
+    };
+    let payload: S3EventPayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_json", "body is not an S3 event payload", Vec::new());
+        }
+    };
+
+    let mut conn = match queue.client.get_multiplexed_async_connection().await {
+        Ok(c) => c,
+        Err(e) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "redis_unavailable",
+                &format!("cannot record event: {e}"),
+                Vec::new(),
+            );
+        }
+    };
+
+    let mut scheduled: Vec<String> = Vec::new();
+    let received = payload.records.len();
+    for rec in payload.records {
+        // Only object-create events; deletes/restores must not trigger runs.
+        if !rec.event_name.starts_with("s3:ObjectCreated:") {
+            continue;
+        }
+        // Only raw uploads (lake bucket). Warehouse writes would loop.
+        let bucket = rec
+            .s3
+            .as_ref()
+            .and_then(|s| s.bucket.as_ref())
+            .and_then(|b| b.name.as_deref());
+        if bucket != Some(state.lake_bucket.as_str()) {
+            continue;
+        }
+        let Some(key) = rec.s3.as_ref().and_then(|s| s.object.as_ref()).and_then(|o| o.key.as_deref()) else {
+            continue;
+        };
+        let Some(slug) = pipeline_slug_from_key(key) else {
+            continue;
+        };
+        match crate::queue::debounce_event(&mut conn, &slug).await {
+            Ok(fire_in_ms) => {
+                tracing::info!("debounced upload event for {slug}; fires in {fire_in_ms}ms");
+                if !scheduled.contains(&slug) {
+                    scheduled.push(slug);
+                }
+            }
+            Err(e) => tracing::error!("debounce_event failed for {slug}: {e}"),
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "received": received, "scheduled": scheduled })),
+    )
+        .into_response()
 }
 
 /// `POST /config/validate`, deserialize the body as a `PipelineConfig`
@@ -71,224 +422,6 @@ async fn post_config_validate(body: String) -> impl IntoResponse {
             })),
         ),
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct RunPipelineRequest {
-    pipeline_prefix: String,
-    #[serde(default)]
-    clean_run: bool,
-}
-
-/// `POST /jobs/run`, execute a pipeline run for the given prefix.
-/// Reads `<prefix>pipeline.json`, lists raw CSVs, runs the pipeline, writes
-/// Parquet output.
-async fn run_pipeline(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<RunPipelineRequest>,
-) -> axum::response::Response {
-    let s3_client = match &state.s3_client {
-        Some(c) => c.clone(),
-        None => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "no_s3_client",
-                "S3 client not configured",
-                Vec::new(),
-            );
-        }
-    };
-
-    let prefix = &body.pipeline_prefix;
-    let config_key = format!("{prefix}pipeline.json");
-
-    let config_bytes = match s3mod::get_bytes(&s3_client, &state.pipelines_bucket, &config_key).await {
-        Ok(b) => b,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "config_read_failed",
-                &e,
-                Vec::new(),
-            );
-        }
-    };
-    let cfg: PipelineConfig = match serde_json::from_slice(&config_bytes) {
-        Ok(c) => c,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "config_parse_failed",
-                &e.to_string(),
-                Vec::new(),
-            );
-        }
-    };
-
-    // clean_run: delete existing warehouse output under the tables the
-    // current config declares (so stale tables from prior configs aren't
-    // wiped).
-    if body.clean_run {
-        for table in &cfg.analytic_tables {
-            let table_prefix = format!("{prefix}{}/", table.id);
-            match s3mod::list_keys(&s3_client, &state.warehouse_bucket, &table_prefix).await {
-                Ok(keys) => {
-                    for key in keys {
-                        let _ = s3_client
-                            .delete_object()
-                            .bucket(&state.warehouse_bucket)
-                            .key(&key)
-                            .send()
-                            .await;
-                    }
-                    tracing::info!("clean_run: deleted existing clean output under {table_prefix}");
-                }
-                Err(e) => tracing::warn!(
-                    "clean_run: failed to list clean keys under {table_prefix}: {e}"
-                ),
-            }
-        }
-    }
-
-    // Download every raw CSV file under each source container's path_prefix
-    // from the lake bucket.
-    let mut all_files: Vec<(String, Vec<u8>)> = Vec::new();
-    for sc in &cfg.source_containers {
-        let raw_prefix = format!("{prefix}{}", sc.path_prefix);
-        let ext = ".csv";
-        let keys = match s3mod::list_keys(&s3_client, &state.lake_bucket, &raw_prefix).await {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!("failed to list keys for {raw_prefix}: {e}");
-                continue;
-            }
-        };
-        for key in keys {
-            if !key.ends_with(ext) {
-                continue;
-            }
-            match s3mod::get_bytes(&s3_client, &state.lake_bucket, &key).await {
-                Ok(bytes) => {
-                    // Strip pipeline prefix so the key matches path_prefix.
-                    let rel_key = key.strip_prefix(prefix).unwrap_or(&key).to_string();
-                    all_files.push((rel_key, bytes));
-                }
-                Err(e) => tracing::warn!("failed to download {key}: {e}"),
-            }
-        }
-    }
-
-    if all_files.is_empty() {
-        return error_response(
-            StatusCode::OK,
-            "no_files",
-            "No CSV files found to process",
-            Vec::new(),
-        );
-    }
-
-    let uploader = s3mod::S3PartitionUploader::new(
-        s3_client.clone(),
-        state.warehouse_bucket.clone(),
-        prefix.to_string(),
-    );
-
-    // Precompile the lookup registry once per job; shared by every mapping.
-    let matchers = lookup::build_registry(&cfg.lookup_mappings);
-
-    let mut total_partitions = 0usize;
-    let mut errors: Vec<String> = Vec::new();
-    let files_processed = all_files.len();
-
-    for mapping in &cfg.mappings {
-        let sc = match cfg
-            .source_containers
-            .iter()
-            .find(|s| s.id == mapping.source_container_id)
-        {
-            Some(s) => s,
-            None => continue,
-        };
-        let mapping_files: Vec<(String, Vec<u8>)> = all_files
-            .iter()
-            .filter(|(k, _)| k.starts_with(&sc.path_prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        if mapping_files.is_empty() {
-            continue;
-        }
-
-        let lf = match pipeline::ingest_many(&mapping_files, &cfg, &matchers) {
-            Ok(lf) => lf,
-            Err(e) => {
-                errors.push(format!("ingest {}: {e}", mapping.id));
-                continue;
-            }
-        };
-        let df = match lf.collect() {
-            Ok(df) => df,
-            Err(e) => {
-                errors.push(format!("collect {}: {e}", mapping.id));
-                continue;
-            }
-        };
-
-        let table = match cfg
-            .analytic_tables
-            .iter()
-            .find(|t| t.id == mapping.analytic_table_id)
-        {
-            Some(t) => t,
-            None => {
-                errors.push(format!("table {} not found", mapping.analytic_table_id));
-                continue;
-            }
-        };
-
-        // Assertions: failure fails this mapping only; others still run.
-        let violations = validate_assertions(&df, table);
-        if !violations.is_empty() {
-            for v in &violations {
-                errors.push(format!("assertion {}: {v}", mapping.id));
-            }
-            tracing::warn!(
-                mapping = %mapping.id,
-                count = violations.len(),
-                "assertion violations; skipping upload",
-            );
-            continue;
-        }
-
-        let partitions = match pipeline::produce_partitions(&df, mapping, table) {
-            Ok(p) => p,
-            Err(e) => {
-                errors.push(format!("partition {}: {e}", mapping.id));
-                continue;
-            }
-        };
-
-        match pipeline::upload_partitions(&uploader, &partitions) {
-            Ok(keys) => {
-                total_partitions += keys.len();
-            }
-            Err(e) => {
-                errors.push(format!("upload {}: {e}", mapping.id));
-            }
-        }
-    }
-
-    let job_id = Uuid::new_v4().to_string();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "job_id": job_id,
-            "partitions_written": total_partitions,
-            "files_processed": files_processed,
-            "errors": errors,
-        })),
-    )
-        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -347,13 +480,37 @@ mod tests {
         "layout": {}
     }"#;
 
+    const TEST_TOKEN: &str = "test-token";
+
     fn test_state() -> AppState {
         AppState {
             pipelines_bucket: "karet-pipelines".into(),
             lake_bucket: "karet-lake".into(),
             warehouse_bucket: "karet-warehouse".into(),
             s3_client: None,
+            auth_token: TEST_TOKEN.into(),
+            queue: None,
+            webhook_secret: Some("test-webhook-secret".into()),
         }
+    }
+
+    /// POST `body` to `uri` with the given bearer token (None = no header).
+    async fn post_with_auth(
+        uri: &str,
+        token: Option<&str>,
+        body: &str,
+    ) -> axum::response::Response {
+        let app = router(test_state());
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(builder.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap()
     }
 
     async fn read_json(response: axum::response::Response) -> serde_json::Value {
@@ -379,18 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_validate_returns_ok_on_valid() {
-        let app = router(test_state());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/config/validate")
-                    .header("content-type", "application/json")
-                    .body(Body::from(VALID_CONFIG))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = post_with_auth("/config/validate", Some(TEST_TOKEN), VALID_CONFIG).await;
         assert_eq!(response.status(), StatusCode::OK);
         let v = read_json(response).await;
         assert_eq!(v["ok"], true);
@@ -409,18 +555,7 @@ mod tests {
             "analytic_tables": [],
             "layout": {}
         }"#;
-        let app = router(test_state());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/config/validate")
-                    .header("content-type", "application/json")
-                    .body(Body::from(bad))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response = post_with_auth("/config/validate", Some(TEST_TOKEN), bad).await;
         assert_eq!(response.status(), StatusCode::OK);
         let v = read_json(response).await;
         assert_eq!(v["ok"], false);
@@ -433,21 +568,171 @@ mod tests {
 
     #[tokio::test]
     async fn config_validate_reports_schema_on_unparseable_body() {
+        let response = post_with_auth("/config/validate", Some(TEST_TOKEN), "not json").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let v = read_json(response).await;
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["errors"][0]["kind"], "schema");
+    }
+
+    // ---- Bearer-token auth ------------------------------------------------
+
+    #[tokio::test]
+    async fn config_validate_rejects_missing_token() {
+        let response = post_with_auth("/config/validate", None, "{}").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let v = read_json(response).await;
+        assert_eq!(v["error"]["kind"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_wrong_token() {
+        let response = post_with_auth("/config/validate", Some("wrong-token"), "{}").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn health_needs_no_token() {
         let app = router(test_state());
         let response = app
             .oneshot(
                 Request::builder()
-                    .method(Method::POST)
-                    .uri("/config/validate")
-                    .header("content-type", "application/json")
-                    .body(Body::from("not json"))
+                    .method(Method::GET)
+                    .uri("/health")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn root_answers_head_probe_without_auth() {
+        // RustFS HEAD-probes the webhook origin's root before delivering.
+        let app = router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unknown_path_is_404_not_401() {
+        // Regression: the auth middleware must wrap only matched routes.
+        // With `.layer` it wrapped the fallback too, turning every
+        // unknown path into a 401 and failing RustFS's health probe.
+        let app = router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- pipeline_prefix validation ----------------------------------------
+    // (enforced at claim time in queue.rs; the shape rules live here)
+
+    #[test]
+    fn validate_pipeline_prefix_accepts_legitimate_shapes() {
+        for prefix in [
+            "pipelines/demo/",
+            "pipelines/my-pipeline-2/",
+            "a/b.c/d_e/",
+            "single/",
+        ] {
+            assert!(
+                validate_pipeline_prefix(prefix).is_ok(),
+                "expected Ok for {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_pipeline_prefix_rejects_malformed_shapes() {
+        let cases = [
+            "",
+            "no-trailing-slash",
+            "/leading/slash/",
+            "double//slash/",
+            "pipelines/../other/",
+            "./relative/",
+            "pipelines/sp ace/",
+            "pipelines/semi;colon/",
+            "pipelines/quo'te/",
+        ];
+        for prefix in cases {
+            assert!(
+                validate_pipeline_prefix(prefix).is_err(),
+                "expected Err for {prefix:?}"
+            );
+        }
+        let too_long = format!("{}/", "a".repeat(600));
+        assert!(validate_pipeline_prefix(&too_long).is_err());
+    }
+
+    // ---- /events/s3 webhook ------------------------------------------------
+
+    #[tokio::test]
+    async fn events_returns_503_when_queue_disabled() {
+        // queue: None (legacy mode) — events have nowhere to go.
+        let app = router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/events/s3")
+                    .header("x-karet-webhook-secret", "test-webhook-secret")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"Records":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let v = read_json(response).await;
-        assert_eq!(v["ok"], false);
-        assert_eq!(v["errors"][0]["kind"], "schema");
+        assert_eq!(v["error"]["kind"], "queue_disabled");
+    }
+
+    #[test]
+    fn pipeline_slug_from_key_extracts_and_sanitizes() {
+        assert_eq!(
+            pipeline_slug_from_key("pipelines/demo/raw/tx/jan.csv"),
+            Some("demo".into())
+        );
+        // URL-encoded key (S3 event spec)
+        assert_eq!(
+            pipeline_slug_from_key("pipelines/my-pipe/raw/a%20b.csv"),
+            Some("my-pipe".into())
+        );
+        // uppercase + illegal chars sanitize like the web app
+        assert_eq!(
+            pipeline_slug_from_key("pipelines/My_Pipe/raw/x.csv"),
+            Some("my-pipe".into())
+        );
+        // not under pipelines/ or no second segment
+        assert_eq!(pipeline_slug_from_key("other/demo/x.csv"), None);
+        assert_eq!(pipeline_slug_from_key("pipelines/demo"), None);
+        assert_eq!(pipeline_slug_from_key("pipelines//x.csv"), None);
+    }
+
+    #[test]
+    fn urldecode_handles_percent_and_plus() {
+        assert_eq!(urldecode("a%2Fb+c"), "a/b c");
+        assert_eq!(urldecode("plain"), "plain");
+        assert_eq!(urldecode("bad%zz"), "bad%zz");
     }
 }

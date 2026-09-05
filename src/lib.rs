@@ -9,8 +9,10 @@ pub mod config;
 pub mod error;
 pub mod evaluator;
 pub mod http;
+pub mod job;
 pub mod lookup;
 pub mod pipeline;
+pub mod queue;
 pub mod s3;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -25,6 +27,9 @@ pub const REQUIRED_ENV_VARS: &[&str] = &[
     "AWS_SECRET_ACCESS_KEY",
     "AWS_REGION",
     "AWS_ENDPOINT_URL",
+    "KARET_WORKER_TOKEN",
+    "REDIS_URL",
+    "KARET_WEBHOOK_SECRET",
 ];
 
 /// Assert every env var in `names` is set to a non-empty value.
@@ -49,6 +54,8 @@ pub fn require_env_vars(names: &[&str]) -> Result<(), String> {
 }
 
 /// Binary entry point, builds the HTTP router and serves it on `PORT`.
+/// When `REDIS_URL` is set, also starts the queue loops (consumer,
+/// delayed mover, reclaimer, debounce scheduler).
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("starting karet-worker");
 
@@ -60,6 +67,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pipelines_bucket = std::env::var("S3_BUCKET_PIPELINES").expect("checked above");
     let lake_bucket = std::env::var("S3_BUCKET_LAKE").expect("checked above");
     let warehouse_bucket = std::env::var("S3_BUCKET_WAREHOUSE").expect("checked above");
+    let auth_token = std::env::var("KARET_WORKER_TOKEN").expect("checked above");
 
     let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .endpoint_url(std::env::var("AWS_ENDPOINT_URL").unwrap_or_default())
@@ -70,12 +78,61 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build();
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
 
+    // The Redis queue is the job transport (REDIS_URL is required). The
+    // webhook secret must be non-empty so /events/s3 can never run open.
+    let redis_url = std::env::var("REDIS_URL").expect("checked above");
+    let webhook_secret = std::env::var("KARET_WEBHOOK_SECRET").expect("checked above");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let client = redis::Client::open(redis_url.as_str())?;
+    let consumer_name = format!(
+        "worker-{}-{}",
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into()),
+        std::process::id()
+    );
+    let settings = queue::QueueSettings {
+        max_attempts: env_parse("MAX_ATTEMPTS", 3),
+        lock_ttl_ms: env_parse("JOB_LOCK_TTL_MS", 90_000),
+        heartbeat_ms: env_parse("HEARTBEAT_MS", 30_000),
+        ..queue::QueueSettings::default()
+    };
+    let queue_ctx = std::sync::Arc::new(queue::QueueCtx {
+        client,
+        job_ctx: job::JobContext {
+            s3_client: s3_client.clone(),
+            pipelines_bucket: pipelines_bucket.clone(),
+            lake_bucket: lake_bucket.clone(),
+            warehouse_bucket: warehouse_bucket.clone(),
+        },
+        consumer_name,
+        settings,
+        in_flight: std::sync::atomic::AtomicUsize::new(0),
+        shutdown: shutdown_rx.clone(),
+    });
+
     let state = http::AppState {
         pipelines_bucket,
         lake_bucket,
         warehouse_bucket,
         s3_client: Some(s3_client),
+        auth_token,
+        queue: Some(queue_ctx.clone()),
+        webhook_secret: Some(webhook_secret),
     };
+
+    let concurrency: usize = env_parse("WORKER_CONCURRENCY", 1);
+    tracing::info!(
+        "queue enabled: consumer={} concurrency={concurrency}",
+        queue_ctx.consumer_name
+    );
+    let mut loop_handles = Vec::new();
+    for _ in 0..concurrency.max(1) {
+        loop_handles.push(tokio::spawn(queue::consumer_loop(queue_ctx.clone())));
+    }
+    loop_handles.push(tokio::spawn(queue::delayed_mover_loop(queue_ctx.clone())));
+    loop_handles.push(tokio::spawn(queue::reclaimer_loop(queue_ctx.clone())));
+    loop_handles.push(tokio::spawn(queue::debounce_scheduler_loop(queue_ctx.clone())));
 
     let app = http::router(state);
 
@@ -83,8 +140,54 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on {addr}");
-    axum::serve(listener, app).await?;
+
+    // Graceful shutdown: SIGTERM/SIGINT stops the HTTP server and flips
+    // the watch flag; queue loops exit at their next check and in-flight
+    // jobs run to completion before the process exits.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    tracing::info!("http server stopped; draining queue loops");
+    let _ = shutdown_tx.send(true);
+    for handle in loop_handles {
+        let _ = handle.await;
+    }
+    tracing::info!("shutdown complete");
     Ok(())
+}
+
+/// Resolves when SIGTERM or SIGINT arrives.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received");
+}
+
+/// Parse an env var with a default; invalid values fall back with a warning.
+fn env_parse<T: std::str::FromStr + std::fmt::Display + Copy>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            tracing::warn!("invalid {name}={raw}; using default {default}");
+            default
+        }),
+        Err(_) => default,
+    }
 }
 
 #[cfg(test)]
