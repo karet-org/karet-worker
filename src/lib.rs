@@ -108,6 +108,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         consumer_name,
         settings,
         in_flight: std::sync::atomic::AtomicUsize::new(0),
+        consumer_ok: std::sync::atomic::AtomicBool::new(true),
         shutdown: shutdown_rx.clone(),
     });
 

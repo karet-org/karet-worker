@@ -160,17 +160,24 @@ async fn health(State(state): State<Arc<AppState>>) -> axum::response::Response 
         return (StatusCode::OK, "ok").into_response();
     };
     let in_flight = queue.in_flight.load(std::sync::atomic::Ordering::SeqCst);
-    match queue.client.get_multiplexed_async_connection().await {
+    let consumer_ok = queue.consumer_ok.load(std::sync::atomic::Ordering::SeqCst);
+    match crate::queue::connect(&queue.client).await {
         Ok(mut conn) => {
             let depth: i64 = redis::cmd("XLEN")
                 .arg(crate::queue::STREAM_KEY)
                 .query_async(&mut conn)
                 .await
                 .unwrap_or(-1);
+            let status = if consumer_ok && depth >= 0 {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
             (
-                StatusCode::OK,
+                status,
                 Json(serde_json::json!({
-                    "redis": "ok",
+                    "redis": if depth >= 0 { "ok" } else { "error" },
+                    "consumer": if consumer_ok { "ok" } else { "reconnecting" },
                     "queue_depth": depth,
                     "in_flight": in_flight,
                 })),

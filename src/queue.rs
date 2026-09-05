@@ -87,6 +87,10 @@ pub struct QueueCtx {
     pub consumer_name: String,
     pub settings: QueueSettings,
     pub in_flight: AtomicUsize,
+    /// True while the consumer loop is successfully reading the stream;
+    /// /health reports it so a dead consumer can't hide behind a fresh
+    /// per-request connection.
+    pub consumer_ok: std::sync::atomic::AtomicBool,
     /// Set to true by the shutdown signal; loops exit at the next check.
     pub shutdown: tokio::sync::watch::Receiver<bool>,
 }
@@ -107,6 +111,35 @@ pub struct JobMessage {
 
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Connect with a response timeout above the longest blocking read (the
+/// consumer's XREADGROUP BLOCK 5000). The client default is 500ms, which
+/// spuriously fails long commands. All queue connections go through here.
+pub async fn connect(client: &redis::Client) -> Result<MultiplexedConnection, RedisError> {
+    let config = redis::AsyncConnectionConfig::new()
+        .set_response_timeout(Some(std::time::Duration::from_secs(15)));
+    client.get_multiplexed_async_connection_with_config(&config).await
+}
+
+/// Reuse the loop's connection or establish a fresh one. Loops set their
+/// slot to `None` on any command error; multiplexed connections don't
+/// recover from socket death on their own.
+async fn ensure_conn<'a>(
+    client: &redis::Client,
+    slot: &'a mut Option<MultiplexedConnection>,
+    label: &str,
+) -> Option<&'a mut MultiplexedConnection> {
+    if slot.is_none() {
+        match connect(client).await {
+            Ok(c) => *slot = Some(c),
+            Err(e) => {
+                tracing::warn!("redis connect failed ({label}): {e}");
+                return None;
+            }
+        }
+    }
+    slot.as_mut()
 }
 
 fn now_iso() -> String {
@@ -447,7 +480,7 @@ async fn defer(
 
 /// Handle one claimed stream entry end to end.
 async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String) {
-    let mut conn = match ctx.client.get_multiplexed_async_connection().await {
+    let mut conn = match connect(&ctx.client).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("redis connection failed in handler: {e}");
@@ -562,7 +595,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
             interval.tick().await;
             let c = match &mut conn {
                 Some(c) => c,
-                None => match hb_ctx.client.get_multiplexed_async_connection().await {
+                None => match connect(&hb_ctx.client).await {
                     Ok(c) => conn.insert(c),
                     Err(e) => {
                         tracing::warn!("heartbeat connect failed for {}: {e}; retrying", hb_msg.job_id);
@@ -711,35 +744,33 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
 /// (WORKER_CONCURRENCY > 1 runs multiple loops).
 pub async fn consumer_loop(ctx: Arc<QueueCtx>) {
     let mut shutdown = ctx.shutdown.clone();
-    let mut conn = loop {
-        // Response timeout must exceed the XREADGROUP BLOCK duration
-        // (5s); the client default is 500ms, which made every idle
-        // blocking read "fail" with a spurious timeout.
-        let config = redis::AsyncConnectionConfig::new()
-            .set_response_timeout(Some(std::time::Duration::from_secs(15)));
-        match ctx
-            .client
-            .get_multiplexed_async_connection_with_config(&config)
-            .await
-        {
-            Ok(c) => break c,
-            Err(e) => {
-                tracing::error!("redis connect failed (consumer): {e}; retrying in 5s");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if *shutdown.borrow() {
-                    return;
-                }
-            }
-        }
-    };
-    if let Err(e) = ensure_group(&mut conn).await {
-        tracing::error!("XGROUP CREATE failed: {e}");
-    }
+    let mut conn: Option<MultiplexedConnection> = None;
     loop {
         if *shutdown.borrow() {
             tracing::info!("consumer loop exiting (shutdown)");
             return;
         }
+        let c = match &mut conn {
+            Some(c) => c,
+            None => match connect(&ctx.client).await {
+                Ok(mut c) => {
+                    if let Err(e) = ensure_group(&mut c).await {
+                        tracing::error!("XGROUP CREATE failed: {e}");
+                    }
+                    conn.insert(c)
+                }
+                Err(e) => {
+                    ctx.consumer_ok.store(false, Ordering::SeqCst);
+                    tracing::error!("redis connect failed (consumer): {e}; retrying in 5s");
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        shutdown.changed(),
+                    )
+                    .await;
+                    continue;
+                }
+            },
+        };
         let reply: Result<redis::streams::StreamReadReply, RedisError> = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg(GROUP)
@@ -751,10 +782,11 @@ pub async fn consumer_loop(ctx: Arc<QueueCtx>) {
             .arg("STREAMS")
             .arg(STREAM_KEY)
             .arg(">")
-            .query_async(&mut conn)
+            .query_async(c)
             .await;
         match reply {
             Ok(reply) => {
+                ctx.consumer_ok.store(true, Ordering::SeqCst);
                 for stream in reply.keys {
                     for entry in stream.ids {
                         let payload: String = entry
@@ -767,7 +799,11 @@ pub async fn consumer_loop(ctx: Arc<QueueCtx>) {
                 }
             }
             Err(e) => {
-                tracing::warn!("XREADGROUP failed: {e}; retrying in 2s");
+                // Multiplexed connections don't recover from socket death;
+                // drop and reconnect rather than retrying a dead handle.
+                ctx.consumer_ok.store(false, Ordering::SeqCst);
+                conn = None;
+                tracing::warn!("XREADGROUP failed: {e}; reconnecting in 2s");
                 let _ = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     shutdown.changed(),
@@ -790,28 +826,31 @@ return #due"#;
 
 pub async fn delayed_mover_loop(ctx: Arc<QueueCtx>) {
     let shutdown = ctx.shutdown.clone();
-    let Ok(mut conn) = ctx.client.get_multiplexed_async_connection().await else {
-        tracing::error!("redis connect failed (mover)");
-        return;
-    };
     let script = redis::Script::new(MOVE_DUE_LUA);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut conn: Option<MultiplexedConnection> = None;
     loop {
         interval.tick().await;
         if *shutdown.borrow() {
             return;
         }
+        let Some(c) = ensure_conn(&ctx.client, &mut conn, "mover").await else {
+            continue;
+        };
         let moved: Result<i64, RedisError> = script
             .key(DELAYED_KEY)
             .key(STREAM_KEY)
             .arg(now_ms())
             .arg(STREAM_MAXLEN)
-            .invoke_async(&mut conn)
+            .invoke_async(c)
             .await;
         match moved {
             Ok(n) if n > 0 => tracing::info!("re-enqueued {n} delayed job(s)"),
             Ok(_) => {}
-            Err(e) => tracing::warn!("delayed mover failed: {e}"),
+            Err(e) => {
+                tracing::warn!("delayed mover failed: {e}");
+                conn = None;
+            }
         }
     }
 }
@@ -820,16 +859,19 @@ pub async fn delayed_mover_loop(ctx: Arc<QueueCtx>) {
 /// run them here.
 pub async fn reclaimer_loop(ctx: Arc<QueueCtx>) {
     let shutdown = ctx.shutdown.clone();
-    let Ok(mut conn) = ctx.client.get_multiplexed_async_connection().await else {
-        tracing::error!("redis connect failed (reclaimer)");
-        return;
-    };
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut conn: Option<MultiplexedConnection> = None;
+    let mut tick: u64 = 0;
     loop {
         interval.tick().await;
         if *shutdown.borrow() {
             return;
         }
+        tick += 1;
+        let mut failed = false;
+        let Some(c) = ensure_conn(&ctx.client, &mut conn, "reclaimer").await else {
+            continue;
+        };
         // Claim one entry at a time: entries claimed in a batch but not
         // yet processed have no heartbeat, so they'd exceed the idle
         // threshold mid-queue and get double-claimed by another worker.
@@ -843,7 +885,7 @@ pub async fn reclaimer_loop(ctx: Arc<QueueCtx>) {
                     .arg("0-0")
                     .arg("COUNT")
                     .arg(1)
-                    .query_async(&mut conn)
+                    .query_async(&mut *c)
                     .await;
             match reply {
                 Ok(reply) if reply.claimed.is_empty() => break,
@@ -860,12 +902,21 @@ pub async fn reclaimer_loop(ctx: Arc<QueueCtx>) {
                 }
                 Err(e) => {
                     tracing::warn!("XAUTOCLAIM failed: {e}");
+                    failed = true;
                     break;
                 }
             }
         }
-        if let Err(e) = sweep_orphaned_live_hashes(&ctx, &mut conn).await {
-            tracing::warn!("orphan sweep failed: {e}");
+        // Sweep every 10th pass; it scans the live keyspace and the
+        // stream, which is too heavy for every minute on every worker.
+        if !failed && tick % 10 == 1 {
+            if let Err(e) = sweep_orphaned_live_hashes(&ctx, c).await {
+                tracing::warn!("orphan sweep failed: {e}");
+                failed = true;
+            }
+        }
+        if failed {
+            conn = None;
         }
     }
 }
@@ -993,21 +1044,21 @@ return due"#;
 /// Fire due debounce windows: enqueue a webhook-triggered job per slug.
 pub async fn debounce_scheduler_loop(ctx: Arc<QueueCtx>) {
     let shutdown = ctx.shutdown.clone();
-    let Ok(mut conn) = ctx.client.get_multiplexed_async_connection().await else {
-        tracing::error!("redis connect failed (debounce)");
-        return;
-    };
     let script = redis::Script::new(POP_DUE_LUA);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut conn: Option<MultiplexedConnection> = None;
     loop {
         interval.tick().await;
         if *shutdown.borrow() {
             return;
         }
+        let Some(c) = ensure_conn(&ctx.client, &mut conn, "debounce").await else {
+            continue;
+        };
         let due: Result<Vec<String>, RedisError> = script
             .key(DEBOUNCE_KEY)
             .arg(now_ms())
-            .invoke_async(&mut conn)
+            .invoke_async(&mut *c)
             .await;
         match due {
             Ok(slugs) => {
@@ -1020,13 +1071,16 @@ pub async fn debounce_scheduler_loop(ctx: Arc<QueueCtx>) {
                         trigger: "webhook".into(),
                         enqueued_at: now_ms(),
                     };
-                    match enqueue(&mut conn, &msg).await {
+                    match enqueue(c, &msg).await {
                         Ok(()) => tracing::info!("debounce fired: enqueued {} for {slug}", msg.job_id),
                         Err(e) => tracing::error!("debounce enqueue failed for {slug}: {e}"),
                     }
                 }
             }
-            Err(e) => tracing::warn!("debounce pop failed: {e}"),
+            Err(e) => {
+                tracing::warn!("debounce pop failed: {e}");
+                conn = None;
+            }
         }
     }
 }

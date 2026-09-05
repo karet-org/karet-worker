@@ -77,6 +77,7 @@ async fn make_ctx(url: &str) -> (Arc<QueueCtx>, tokio::sync::watch::Sender<bool>
             live_terminal_ttl_s: 60,
         },
         in_flight: AtomicUsize::new(0),
+        consumer_ok: std::sync::atomic::AtomicBool::new(true),
         shutdown: rx,
     });
     (ctx, tx)
