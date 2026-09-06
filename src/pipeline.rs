@@ -575,7 +575,6 @@ mod tests {
             analytic_tables: vec![AnalyticTable {
                 id: "t".into(),
                 name: "T".into(),
-                output_prefix: "t/".into(),
                 schema: vec![ColumnSchema {
                     name: "upper_desc".into(),
                     type_: "string".into(),
@@ -835,7 +834,6 @@ mod tests {
         AnalyticTable {
             id: id.into(),
             name: id.into(),
-            output_prefix: format!("{id}/"),
             schema: vec![],
             partition_keys: partition_keys.iter().map(|k| k.to_string()).collect(),
             dedup_keys: dedup_keys.iter().map(|k| k.to_string()).collect(),

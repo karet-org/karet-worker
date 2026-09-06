@@ -124,7 +124,6 @@ mod tests {
         AnalyticTable {
             id: "t".into(),
             name: "T".into(),
-            output_prefix: "clean/t/".into(),
             schema: vec![ColumnSchema {
                 name: name.into(),
                 type_: type_.into(),
@@ -142,7 +141,6 @@ mod tests {
         let table = AnalyticTable {
             id: "t".into(),
             name: "T".into(),
-            output_prefix: "clean/t/".into(),
             schema: vec![ColumnSchema {
                 name: "a".into(),
                 type_: "int64".into(),
