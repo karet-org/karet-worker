@@ -332,10 +332,10 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
                     kind: "schema_column".to_string(),
                     target: key.clone(),
                 }),
-                Some(&"float64") => errors.push(ConfigError::Schema {
+                Some(&"float64") | Some(&"number") => errors.push(ConfigError::Schema {
                     path: format!("/analytic_tables/{i}/partition_keys"),
                     message: format!(
-                        "partition key `{key}` is float64; floats make unstable path segments"
+                        "partition key `{key}` is float-capable; floats make unstable path segments"
                     ),
                 }),
                 Some(_) => {}
@@ -799,7 +799,23 @@ mod tests {
         let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
         assert!(msgs.iter().any(|m| m.contains("at most 2")), "{msgs:?}");
         assert!(msgs.iter().any(|m| m.contains("duplicate partition key")), "{msgs:?}");
-        assert!(msgs.iter().any(|m| m.contains("float64")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("float-capable")), "{msgs:?}");
+
+        // `number` is float-capable and equally ineligible.
+        let mut cfg = minimal_valid_config();
+        cfg.analytic_tables[0].schema.push(ColumnSchema {
+            name: "n".to_string(),
+            type_: "number".to_string(),
+            nullable: Some(true),
+            assertions: None,
+        });
+        cfg.mappings[0].columns.push(MappingColumn {
+            name: "n".to_string(),
+            expr: AstNode::Num { value: 1.0 },
+        });
+        cfg.analytic_tables[0].partition_keys = vec!["n".into()];
+        let errs = validate(&cfg).unwrap_err();
+        assert!(errs.iter().any(|e| e.to_string().contains("float-capable")), "{errs:?}");
     }
 
     #[test]

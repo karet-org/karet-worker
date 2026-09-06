@@ -319,6 +319,23 @@ pub fn produce_partitions(
 // Partition upload
 // ===========================================================================
 
+/// Keys of a mapping's previous outputs that this run did not rewrite:
+/// stale layouts after a partition-key change, and partitions whose
+/// source rows vanished. `existing` is the current listing under the
+/// table prefix; `uploaded` the full keys this run just wrote.
+pub fn stale_keys(
+    existing: &[String],
+    uploaded: &std::collections::HashSet<String>,
+    mapping_id: &str,
+) -> Vec<String> {
+    let suffix = format!("/{mapping_id}.parquet");
+    existing
+        .iter()
+        .filter(|k| k.ends_with(&suffix) && !uploaded.contains(*k))
+        .cloned()
+        .collect()
+}
+
 /// Upload seam: production is async in `job.rs`; this sync trait lets
 /// tests run the pipeline against in-memory uploaders.
 pub trait PartitionUploader {
@@ -915,6 +932,30 @@ mod tests {
         let visa_key = produce_partitions(&df, &visa, &table).unwrap()[0].key.clone();
         let chq_key = produce_partitions(&df, &chq, &table).unwrap()[0].key.clone();
         assert_ne!(visa_key, chq_key);
+    }
+
+    #[test]
+    fn stale_keys_reaps_only_this_mappings_unwritten_outputs() {
+        let existing: Vec<String> = [
+            "pipelines/p/t/year=2026/month=1/m.parquet", // rewritten
+            "pipelines/p/t/year=2026/month=2/m.parquet", // vanished partition
+            "pipelines/p/t/account=visa/m.parquet",      // old layout
+            "pipelines/p/t/year=2026/month=1/other.parquet", // other mapping
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let uploaded: std::collections::HashSet<String> =
+            ["pipelines/p/t/year=2026/month=1/m.parquet".to_string()].into();
+        let mut stale = stale_keys(&existing, &uploaded, "m");
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec![
+                "pipelines/p/t/account=visa/m.parquet".to_string(),
+                "pipelines/p/t/year=2026/month=2/m.parquet".to_string(),
+            ]
+        );
     }
 
     #[test]

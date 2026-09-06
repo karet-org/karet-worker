@@ -274,7 +274,36 @@ pub async fn execute_job(
 
         total_deduped += dropped;
         match upload_partitions_async(ctx, prefix, &partitions).await {
-            Ok(count) => total_partitions += count,
+            Ok(count) => {
+                total_partitions += count;
+                // Upload first, then reap this mapping's stale outputs
+                // (previous layouts, vanished partitions), so a failed
+                // upload never costs existing data.
+                let table_prefix = format!("{prefix}{}/", mapping.analytic_table_id);
+                let uploaded: std::collections::HashSet<String> = partitions
+                    .iter()
+                    .map(|p| format!("{prefix}{}", p.key))
+                    .collect();
+                match s3mod::list_keys(&ctx.s3_client, &ctx.warehouse_bucket, &table_prefix).await {
+                    Ok(existing) => {
+                        for key in pipeline::stale_keys(&existing, &uploaded, &mapping.id) {
+                            if let Err(e) = ctx
+                                .s3_client
+                                .delete_object()
+                                .bucket(&ctx.warehouse_bucket)
+                                .key(&key)
+                                .send()
+                                .await
+                            {
+                                tracing::warn!("stale output delete failed for {key}: {e}");
+                            } else {
+                                tracing::info!(mapping = %mapping.id, key, "reaped stale output");
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("stale output listing failed under {table_prefix}: {e}"),
+                }
+            }
             Err(e) => errors.push(format!("upload {}: {e}", mapping.id)),
         }
     }

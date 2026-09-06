@@ -76,12 +76,13 @@ async fn route_key(state: &AppState, key: &str) -> Vec<String> {
             return match_key(&cache.entries, key);
         }
     }
+    // Build outside the lock so a slow store doesn't serialize every
+    // webhook event behind the rebuild. Concurrent rebuilds are
+    // harmless: last swap wins.
+    let entries = build_routing(state).await;
     let mut cache = state.routing.write().await;
-    // Double-checked: another task may have rebuilt while we waited.
-    if cache.built_at.is_none_or(|t| t.elapsed() >= ROUTING_TTL) {
-        cache.entries = build_routing(state).await;
-        cache.built_at = Some(std::time::Instant::now());
-    }
+    cache.entries = entries;
+    cache.built_at = Some(std::time::Instant::now());
     match_key(&cache.entries, key)
 }
 
@@ -480,7 +481,14 @@ async fn post_s3_events(
 /// `POST /config/validate`, deserialize the body as a `PipelineConfig`
 /// and run [`config::validate`]. Always returns 200; the `ok` field
 /// reflects the result and `errors` lists details.
-async fn post_config_validate(body: String) -> impl IntoResponse {
+async fn post_config_validate(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> impl IntoResponse {
+    // A validate call precedes every config publish; drop the routing
+    // cache so a source pointed at a new folder routes its first upload
+    // instead of waiting out the TTL.
+    state.routing.write().await.built_at = None;
     match serde_json::from_str::<PipelineConfig>(&body) {
         Ok(cfg) => match config::validate(&cfg) {
             Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
