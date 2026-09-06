@@ -36,18 +36,9 @@ pub fn validate_csv_headers(
     }
 }
 
-/// Project a [`DataFrame`] down to only the columns named in `schema`, in
-/// schema-declaration order.
-///
-/// Extra columns present in `df` but not in `schema` are dropped so the
-/// evaluator only sees the columns it was configured for.
-///
-/// # Preconditions
-///
-/// The caller is expected to have already run [`validate_csv_headers`] against
-/// the source's headers, so every column named in `schema` is present in `df`.
-/// If that precondition is violated, `select` will surface the underlying
-/// polars error.
+/// Project `df` to the schema's columns, in declaration order; extras are
+/// dropped. Callers run [`validate_csv_headers`] first, so missing columns
+/// surface as polars errors.
 pub fn project_schema_columns(
     df: &DataFrame,
     schema: &[ColumnSchema],
@@ -85,19 +76,10 @@ fn read_source(key: &str, bytes: &[u8]) -> Result<DataFrame, PipelineError> {
         .map_err(|e| PipelineError::polars(key, e))
 }
 
-/// Ingest a single source file through one mapping and return the output
-/// [`DataFrame`].
-///
-/// Resolves the source container by path prefix, validates headers
-/// against the declared schema (extras allowed, missing flagged),
-/// projects to schema columns, and compiles + executes each
-/// `MappingColumn.expr` of the **caller-supplied** `mapping` via Polars.
-/// The mapping is explicit — not re-derived from the container — so a
-/// container targeted by several mappings ingests each one with its own
-/// columns (previously this silently used the first mapping declared,
-/// writing mapping A's data under mapping B's table). `matchers` is the
-/// per-job precompiled lookup registry produced by
-/// [`crate::lookup::build_registry`].
+/// Ingest one source file through one mapping: resolve the container by
+/// prefix, validate headers, project to schema columns, evaluate each
+/// column expr via Polars. The mapping is caller-supplied, not re-derived
+/// from the container, so multi-mapping containers ingest per mapping.
 pub fn ingest_file(
     key: &str,
     csv_bytes: &[u8],
@@ -259,21 +241,12 @@ pub fn dedup_rows(
     Ok((deduped, dropped))
 }
 
-/// Produce one [`PartitionOutput`] per distinct tuple of the target
-/// table's `partition_keys`.
-///
-/// - No keys: the whole frame becomes one output under
-///   `<table_id>/<mapping_id>.parquet`, all columns kept.
-/// - With keys: one output per distinct key tuple at
-///   `<table_id>/<k1>=<v1>/../<mapping_id>.parquet`. Key columns are
-///   dropped from the written file; the path carries them and DuckDB's
-///   hive reading re-materializes them on read.
-/// - A null in any key column fails the mapping: silent row loss is
-///   worse than a failed job, and `coalesce` is the escape hatch.
-///
-/// The mapping id is in the filename so multiple mappings writing to the
-/// same analytic table don't overwrite each other's partitions; re-running
-/// the same mapping still overwrites its own previous output in place.
+/// One [`PartitionOutput`] per distinct tuple of the table's
+/// `partition_keys` at `<table_id>/<k>=<v>/../<mapping_id>.parquet`; no
+/// keys means one whole-frame output. Key columns live in the path only
+/// (hive reading restores them); null keys fail the mapping (`coalesce`
+/// is the escape hatch). The mapping id in the filename keeps mappings
+/// sharing a table from overwriting each other.
 pub fn produce_partitions(
     df: &DataFrame,
     mapping: &Mapping,
@@ -346,15 +319,8 @@ pub fn produce_partitions(
 // Partition upload
 // ===========================================================================
 
-/// Abstraction over the partition uploader.
-///
-/// Upload seam for partition output. Production uploads are async in
-/// `job.rs`; this sync trait exists so unit and integration tests can run
-/// the partition pipeline against in-memory or custom uploaders.
-///
-/// `bytes` is borrowed so callers can pass a [`PartitionOutput`] slice
-/// without cloning. Failures are wrapped into
-/// [`PipelineError::PartitionUploadFailed`] alongside the key.
+/// Upload seam: production is async in `job.rs`; this sync trait lets
+/// tests run the pipeline against in-memory uploaders.
 pub trait PartitionUploader {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), String>;
 }

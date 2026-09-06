@@ -1,6 +1,8 @@
 # karet-worker
 
+[![CI](https://github.com/karet-org/karet-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/karet-org/karet-worker/actions/workflows/ci.yml)
 [![Publish Docker image](https://github.com/karet-org/karet-worker/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/karet-org/karet-worker/actions/workflows/docker-publish.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2b2c33)](./LICENSE)
 
 Rust/Axum data pipeline worker for the Karet analytics platform. Ingests
 source CSVs from S3 (karet-lake bucket), evaluates AST-JSON mapping
