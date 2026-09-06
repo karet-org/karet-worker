@@ -41,13 +41,10 @@ pub struct ColumnSchema {
 /// Declarative data-quality checks on a column. Applied post-mapping,
 /// pre-write. A failed check fails this mapping only; others still run.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnAssertions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_null: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unique: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accepted_values: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,14 +90,13 @@ pub struct LookupRow {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Mapping {
     pub id: String,
     #[serde(default)]
     pub name: String,
     pub source_container_id: String,
     pub analytic_table_id: String,
-    #[serde(default)]
-    pub partition_by: Option<PartitionBy>,
     pub columns: Vec<MappingColumn>,
 }
 
@@ -111,18 +107,19 @@ pub struct MappingColumn {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct PartitionBy {
-    pub column: String,
-    /// Granularity, e.g. `"month"`.
-    pub granularity: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AnalyticTable {
     pub id: String,
     pub name: String,
     pub output_prefix: String,
     pub schema: Vec<ColumnSchema>,
+    /// Ordered hive partition keys; each names a schema column. Empty
+    /// means unpartitioned. Capped at 2 by validation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_keys: Vec<String>,
+    /// Row-identity columns; rows sharing the tuple collapse to one at
+    /// write time (first in ingest order survives). Empty = no dedup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dedup_keys: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -168,7 +165,9 @@ pub enum ConfigError {
 /// Checks:
 /// - Unique non-empty ids/names per collection.
 /// - Every mapping reference (source, table, lookup, columns) resolves.
-/// - `partition_by.column` is a mapping output, and points at a `date` column.
+/// - Table `partition_keys` (max 2, non-float) and `dedup_keys` name schema columns.
+/// - Source `path_prefix` is a well-formed lake key prefix; no source's prefix
+///   is a prefix of another's within the pipeline.
 pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
     let mut errors: Vec<ConfigError> = Vec::new();
 
@@ -277,36 +276,6 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
             }
         }
 
-        // `partition_by.column` must be a mapping output and a `date` column
-        // (only granularity today is `"month"`, which uses `.dt().year/month()`).
-        if let Some(pb) = &mapping.partition_by {
-            let produced: HashSet<&str> =
-                mapping.columns.iter().map(|c| c.name.as_str()).collect();
-            if !produced.contains(pb.column.as_str()) {
-                errors.push(ConfigError::DanglingReference {
-                    path: format!("/mappings/{i}/partition_by/column"),
-                    kind: "mapping_output_column".to_string(),
-                    target: pb.column.clone(),
-                });
-            } else if let Some(table) = cfg
-                .analytic_tables
-                .iter()
-                .find(|t| t.id == mapping.analytic_table_id)
-            {
-                if let Some(col) = table.schema.iter().find(|c| c.name == pb.column) {
-                    if col.type_ != "date" {
-                        errors.push(ConfigError::Schema {
-                            path: format!("/mappings/{i}/partition_by/column"),
-                            message: format!(
-                                "partition column `{}` is type `{}`; only `date` columns can be partitioned by month",
-                                pb.column, col.type_
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-
         // Every `Col` ref must resolve to a source schema column.
         if let Some(src) = cfg
             .source_containers
@@ -327,6 +296,103 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
                             });
                         }
                     }
+                });
+            }
+        }
+    }
+
+    // Table partition and dedup keys reference schema columns.
+    for (i, table) in cfg.analytic_tables.iter().enumerate() {
+        let schema_cols: HashMap<&str, &str> = table
+            .schema
+            .iter()
+            .map(|c| (c.name.as_str(), c.type_.as_str()))
+            .collect();
+
+        if table.partition_keys.len() > 2 {
+            errors.push(ConfigError::Schema {
+                path: format!("/analytic_tables/{i}/partition_keys"),
+                message: format!(
+                    "{} partition keys; at most 2 are supported",
+                    table.partition_keys.len()
+                ),
+            });
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for key in &table.partition_keys {
+            if !seen.insert(key.as_str()) {
+                errors.push(ConfigError::Schema {
+                    path: format!("/analytic_tables/{i}/partition_keys"),
+                    message: format!("duplicate partition key `{key}`"),
+                });
+                continue;
+            }
+            match schema_cols.get(key.as_str()) {
+                None => errors.push(ConfigError::DanglingReference {
+                    path: format!("/analytic_tables/{i}/partition_keys"),
+                    kind: "schema_column".to_string(),
+                    target: key.clone(),
+                }),
+                Some(&"float64") => errors.push(ConfigError::Schema {
+                    path: format!("/analytic_tables/{i}/partition_keys"),
+                    message: format!(
+                        "partition key `{key}` is float64; floats make unstable path segments"
+                    ),
+                }),
+                Some(_) => {}
+            }
+        }
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for key in &table.dedup_keys {
+            if !seen.insert(key.as_str()) {
+                errors.push(ConfigError::Schema {
+                    path: format!("/analytic_tables/{i}/dedup_keys"),
+                    message: format!("duplicate dedup key `{key}`"),
+                });
+                continue;
+            }
+            if !schema_cols.contains_key(key.as_str()) {
+                errors.push(ConfigError::DanglingReference {
+                    path: format!("/analytic_tables/{i}/dedup_keys"),
+                    kind: "schema_column".to_string(),
+                    target: key.clone(),
+                });
+            }
+        }
+    }
+
+    // Source prefixes: well-formed absolute lake key prefixes, and no
+    // source's prefix may be a prefix of another's (ingest resolves a
+    // file's source by prefix match; nesting makes that ambiguous).
+    for (i, sc) in cfg.source_containers.iter().enumerate() {
+        let path = format!("/source_containers/{i}/path_prefix");
+        let p = sc.path_prefix.as_str();
+        if p.is_empty() {
+            errors.push(ConfigError::MissingField {
+                path,
+                field: "path_prefix".to_string(),
+            });
+            continue;
+        }
+        if p.starts_with('/') || !p.ends_with('/') || p.split('/').any(|seg| seg == "..") {
+            errors.push(ConfigError::Schema {
+                path,
+                message: format!(
+                    "path_prefix `{p}` must be a relative key prefix ending in `/` without `..` segments"
+                ),
+            });
+        }
+    }
+    for (i, a) in cfg.source_containers.iter().enumerate() {
+        for (j, b) in cfg.source_containers.iter().enumerate() {
+            if i != j && !a.path_prefix.is_empty() && b.path_prefix.starts_with(&a.path_prefix) {
+                errors.push(ConfigError::Schema {
+                    path: format!("/source_containers/{j}/path_prefix"),
+                    message: format!(
+                        "prefix `{}` is nested under `{}` (source `{}`); source prefixes must not overlap",
+                        b.path_prefix, a.path_prefix, a.id
+                    ),
                 });
             }
         }
@@ -419,6 +485,9 @@ fn walk_ast(node: &AstNode, visit: &mut impl FnMut(&AstNode)) {
         | AstNode::Trim { input }
         | AstNode::Substring { input, .. }
         | AstNode::ParseDate { input, .. }
+        | AstNode::Year { input }
+        | AstNode::Month { input }
+        | AstNode::Day { input }
         | AstNode::LookupRef { input, .. }
         | AstNode::Cast { input, .. } => {
             walk_ast(input, visit);
@@ -505,7 +574,6 @@ mod tests {
                 name: String::new(),
                 source_container_id: "src".to_string(),
                 analytic_table_id: "t".to_string(),
-                partition_by: None,
                 columns: vec![
                     MappingColumn {
                         name: "cat".to_string(),
@@ -545,6 +613,8 @@ mod tests {
                         assertions: None,
                     },
                 ],
+                partition_keys: vec![],
+                dedup_keys: vec![],
             }],
             layout: HashMap::new(),
         }
@@ -652,7 +722,6 @@ mod tests {
                 name: String::new(),
                 source_container_id: "src".to_string(),
                 analytic_table_id: "t".to_string(),
-                partition_by: None,
                 columns: vec![MappingColumn {
                     name: "out".to_string(),
                     expr: AstNode::Col {
@@ -670,6 +739,8 @@ mod tests {
                     nullable: Some(true),
                     assertions: None,
                 }],
+                partition_keys: vec![],
+                dedup_keys: vec![],
             }],
             layout: HashMap::new(),
         };
@@ -698,42 +769,92 @@ mod tests {
     }
 
     #[test]
-    fn partition_by_column_not_produced_is_reported() {
+    fn partition_key_must_name_schema_column() {
         let mut cfg = minimal_valid_config();
-        cfg.mappings[0].partition_by = Some(PartitionBy {
-            column: "ghost".to_string(),
-            granularity: "month".to_string(),
-        });
+        cfg.analytic_tables[0].partition_keys = vec!["ghost".to_string()];
         let errs = validate(&cfg).unwrap_err();
         assert!(
             errs.iter().any(|e| matches!(
                 e,
                 ConfigError::DanglingReference { kind, target, .. }
-                    if kind == "mapping_output_column" && target == "ghost"
+                    if kind == "schema_column" && target == "ghost"
             )),
-            "expected mapping_output_column error, got {errs:?}"
+            "expected schema_column error, got {errs:?}"
         );
     }
 
     #[test]
-    fn partition_by_non_date_column_is_reported() {
-        // `cat` is produced by the mapping but declared as `string`; month
-        // partitioning would blow up at runtime.
+    fn partition_keys_reject_floats_dupes_and_more_than_two() {
         let mut cfg = minimal_valid_config();
-        cfg.mappings[0].partition_by = Some(PartitionBy {
-            column: "cat".to_string(),
-            granularity: "month".to_string(),
+        cfg.analytic_tables[0].schema.push(ColumnSchema {
+            name: "amt".to_string(),
+            type_: "float64".to_string(),
+            nullable: Some(true),
+            assertions: None,
         });
+        cfg.mappings[0].columns.push(MappingColumn {
+            name: "amt".to_string(),
+            expr: AstNode::Num { value: 1.0 },
+        });
+        cfg.analytic_tables[0].partition_keys =
+            vec!["cat".into(), "cat".into(), "amt".into()];
+        let errs = validate(&cfg).unwrap_err();
+        let msgs: Vec<String> = errs.iter().map(|e| e.to_string()).collect();
+        assert!(msgs.iter().any(|m| m.contains("at most 2")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("duplicate partition key")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("float64")), "{msgs:?}");
+    }
+
+    #[test]
+    fn dedup_key_must_name_schema_column_but_floats_allowed() {
+        let mut cfg = minimal_valid_config();
+        cfg.analytic_tables[0].dedup_keys = vec!["ghost".to_string()];
+        let errs = validate(&cfg).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ConfigError::DanglingReference { kind, target, .. }
+                if kind == "schema_column" && target == "ghost"
+        )));
+
+        let mut cfg = minimal_valid_config();
+        cfg.analytic_tables[0].schema.push(ColumnSchema {
+            name: "amt".to_string(),
+            type_: "float64".to_string(),
+            nullable: Some(true),
+            assertions: None,
+        });
+        cfg.mappings[0].columns.push(MappingColumn {
+            name: "amt".to_string(),
+            expr: AstNode::Num { value: 1.0 },
+        });
+        cfg.analytic_tables[0].dedup_keys = vec!["amt".to_string()];
+        assert_eq!(validate(&cfg), Ok(()));
+    }
+
+    #[test]
+    fn source_prefix_shape_is_validated() {
+        for bad in ["/abs/", "no-slash", "a/../b/", ""] {
+            let mut cfg = minimal_valid_config();
+            cfg.source_containers[0].path_prefix = bad.to_string();
+            assert!(validate(&cfg).is_err(), "prefix `{bad}` should fail");
+        }
+        let mut cfg = minimal_valid_config();
+        cfg.source_containers[0].path_prefix = "banks/rbc/chequing/".to_string();
+        assert_eq!(validate(&cfg), Ok(()));
+    }
+
+    #[test]
+    fn nested_source_prefixes_rejected() {
+        let mut cfg = minimal_valid_config();
+        let mut second = cfg.source_containers[0].clone();
+        second.id = "s2".to_string();
+        second.name = "S2".to_string();
+        second.path_prefix = format!("{}nested/", cfg.source_containers[0].path_prefix);
+        cfg.source_containers.push(second);
         let errs = validate(&cfg).unwrap_err();
         assert!(
-            errs.iter().any(|e| matches!(
-                e,
-                ConfigError::Schema { path, message }
-                    if path == "/mappings/0/partition_by/column"
-                       && message.contains("date")
-                       && message.contains("cat")
-            )),
-            "expected Schema error about non-date partition column, got {errs:?}"
+            errs.iter().any(|e| e.to_string().contains("must not overlap")),
+            "{errs:?}"
         );
     }
 
@@ -865,6 +986,8 @@ mod tests {
                                     nullable: Some(true),
                                     assertions: None,
                                 }],
+                                partition_keys: vec![],
+                                dedup_keys: vec![],
                             })
                             .collect();
 
@@ -894,8 +1017,7 @@ mod tests {
                                                 name: String::new(),
                                                 source_container_id: format!("s{}", src_idxs[i]),
                                                 analytic_table_id: format!("t{}", tbl_idxs[i]),
-                                                partition_by: None,
-                                                columns: vec![MappingColumn {
+                                                                                columns: vec![MappingColumn {
                                                     name: "out0".to_string(),
                                                     expr,
                                                 }],

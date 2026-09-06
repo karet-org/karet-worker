@@ -81,6 +81,9 @@ pub fn arb_ast_node() -> impl Strategy<Value = AstNode> {
                 // String ops
                 (".*", vec(inner.clone(), 0..5))
                     .prop_map(|(sep, args): (String, Vec<AstNode>)| AstNode::Concat { sep, args }),
+                inner.clone().prop_map(|i| AstNode::Year { input: Box::new(i) }),
+                inner.clone().prop_map(|i| AstNode::Month { input: Box::new(i) }),
+                inner.clone().prop_map(|i| AstNode::Day { input: Box::new(i) }),
                 inner.clone().prop_map(|i| AstNode::Upper {
                     input: Box::new(i),
                 }),

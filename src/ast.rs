@@ -74,6 +74,14 @@ pub enum AstNode {
     /// Reference into a `Lookup_Mapping` by dotted id (`parent.child`).
     LookupRef { lookup_id: String, input: Box<AstNode> },
 
+    // --- Date parts ---
+    /// Calendar year of a date input, as Int64.
+    Year { input: Box<AstNode> },
+    /// Calendar month of a date input (1 to 12), as Int64.
+    Month { input: Box<AstNode> },
+    /// Day of month of a date input (1 to 31), as Int64.
+    Day { input: Box<AstNode> },
+
     // --- Cast ---
     /// Explicit type cast.
     Cast { input: Box<AstNode>, to: CastType },

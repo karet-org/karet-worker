@@ -363,6 +363,7 @@ struct Terminal<'a> {
     errors: Vec<String>,
     partitions_written: Option<usize>,
     files_processed: Option<usize>,
+    rows_deduped: Option<usize>,
 }
 
 /// Write the terminal S3 record (web `JobRecord` shape), update the live
@@ -416,6 +417,9 @@ async fn finish_job(
     }
     if let Some(n) = terminal.files_processed {
         record["files_processed"] = serde_json::json!(n);
+    }
+    if let Some(n) = terminal.rows_deduped.filter(|&n| n > 0) {
+        record["rows_deduped"] = serde_json::json!(n);
     }
 
     let key = format!("{}jobs/{}.json", msg.prefix, msg.job_id);
@@ -526,6 +530,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
                 errors: Vec::new(),
                 partitions_written: None,
                 files_processed: None,
+                rows_deduped: None,
             },
         )
         .await
@@ -564,6 +569,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
                 errors: Vec::new(),
                 partitions_written: None,
                 files_processed: None,
+                rows_deduped: None,
             },
         )
         .await
@@ -679,6 +685,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
         Ok(JobOutcome {
             partitions_written,
             files_processed,
+            rows_deduped,
             errors,
         }) => {
             let error = if errors.is_empty() {
@@ -698,6 +705,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
                     errors,
                     partitions_written: Some(partitions_written),
                     files_processed: Some(files_processed),
+                    rows_deduped: Some(rows_deduped),
                 },
             )
             .await
@@ -712,6 +720,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
                     errors: Vec::new(),
                     partitions_written: Some(0),
                     files_processed: Some(0),
+                    rows_deduped: None,
                 },
             )
             .await
@@ -731,6 +740,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
                             errors: Vec::new(),
                             partitions_written: None,
                             files_processed: None,
+                            rows_deduped: None,
                         },
                     )
                     .await
@@ -761,6 +771,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
                     errors: Vec::new(),
                     partitions_written: None,
                     files_processed: None,
+                    rows_deduped: None,
                 },
             )
             .await

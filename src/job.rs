@@ -43,6 +43,8 @@ impl ProgressSink for NoopProgress {
 pub struct JobOutcome {
     pub partitions_written: usize,
     pub files_processed: usize,
+    /// Duplicate rows dropped by table dedup keys across all mappings.
+    pub rows_deduped: usize,
     /// Per-mapping errors; non-empty means a partial failure.
     pub errors: Vec<String>,
 }
@@ -138,13 +140,14 @@ pub async fn execute_job(
     let mut candidate_keys: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for sc in &cfg.source_containers {
-        let raw_prefix = format!("{prefix}{}", sc.path_prefix);
-        match s3mod::list_keys(&ctx.s3_client, &ctx.lake_bucket, &raw_prefix).await {
+        // path_prefix is an absolute lake key prefix; sources may point at
+        // any folder in the lake, not just this pipeline's.
+        match s3mod::list_keys(&ctx.s3_client, &ctx.lake_bucket, &sc.path_prefix).await {
             Ok(keys) => candidate_keys.extend(
                 keys.into_iter()
                     .filter(|k| k.ends_with(".csv") && seen.insert(k.clone())),
             ),
-            Err(e) => tracing::warn!("failed to list keys for {raw_prefix}: {e}"),
+            Err(e) => tracing::warn!("failed to list keys for {}: {e}", sc.path_prefix),
         }
     }
 
@@ -156,9 +159,7 @@ pub async fn execute_job(
         }
         match s3mod::get_bytes(&ctx.s3_client, &ctx.lake_bucket, key).await {
             Ok(bytes) => {
-                // Strip pipeline prefix so the key matches path_prefix.
-                let rel_key = key.strip_prefix(prefix).unwrap_or(key).to_string();
-                all_files.push((rel_key, bytes));
+                all_files.push((key.clone(), bytes));
             }
             Err(e) => tracing::warn!("failed to download {key}: {e}"),
         }
@@ -173,6 +174,7 @@ pub async fn execute_job(
     let matchers = lookup::build_registry(&cfg.lookup_mappings);
 
     let mut total_partitions = 0usize;
+    let mut total_deduped: usize = 0;
     let mut errors: Vec<String> = Vec::new();
     let files_processed = all_files.len();
     let mappings_total = cfg.mappings.len();
@@ -212,7 +214,7 @@ pub async fn execute_job(
         let mapping_id = mapping.id.clone();
         let table_id = mapping.analytic_table_id.clone();
         let matchers_cloned = matchers.clone();
-        let partitions_result: Result<Result<Vec<pipeline::PartitionOutput>, String>, _> =
+        let partitions_result: Result<Result<(Vec<pipeline::PartitionOutput>, usize), String>, _> =
             tokio::task::spawn_blocking(move || {
                 let mapping = cfg_cloned
                     .mappings
@@ -246,12 +248,19 @@ pub async fn execute_job(
                     return Err(msgs.join("; "));
                 }
 
+                let (df, dropped) = pipeline::dedup_rows(&df, table)
+                    .map_err(|e| format!("dedup {}: {e}", mapping.id))?;
+                if dropped > 0 {
+                    tracing::info!(mapping = %mapping.id, dropped, "dedup dropped duplicate rows");
+                }
+
                 pipeline::produce_partitions(&df, mapping, table)
                     .map_err(|e| format!("partition {}: {e}", mapping.id))
+                    .map(|parts| (parts, dropped))
             })
             .await;
 
-        let partitions = match partitions_result {
+        let (partitions, dropped) = match partitions_result {
             Ok(Ok(p)) => p,
             Ok(Err(msg)) => {
                 errors.push(msg);
@@ -263,6 +272,7 @@ pub async fn execute_job(
             }
         };
 
+        total_deduped += dropped;
         match upload_partitions_async(ctx, prefix, &partitions).await {
             Ok(count) => total_partitions += count,
             Err(e) => errors.push(format!("upload {}: {e}", mapping.id)),
@@ -278,6 +288,7 @@ pub async fn execute_job(
     Ok(JobOutcome {
         partitions_written: total_partitions,
         files_processed,
+        rows_deduped: total_deduped,
         errors,
     })
 }
