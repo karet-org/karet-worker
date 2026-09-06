@@ -120,6 +120,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         auth_token,
         queue: Some(queue_ctx.clone()),
         webhook_secret: Some(webhook_secret),
+        routing: std::sync::Arc::new(tokio::sync::RwLock::new(http::RoutingCache::default())),
     };
 
     let concurrency: usize = env_parse("WORKER_CONCURRENCY", 1);

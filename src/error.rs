@@ -27,8 +27,8 @@ pub enum PipelineError {
     #[error("no files succeeded during ingestion")]
     NoFilesSucceeded,
 
-    #[error("unsupported partition granularity: `{got}` (supported: \"month\")")]
-    UnsupportedGranularity { got: String },
+    #[error("partitioning failed: {message}")]
+    Partition { message: String },
 
     #[error("partition upload failed for key `{key}`: {message}")]
     PartitionUploadFailed { key: String, message: String },

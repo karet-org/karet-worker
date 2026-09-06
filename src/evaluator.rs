@@ -119,6 +119,19 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
         // strings parse to null instead of failing the whole pipeline
         // (Req 3.6, malformed AST structures surface as JSON parse errors
         // at config-load time, malformed *data* must not).
+        AstNode::Year { input } => Ok(compile(input, ctx)?
+            .dt()
+            .year()
+            .cast(DataType::Int64)),
+        AstNode::Month { input } => Ok(compile(input, ctx)?
+            .dt()
+            .month()
+            .cast(DataType::Int64)),
+        AstNode::Day { input } => Ok(compile(input, ctx)?
+            .dt()
+            .day()
+            .cast(DataType::Int64)),
+
         AstNode::ParseDate { input, format } => {
             let options = StrptimeOptions {
                 format: Some(format.as_str().into()),
@@ -170,6 +183,35 @@ mod tests {
     // Malformed date strings must parse to null rather than erroring.
     // Mixed input `["2024-01-01", "not-a-date"]` should yield
     // `[Some(_), None]`.
+    #[test]
+    fn date_parts_extract_as_int64() {
+        let df = df!["d" => ["2026-09-06", "2024-01-31"]].unwrap();
+        let registry = HashMap::new();
+        let ctx = CompileCtx::new(&registry);
+        let parse = AstNode::ParseDate {
+            input: Box::new(AstNode::Col { name: "d".into() }),
+            format: "%Y-%m-%d".into(),
+        };
+        let out = df
+            .lazy()
+            .select([
+                compile(&AstNode::Year { input: Box::new(parse.clone()) }, &ctx)
+                    .unwrap()
+                    .alias("y"),
+                compile(&AstNode::Month { input: Box::new(parse.clone()) }, &ctx)
+                    .unwrap()
+                    .alias("m"),
+                compile(&AstNode::Day { input: Box::new(parse) }, &ctx)
+                    .unwrap()
+                    .alias("day"),
+            ])
+            .collect()
+            .unwrap();
+        assert_eq!(out.column("y").unwrap().i64().unwrap().get(0), Some(2026));
+        assert_eq!(out.column("m").unwrap().i64().unwrap().get(0), Some(9));
+        assert_eq!(out.column("day").unwrap().i64().unwrap().get(1), Some(31));
+    }
+
     #[test]
     fn parse_date_produces_null_on_malformed() {
         let df = DataFrame::new(

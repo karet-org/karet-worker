@@ -36,18 +36,9 @@ pub fn validate_csv_headers(
     }
 }
 
-/// Project a [`DataFrame`] down to only the columns named in `schema`, in
-/// schema-declaration order.
-///
-/// Extra columns present in `df` but not in `schema` are dropped so the
-/// evaluator only sees the columns it was configured for.
-///
-/// # Preconditions
-///
-/// The caller is expected to have already run [`validate_csv_headers`] against
-/// the source's headers, so every column named in `schema` is present in `df`.
-/// If that precondition is violated, `select` will surface the underlying
-/// polars error.
+/// Project `df` to the schema's columns, in declaration order; extras are
+/// dropped. Callers run [`validate_csv_headers`] first, so missing columns
+/// surface as polars errors.
 pub fn project_schema_columns(
     df: &DataFrame,
     schema: &[ColumnSchema],
@@ -85,19 +76,10 @@ fn read_source(key: &str, bytes: &[u8]) -> Result<DataFrame, PipelineError> {
         .map_err(|e| PipelineError::polars(key, e))
 }
 
-/// Ingest a single source file through one mapping and return the output
-/// [`DataFrame`].
-///
-/// Resolves the source container by path prefix, validates headers
-/// against the declared schema (extras allowed, missing flagged),
-/// projects to schema columns, and compiles + executes each
-/// `MappingColumn.expr` of the **caller-supplied** `mapping` via Polars.
-/// The mapping is explicit — not re-derived from the container — so a
-/// container targeted by several mappings ingests each one with its own
-/// columns (previously this silently used the first mapping declared,
-/// writing mapping A's data under mapping B's table). `matchers` is the
-/// per-job precompiled lookup registry produced by
-/// [`crate::lookup::build_registry`].
+/// Ingest one source file through one mapping: resolve the container by
+/// prefix, validate headers, project to schema columns, evaluate each
+/// column expr via Polars. The mapping is caller-supplied, not re-derived
+/// from the container, so multi-mapping containers ingest per mapping.
 pub fn ingest_file(
     key: &str,
     csv_bytes: &[u8],
@@ -186,57 +168,47 @@ pub struct PartitionOutput {
     pub bytes: Vec<u8>,
 }
 
-/// One `(year, month)` partition and the rows belonging to it.
-pub type MonthPartition = ((i32, u32), DataFrame);
-
-/// Partition a [`DataFrame`] by `(year, month)` of a date-typed column.
-///
-/// Returns one `((year, month), sub_df)` entry per distinct calendar month
-/// present in `partition_col`. Order is unspecified, callers that need
-/// stable ordering should sort by the key themselves.
-pub fn partition_by_month(
-    df: &DataFrame,
-    partition_col: &str,
-) -> Result<Vec<MonthPartition>, PolarsError> {
-    let partitions = df
-        .clone()
-        .lazy()
-        .select([
-            col(partition_col).dt().year().alias("__year"),
-            col(partition_col).dt().month().alias("__month"),
-        ])
-        .unique(None, UniqueKeepStrategy::First)
-        .collect()?;
-
-    // `dt().year()` → Int32, `dt().month()` → Int8.
-    let years = partitions.column("__year")?.i32()?;
-    let months = partitions.column("__month")?.i8()?;
-
-    let mut out: Vec<((i32, u32), DataFrame)> = Vec::with_capacity(partitions.height());
-    for i in 0..partitions.height() {
-        // Skip null partition-key values, a null date can't be assigned
-        // to a `(year, month)` partition.
-        let (Some(year), Some(month)) = (years.get(i), months.get(i)) else {
-            continue;
-        };
-
-        let sub_df = df
-            .clone()
-            .lazy()
-            .filter(
-                col(partition_col)
-                    .dt()
-                    .year()
-                    .eq(year)
-                    .and(col(partition_col).dt().month().eq(month)),
-            )
-            .sort([partition_col], Default::default())
-            .collect()?;
-
-        out.push(((year, month as u32), sub_df));
+/// Percent-encode a partition value for use as a hive path segment.
+/// Characters outside `[A-Za-z0-9._-]` are `%XX`-escaped.
+fn encode_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
     }
+    out
+}
 
-    Ok(out)
+/// Render one partition-key cell as its path segment string.
+/// Ints plain, dates ISO, bools true/false, strings percent-encoded.
+fn segment_value(av: &AnyValue) -> Result<String, PipelineError> {
+    match av {
+        AnyValue::Int8(v) => Ok(v.to_string()),
+        AnyValue::Int16(v) => Ok(v.to_string()),
+        AnyValue::Int32(v) => Ok(v.to_string()),
+        AnyValue::Int64(v) => Ok(v.to_string()),
+        AnyValue::UInt8(v) => Ok(v.to_string()),
+        AnyValue::UInt16(v) => Ok(v.to_string()),
+        AnyValue::UInt32(v) => Ok(v.to_string()),
+        AnyValue::UInt64(v) => Ok(v.to_string()),
+        AnyValue::Boolean(v) => Ok(v.to_string()),
+        AnyValue::Date(days) => {
+            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)
+                .ok_or_else(|| PipelineError::Partition {
+                    message: format!("date value {days} out of range"),
+                })?;
+            Ok(date.format("%Y-%m-%d").to_string())
+        }
+        AnyValue::String(v) => Ok(encode_segment(v)),
+        AnyValue::StringOwned(v) => Ok(encode_segment(v)),
+        other => Err(PipelineError::Partition {
+            message: format!("unsupported partition key value: {other:?}"),
+        }),
+    }
 }
 
 /// Serialize a [`DataFrame`] to Parquet-encoded bytes.
@@ -246,38 +218,35 @@ pub fn write_parquet_bytes(df: &mut DataFrame) -> Result<Vec<u8>, PolarsError> {
     Ok(buf.into_inner())
 }
 
-/// Build the S3 object key (relative to the pipeline prefix) for a
-/// `(year, month)` partition.
-/// Format: `<analytic_table_id>/year=YYYY/month=MM/<mapping_id>.parquet`.
-///
-/// The mapping id is in the filename so multiple mappings writing to the
-/// same analytic table don't overwrite each other's partitions; re-running
-/// the same mapping still overwrites its own previous output in place.
-pub fn partition_key(
-    analytic_table_id: &str,
-    mapping_id: &str,
-    year: i32,
-    month: u32,
-) -> String {
-    format!(
-        "{analytic_table_id}/year={year:04}/month={month:02}/{mapping_id}.parquet"
-    )
-}
-
 /// Build the S3 object key for an unpartitioned output.
 /// Format: `<analytic_table_id>/<mapping_id>.parquet`.
 fn unpartitioned_key(analytic_table_id: &str, mapping_id: &str) -> String {
     format!("{analytic_table_id}/{mapping_id}.parquet")
 }
 
-/// Produce one [`PartitionOutput`] per partition of `df` according to the
-/// mapping's `partition_by` configuration.
-///
-/// - `partition_by == None`: the whole frame becomes a single output
-///   under `<table_id>/data.parquet`.
-/// - `partition_by.granularity == "month"`: one output per `(year,
-///   month)` of the declared date column.
-/// - Any other granularity returns [`PipelineError::UnsupportedGranularity`].
+/// Deduplicate `df` on the table's `dedup_keys`, keeping the first row in
+/// ingest order. Returns the deduped frame and the number of dropped rows.
+/// No keys means no work.
+pub fn dedup_rows(
+    df: &DataFrame,
+    table: &AnalyticTable,
+) -> Result<(DataFrame, usize), PipelineError> {
+    if table.dedup_keys.is_empty() {
+        return Ok((df.clone(), 0));
+    }
+    let deduped = df
+        .unique_stable(Some(&table.dedup_keys), UniqueKeepStrategy::First, None)
+        .map_err(|e| PipelineError::polars("<dedup>", e))?;
+    let dropped = df.height() - deduped.height();
+    Ok((deduped, dropped))
+}
+
+/// One [`PartitionOutput`] per distinct tuple of the table's
+/// `partition_keys` at `<table_id>/<k>=<v>/../<mapping_id>.parquet`; no
+/// keys means one whole-frame output. Key columns live in the path only
+/// (hive reading restores them); null keys fail the mapping (`coalesce`
+/// is the escape hatch). The mapping id in the filename keeps mappings
+/// sharing a table from overwriting each other.
 pub fn produce_partitions(
     df: &DataFrame,
     mapping: &Mapping,
@@ -289,51 +258,86 @@ pub fn produce_partitions(
         mapping.analytic_table_id, table.id
     );
 
-    match &mapping.partition_by {
-        None => {
-            let mut owned = df.clone();
-            let bytes = write_parquet_bytes(&mut owned).map_err(|e| PipelineError::polars("<partition>", e))?;
-            Ok(vec![PartitionOutput {
-                key: unpartitioned_key(&table.id, &mapping.id),
-                bytes,
-            }])
-        }
-
-        Some(pb) if pb.granularity == "month" => {
-            let groups = partition_by_month(df, &pb.column)
-                .map_err(|e| PipelineError::polars("<partition>", e))?;
-
-            let mut out: Vec<PartitionOutput> = Vec::with_capacity(groups.len());
-            for ((year, month), mut sub_df) in groups {
-                let bytes = write_parquet_bytes(&mut sub_df)
-                    .map_err(|e| PipelineError::polars("<partition>", e))?;
-                out.push(PartitionOutput {
-                    key: partition_key(&table.id, &mapping.id, year, month),
-                    bytes,
-                });
-            }
-            Ok(out)
-        }
-
-        Some(pb) => Err(PipelineError::UnsupportedGranularity {
-            got: pb.granularity.clone(),
-        }),
+    if table.partition_keys.is_empty() {
+        let mut owned = df.clone();
+        let bytes =
+            write_parquet_bytes(&mut owned).map_err(|e| PipelineError::polars("<partition>", e))?;
+        return Ok(vec![PartitionOutput {
+            key: unpartitioned_key(&table.id, &mapping.id),
+            bytes,
+        }]);
     }
+
+    // Fail fast on null key values, naming the column and row count.
+    for key in &table.partition_keys {
+        let column = df
+            .column(key)
+            .map_err(|e| PipelineError::polars("<partition>", e))?;
+        let nulls = column.null_count();
+        if nulls > 0 {
+            return Err(PipelineError::Partition {
+                message: format!(
+                    "partition key `{key}` has {nulls} null value(s); \
+                     rows cannot be assigned to a partition (coalesce in the expression to supply a default)"
+                ),
+            });
+        }
+    }
+
+    let keys: Vec<PlSmallStr> = table
+        .partition_keys
+        .iter()
+        .map(|k| PlSmallStr::from_str(k))
+        .collect();
+    let groups = df
+        .partition_by_stable(keys.clone(), true)
+        .map_err(|e| PipelineError::polars("<partition>", e))?;
+
+    let mut out: Vec<PartitionOutput> = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut segments: Vec<String> = Vec::with_capacity(table.partition_keys.len());
+        for key in &table.partition_keys {
+            let av = group
+                .column(key)
+                .and_then(|c| c.get(0))
+                .map_err(|e| PipelineError::polars("<partition>", e))?;
+            segments.push(format!("{key}={}", segment_value(&av)?));
+        }
+        let mut sub = group
+            .drop_many(keys.iter().cloned());
+        let bytes =
+            write_parquet_bytes(&mut sub).map_err(|e| PipelineError::polars("<partition>", e))?;
+        out.push(PartitionOutput {
+            key: format!("{}/{}/{}.parquet", table.id, segments.join("/"), mapping.id),
+            bytes,
+        });
+    }
+    Ok(out)
 }
 
 // ===========================================================================
 // Partition upload
 // ===========================================================================
 
-/// Abstraction over the partition uploader.
-///
-/// Upload seam for partition output. Production uploads are async in
-/// `job.rs`; this sync trait exists so unit and integration tests can run
-/// the partition pipeline against in-memory or custom uploaders.
-///
-/// `bytes` is borrowed so callers can pass a [`PartitionOutput`] slice
-/// without cloning. Failures are wrapped into
-/// [`PipelineError::PartitionUploadFailed`] alongside the key.
+/// Keys of a mapping's previous outputs that this run did not rewrite:
+/// stale layouts after a partition-key change, and partitions whose
+/// source rows vanished. `existing` is the current listing under the
+/// table prefix; `uploaded` the full keys this run just wrote.
+pub fn stale_keys(
+    existing: &[String],
+    uploaded: &std::collections::HashSet<String>,
+    mapping_id: &str,
+) -> Vec<String> {
+    let suffix = format!("/{mapping_id}.parquet");
+    existing
+        .iter()
+        .filter(|k| k.ends_with(&suffix) && !uploaded.contains(*k))
+        .cloned()
+        .collect()
+}
+
+/// Upload seam: production is async in `job.rs`; this sync trait lets
+/// tests run the pipeline against in-memory uploaders.
 pub trait PartitionUploader {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), String>;
 }
@@ -542,7 +546,6 @@ mod tests {
                 name: String::new(),
                 source_container_id: "src".into(),
                 analytic_table_id: "t".into(),
-                partition_by: None,
                 columns: vec![MappingColumn {
                     name: "upper_desc".into(),
                     expr: AstNode::Upper {
@@ -555,13 +558,14 @@ mod tests {
             analytic_tables: vec![AnalyticTable {
                 id: "t".into(),
                 name: "T".into(),
-                output_prefix: "t/".into(),
                 schema: vec![ColumnSchema {
                     name: "upper_desc".into(),
                     type_: "string".into(),
                     nullable: None,
                     assertions: None,
                 }],
+                partition_keys: vec![],
+                dedup_keys: vec![],
             }],
             layout: HashMap::new(),
         }
@@ -808,223 +812,198 @@ mod tests {
     // produce_partitions
     // -----------------------------------------------------------------------
 
-    use crate::config::PartitionBy;
-
     /// Build a minimal AnalyticTable for tests.
-    fn test_table(id: &str) -> AnalyticTable {
+    fn test_table(id: &str, partition_keys: &[&str], dedup_keys: &[&str]) -> AnalyticTable {
         AnalyticTable {
             id: id.into(),
             name: id.into(),
-            output_prefix: format!("{id}/"),
             schema: vec![],
+            partition_keys: partition_keys.iter().map(|k| k.to_string()).collect(),
+            dedup_keys: dedup_keys.iter().map(|k| k.to_string()).collect(),
         }
     }
 
-    /// Build a mapping targeting `table_id` with the given (optional)
-    /// partition configuration. The mapping's columns list is empty because
-    /// these tests operate on DataFrames built by hand, produce_partitions
-    /// doesn't inspect `columns`.
-    fn test_mapping(table_id: &str, partition_by: Option<PartitionBy>) -> Mapping {
+    /// Build a mapping targeting `table_id`. The columns list is empty
+    /// because these tests operate on DataFrames built by hand.
+    fn test_mapping(table_id: &str) -> Mapping {
         Mapping {
             id: "m".into(),
             name: String::new(),
             source_container_id: "src".into(),
             analytic_table_id: table_id.into(),
-            partition_by,
             columns: vec![],
         }
     }
 
-    /// Build a DataFrame with a Date-typed `d` column from `&[&str]` values
-    /// like `"2024-01-15"`. Uses Polars' str→Date conversion so the schema
-    /// matches what the evaluator produces via `parse_date`.
-    fn df_with_dates(dates: &[&str]) -> DataFrame {
-        let df = DataFrame::new(
-            dates.len(),
-            vec![Column::new("d".into(), dates)],
-        )
-        .unwrap();
-        df.lazy()
-            .with_column(col("d").str().to_date(StrptimeOptions {
-                format: Some("%Y-%m-%d".into()),
-                strict: true,
-                ..Default::default()
-            }))
-            .collect()
-            .unwrap()
+    /// DataFrame with int64 `year`/`month` key columns plus a `v` payload.
+    fn df_with_keys(rows: &[(i64, i64, &str)]) -> DataFrame {
+        let years: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let months: Vec<i64> = rows.iter().map(|r| r.1).collect();
+        let vals: Vec<&str> = rows.iter().map(|r| r.2).collect();
+        df!["year" => years, "month" => months, "v" => vals].unwrap()
     }
 
     #[test]
     fn produce_partitions_no_partitioning() {
-        // With `partition_by: None`, the whole frame becomes a single output
-        // under `<id>/<uuid>.parquet`. We can't pin the UUID, but we can
-        // assert the prefix/suffix and that exactly one output came out.
-        let df = df_with_dates(&["2024-01-15", "2024-02-01"]);
-        let table = test_table("orders");
-        let mapping = test_mapping("orders", None);
+        let df = df_with_keys(&[(2024, 1, "a"), (2024, 2, "b")]);
+        let table = test_table("orders", &[], &[]);
+        let mapping = test_mapping("orders");
 
         let outs = produce_partitions(&df, &mapping, &table).unwrap();
         assert_eq!(outs.len(), 1);
-
-        let key = &outs[0].key;
-        assert!(
-            key.starts_with("orders/") && key.ends_with(".parquet"),
-            "unexpected key `{key}`"
-        );
-        assert!(
-            !key.contains("year="),
-            "unpartitioned key should not contain a year= segment; got `{key}`"
-        );
-        assert!(
-            !outs[0].bytes.is_empty(),
-            "parquet bytes should be non-empty for a non-empty frame"
-        );
-        // Parquet magic header (PAR1), a cheap sanity check that we
-        // actually produced a parquet file and not some other encoding.
+        assert_eq!(outs[0].key, "orders/m.parquet");
         assert_eq!(&outs[0].bytes[..4], b"PAR1");
     }
 
     #[test]
-    fn produce_partitions_by_month() {
-        // Rows dated 2024-01-15, 2024-02-01, 2024-02-28 → 2 partitions
-        // (January and February 2024). Assert the two partition keys
-        // contain the expected `year=YYYY/month=MM/` fragments.
-        let df = df_with_dates(&["2024-01-15", "2024-02-01", "2024-02-28"]);
-        let table = test_table("transactions");
-        let mapping = test_mapping(
-            "transactions",
-            Some(PartitionBy {
-                column: "d".into(),
-                granularity: "month".into(),
-            }),
-        );
+    fn produce_partitions_groups_by_key_tuple_and_drops_key_columns() {
+        let df = df_with_keys(&[(2024, 1, "a"), (2024, 2, "b"), (2024, 2, "c")]);
+        let table = test_table("transactions", &["year", "month"], &[]);
+        let mapping = test_mapping("transactions");
 
         let outs = produce_partitions(&df, &mapping, &table).unwrap();
-        assert_eq!(outs.len(), 2, "expected 2 month partitions, got {}", outs.len());
+        assert_eq!(outs.len(), 2, "expected 2 partitions, got {}", outs.len());
 
-        // Order of partitions isn't guaranteed by `unique()`, so check
-        // membership of the key fragments rather than positional indexing.
         let keys: Vec<&String> = outs.iter().map(|o| &o.key).collect();
-        let has_jan = keys
-            .iter()
-            .any(|k| k.contains("year=2024/month=01/") && k.starts_with("transactions/"));
-        let has_feb = keys
-            .iter()
-            .any(|k| k.contains("year=2024/month=02/") && k.starts_with("transactions/"));
-        assert!(has_jan, "missing January partition in keys {:?}", keys);
-        assert!(has_feb, "missing February partition in keys {:?}", keys);
+        assert!(keys.iter().any(|k| *k == "transactions/year=2024/month=1/m.parquet"), "{keys:?}");
+        assert!(keys.iter().any(|k| *k == "transactions/year=2024/month=2/m.parquet"), "{keys:?}");
 
+        // Key columns must not be inside the parquet payload; hive
+        // re-materializes them from the path on read.
         for out in &outs {
-            assert!(out.key.ends_with(".parquet"));
-            assert_eq!(&out.bytes[..4], b"PAR1");
+            let cursor = std::io::Cursor::new(out.bytes.clone());
+            let read = ParquetReader::new(cursor).finish().unwrap();
+            let names: Vec<String> = read
+                .get_column_names()
+                .iter()
+                .map(|n| n.to_string())
+                .collect();
+            assert_eq!(names, vec!["v".to_string()], "key columns leaked into {names:?}");
         }
+    }
+
+    #[test]
+    fn produce_partitions_encodes_values_per_type() {
+        // string keys percent-encode; bools render true/false.
+        let df = df![
+            "account" => ["visa gold", "chequing"],
+            "flag" => [true, false],
+            "v" => ["a", "b"]
+        ]
+        .unwrap();
+        let table = test_table("t", &["account", "flag"], &[]);
+        let outs = produce_partitions(&df, &test_mapping("t"), &table).unwrap();
+        let keys: Vec<&String> = outs.iter().map(|o| &o.key).collect();
+        assert!(
+            keys.iter().any(|k| *k == "t/account=visa%20gold/flag=true/m.parquet"),
+            "{keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| *k == "t/account=chequing/flag=false/m.parquet"),
+            "{keys:?}"
+        );
+    }
+
+    #[test]
+    fn produce_partitions_null_key_fails_with_column_and_count() {
+        let df = df![
+            "year" => [Some(2024i64), None, None],
+            "v" => ["a", "b", "c"]
+        ]
+        .unwrap();
+        let table = test_table("t", &["year"], &[]);
+        let err = produce_partitions(&df, &test_mapping("t"), &table).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`year`") && msg.contains("2 null"), "{msg}");
     }
 
     #[test]
     fn produce_partitions_distinct_keys_per_mapping() {
-        // Two mappings writing the same analytic table at the same (year,
-        // month) must produce different keys, otherwise the second upload
-        // overwrites the first.
-        let df = df_with_dates(&["2024-01-15"]);
-        let table = test_table("transactions");
+        // Two mappings writing the same table at the same tuple must
+        // produce different keys, otherwise the second overwrites the first.
+        let df = df_with_keys(&[(2024, 1, "a")]);
+        let table = test_table("transactions", &["year", "month"], &[]);
 
-        let mut visa = test_mapping(
-            "transactions",
-            Some(PartitionBy { column: "d".into(), granularity: "month".into() }),
-        );
+        let mut visa = test_mapping("transactions");
         visa.id = "scotia_visa_mapping".into();
-
-        let mut chq = test_mapping(
-            "transactions",
-            Some(PartitionBy { column: "d".into(), granularity: "month".into() }),
-        );
+        let mut chq = test_mapping("transactions");
         chq.id = "scotia_chq_mapping".into();
 
         let visa_key = produce_partitions(&df, &visa, &table).unwrap()[0].key.clone();
         let chq_key = produce_partitions(&df, &chq, &table).unwrap()[0].key.clone();
-
         assert_ne!(visa_key, chq_key);
-        assert!(visa_key.contains("scotia_visa_mapping"));
-        assert!(chq_key.contains("scotia_chq_mapping"));
     }
 
     #[test]
-    fn produce_partitions_rejects_unsupported_granularity() {
-        // `granularity = "day"` isn't implemented → `UnsupportedGranularity`.
-        let df = df_with_dates(&["2024-01-15"]);
-        let table = test_table("t");
-        let mapping = test_mapping(
-            "t",
-            Some(PartitionBy {
-                column: "d".into(),
-                granularity: "day".into(),
-            }),
+    fn stale_keys_reaps_only_this_mappings_unwritten_outputs() {
+        let existing: Vec<String> = [
+            "pipelines/p/t/year=2026/month=1/m.parquet", // rewritten
+            "pipelines/p/t/year=2026/month=2/m.parquet", // vanished partition
+            "pipelines/p/t/account=visa/m.parquet",      // old layout
+            "pipelines/p/t/year=2026/month=1/other.parquet", // other mapping
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let uploaded: std::collections::HashSet<String> =
+            ["pipelines/p/t/year=2026/month=1/m.parquet".to_string()].into();
+        let mut stale = stale_keys(&existing, &uploaded, "m");
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec![
+                "pipelines/p/t/account=visa/m.parquet".to_string(),
+                "pipelines/p/t/year=2026/month=2/m.parquet".to_string(),
+            ]
         );
+    }
 
-        let err = produce_partitions(&df, &mapping, &table).unwrap_err();
-        match err {
-            PipelineError::UnsupportedGranularity { got } => {
-                assert_eq!(got, "day");
+    #[test]
+    fn dedup_rows_keeps_first_and_counts() {
+        let df = df![
+            "k" => ["a", "b", "a", "a"],
+            "v" => [1i64, 2, 3, 4]
+        ]
+        .unwrap();
+        let table = test_table("t", &[], &["k"]);
+        let (deduped, dropped) = dedup_rows(&df, &table).unwrap();
+        assert_eq!(dropped, 2);
+        assert_eq!(deduped.height(), 2);
+        // first occurrence survives (v=1 for k=a)
+        let v = deduped.column("v").unwrap().i64().unwrap();
+        let ks = deduped.column("k").unwrap().str().unwrap();
+        for i in 0..deduped.height() {
+            if ks.get(i) == Some("a") {
+                assert_eq!(v.get(i), Some(1));
             }
-            other => panic!("expected UnsupportedGranularity, got {other:?}"),
         }
+        // no keys: identity
+        let none = test_table("t", &[], &[]);
+        let (same, zero) = dedup_rows(&df, &none).unwrap();
+        assert_eq!(zero, 0);
+        assert_eq!(same.height(), df.height());
     }
 
     proptest! {
-        // Output partitions cover exactly the input date range
-        //
-        // Generate 1..=20 random dates within 2022-01-01..=2025-12-31 and
-        // assert that the set of `(year, month)` keys emitted by
-        // `produce_partitions` equals the set `{ (year(v), month(v)) | v in dates }`.
-        //
-        // We restrict day-of-month to 1..=28 so every `(year, month, day)`
-        // triple is a valid calendar date regardless of month length or
-        // leap-year rules, we're testing partition coverage here, not date
-        // parsing.
+        // Output partitions cover exactly the distinct key tuples of the
+        // input frame, whatever the values are.
         #[test]
-        fn partitions_cover_input_date_range(
-            dates in proptest::collection::vec(
-                (2022i32..=2025, 1u32..=12, 1u32..=28),
-                1..=20,
-            ),
+        fn partitions_cover_distinct_tuples(
+            rows in proptest::collection::vec((2022i64..=2025, 1i64..=12), 1..=20),
         ) {
-            // Format the (y, m, d) triples into YYYY-MM-DD strings for the
-            // DataFrame builder. Kept as `String` owned values so their
-            // lifetimes extend across the subsequent borrow as `&[&str]`.
-            let date_strs: Vec<String> = dates.iter()
-                .map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}"))
-                .collect();
-            let date_refs: Vec<&str> = date_strs.iter().map(|s| s.as_str()).collect();
+            let data: Vec<(i64, i64, &str)> =
+                rows.iter().map(|(y, m)| (*y, *m, "x")).collect();
+            let df = df_with_keys(&data);
+            let table = test_table("t", &["year", "month"], &[]);
+            let outs = produce_partitions(&df, &test_mapping("t"), &table).unwrap();
 
-            let df = df_with_dates(&date_refs);
-            let table = test_table("t");
-            let mapping = test_mapping(
-                "t",
-                Some(PartitionBy {
-                    column: "d".into(),
-                    granularity: "month".into(),
-                }),
-            );
-
-            let outs = produce_partitions(&df, &mapping, &table).unwrap();
-
-            // Extract `(year, month)` pairs from the output keys. The key
-            // format `<id>/year=YYYY/month=MM/<uuid>.parquet` is pinned
-            // by `partition_key()`; we locate the `year=` and `month=` tags
-            // and read their fixed-width numeric values.
-            let mut got: std::collections::HashSet<(i32, u32)> = std::collections::HashSet::new();
+            let mut got: std::collections::HashSet<String> = std::collections::HashSet::new();
             for out in &outs {
-                let y_start = out.key.find("year=").expect("key has year=") + 5;
-                let y = out.key[y_start..y_start + 4].parse::<i32>().unwrap();
-                let m_start = out.key.find("month=").expect("key has month=") + 6;
-                let m = out.key[m_start..m_start + 2].parse::<u32>().unwrap();
-                got.insert((y, m));
+                got.insert(out.key.clone());
             }
-
-            let expected: std::collections::HashSet<(i32, u32)> = dates.iter()
-                .map(|(y, m, _)| (*y, *m))
+            let expected: std::collections::HashSet<String> = rows.iter()
+                .map(|(y, m)| format!("t/year={y}/month={m}/m.parquet"))
                 .collect();
-
             prop_assert_eq!(got, expected);
         }
     }

@@ -35,6 +35,106 @@ pub struct AppState {
     /// Shared secret for `/events/s3` (`KARET_WEBHOOK_SECRET`). Required
     /// non-empty when the queue is enabled.
     pub webhook_secret: Option<String>,
+    /// Upload-routing table: `(source path_prefix, pipeline slug)` pairs
+    /// from every pipeline config, cached briefly (see [`ROUTING_TTL`]).
+    pub routing: Arc<tokio::sync::RwLock<RoutingCache>>,
+}
+
+/// Cached `(prefix, slug)` pairs for webhook routing.
+#[derive(Default)]
+pub struct RoutingCache {
+    built_at: Option<std::time::Instant>,
+    entries: Vec<(String, String)>,
+}
+
+/// How long the routing table is trusted before a rebuild. A short TTL
+/// keeps a just-published source from missing uploads for long, without
+/// hitting S3 on every event.
+const ROUTING_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The subset of `pipeline.json` the router needs. Parsed leniently so a
+/// config from any schema era still routes.
+#[derive(serde::Deserialize)]
+struct RoutingConfig {
+    #[serde(default)]
+    source_containers: Vec<RoutingSource>,
+}
+
+#[derive(serde::Deserialize)]
+struct RoutingSource {
+    #[serde(default)]
+    path_prefix: String,
+}
+
+/// Return the slugs of every pipeline with a source prefix matching `key`,
+/// rebuilding the routing table if stale. One upload may route to several
+/// pipelines: shared lake folders fan out by design.
+async fn route_key(state: &AppState, key: &str) -> Vec<String> {
+    {
+        let cache = state.routing.read().await;
+        if cache.built_at.is_some_and(|t| t.elapsed() < ROUTING_TTL) {
+            return match_key(&cache.entries, key);
+        }
+    }
+    // Build outside the lock so a slow store doesn't serialize every
+    // webhook event behind the rebuild. Concurrent rebuilds are
+    // harmless: last swap wins.
+    let entries = build_routing(state).await;
+    let mut cache = state.routing.write().await;
+    cache.entries = entries;
+    cache.built_at = Some(std::time::Instant::now());
+    match_key(&cache.entries, key)
+}
+
+fn match_key(entries: &[(String, String)], key: &str) -> Vec<String> {
+    let mut slugs: Vec<String> = entries
+        .iter()
+        .filter(|(prefix, _)| !prefix.is_empty() && key.starts_with(prefix.as_str()))
+        .map(|(_, slug)| slug.clone())
+        .collect();
+    slugs.sort();
+    slugs.dedup();
+    slugs
+}
+
+/// List `pipelines/<slug>/pipeline.json` objects and collect every source
+/// prefix. Errors degrade to an empty table (logged); the next event or
+/// TTL expiry retries.
+async fn build_routing(state: &AppState) -> Vec<(String, String)> {
+    let Some(client) = &state.s3_client else {
+        return Vec::new();
+    };
+    let keys = match crate::s3::list_keys(client, &state.pipelines_bucket, "pipelines/").await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("routing: list pipelines failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut entries = Vec::new();
+    for key in keys {
+        let Some(slug) = key
+            .strip_prefix("pipelines/")
+            .and_then(|r| r.strip_suffix("/pipeline.json"))
+        else {
+            continue;
+        };
+        if slug.is_empty() || slug.contains('/') {
+            continue;
+        }
+        match crate::s3::get_bytes(client, &state.pipelines_bucket, &key).await {
+            Ok(bytes) => match serde_json::from_slice::<RoutingConfig>(&bytes) {
+                Ok(cfg) => {
+                    for sc in cfg.source_containers {
+                        entries.push((sc.path_prefix, slug.to_string()));
+                    }
+                }
+                Err(e) => tracing::warn!("routing: parse {key} failed: {e}"),
+            },
+            Err(e) => tracing::warn!("routing: read {key} failed: {e}"),
+        }
+    }
+    entries
 }
 
 pub fn router(state: AppState) -> Router {
@@ -229,26 +329,6 @@ struct S3EventPayload {
     records: Vec<S3EventRecord>,
 }
 
-/// Pull `<slug>` out of a `pipelines/<slug>/...` key (URL-decoded first,
-/// matching the S3 event spec). Slugs are created as `[a-z0-9-]`; keys
-/// with anything else are not pipeline uploads and are dropped, not
-/// normalized. Rewriting (e.g. `My_Pipe` to `my-pipe`) used to enqueue
-/// jobs for pipelines that don't exist.
-fn pipeline_slug_from_key(raw_key: &str) -> Option<String> {
-    let key = urldecode(raw_key);
-    let rest = key.strip_prefix("pipelines/")?;
-    let (slug, tail) = rest.split_once('/')?;
-    if slug.is_empty()
-        || tail.is_empty()
-        || !slug
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
-        return None;
-    }
-    Some(slug.to_string())
-}
-
 /// Minimal percent-decoding (S3 events encode keys like URL query args,
 /// with `+` for space).
 fn urldecode(s: &str) -> String {
@@ -378,17 +458,16 @@ async fn post_s3_events(
         let Some(key) = rec.s3.as_ref().and_then(|s| s.object.as_ref()).and_then(|o| o.key.as_deref()) else {
             continue;
         };
-        let Some(slug) = pipeline_slug_from_key(key) else {
-            continue;
-        };
-        match crate::queue::debounce_event(&mut conn, &slug).await {
-            Ok(fire_in_ms) => {
-                tracing::info!("debounced upload event for {slug}; fires in {fire_in_ms}ms");
-                if !scheduled.contains(&slug) {
-                    scheduled.push(slug);
+        for slug in route_key(&state, &urldecode(key)).await {
+            match crate::queue::debounce_event(&mut conn, &slug).await {
+                Ok(fire_in_ms) => {
+                    tracing::info!("debounced upload event for {slug}; fires in {fire_in_ms}ms");
+                    if !scheduled.contains(&slug) {
+                        scheduled.push(slug);
+                    }
                 }
+                Err(e) => tracing::error!("debounce_event failed for {slug}: {e}"),
             }
-            Err(e) => tracing::error!("debounce_event failed for {slug}: {e}"),
         }
     }
 
@@ -402,7 +481,14 @@ async fn post_s3_events(
 /// `POST /config/validate`, deserialize the body as a `PipelineConfig`
 /// and run [`config::validate`]. Always returns 200; the `ok` field
 /// reflects the result and `errors` lists details.
-async fn post_config_validate(body: String) -> impl IntoResponse {
+async fn post_config_validate(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> impl IntoResponse {
+    // A validate call precedes every config publish; drop the routing
+    // cache so a source pointed at a new folder routes its first upload
+    // instead of waiting out the TTL.
+    state.routing.write().await.built_at = None;
     match serde_json::from_str::<PipelineConfig>(&body) {
         Ok(cfg) => match config::validate(&cfg) {
             Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
@@ -488,6 +574,7 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState {
+            routing: Arc::new(tokio::sync::RwLock::new(RoutingCache::default())),
             pipelines_bucket: "karet-pipelines".into(),
             lake_bucket: "karet-lake".into(),
             warehouse_bucket: "karet-warehouse".into(),
@@ -712,24 +799,26 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_slug_from_key_extracts_and_rejects() {
+    fn match_key_routes_by_prefix() {
+        let entries = vec![
+            ("banks/rbc/".to_string(), "spending".to_string()),
+            ("shared/exports/".to_string(), "spending".to_string()),
+            ("shared/exports/".to_string(), "audit".to_string()),
+        ];
+        // One upload fans out to every pipeline reading the folder.
         assert_eq!(
-            pipeline_slug_from_key("pipelines/demo/raw/tx/jan.csv"),
-            Some("demo".into())
+            match_key(&entries, "shared/exports/jan.csv"),
+            vec!["audit".to_string(), "spending".to_string()]
         );
-        // URL-encoded key (S3 event spec)
         assert_eq!(
-            pipeline_slug_from_key("pipelines/my-pipe/raw/a%20b.csv"),
-            Some("my-pipe".into())
+            match_key(&entries, "banks/rbc/chequing/feb.csv"),
+            vec!["spending".to_string()]
         );
-        // Non-canonical slugs are dropped, not rewritten: normalizing
-        // My_Pipe to my-pipe enqueued jobs for nonexistent pipelines.
-        assert_eq!(pipeline_slug_from_key("pipelines/My_Pipe/raw/x.csv"), None);
-        assert_eq!(pipeline_slug_from_key("pipelines/sp ace/raw/x.csv"), None);
-        // not under pipelines/ or no second segment
-        assert_eq!(pipeline_slug_from_key("other/demo/x.csv"), None);
-        assert_eq!(pipeline_slug_from_key("pipelines/demo"), None);
-        assert_eq!(pipeline_slug_from_key("pipelines//x.csv"), None);
+        // No matching source: dropped.
+        assert!(match_key(&entries, "unrelated/x.csv").is_empty());
+        // Empty prefixes never match everything.
+        let empty = vec![("".to_string(), "oops".to_string())];
+        assert!(match_key(&empty, "anything.csv").is_empty());
     }
 
     #[test]
