@@ -712,10 +712,12 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
                     errors[0]
                 ))
             };
+            // "completed" is reserved for clean runs.
+            let status = if errors.is_empty() { "completed" } else { "failed" };
             finish_job(
                 ctx, &mut conn, &msg, &stream_id, &started_at_iso, attempts,
                 Terminal {
-                    status: "completed",
+                    status,
                     error,
                     errors,
                     partitions_written: Some(partitions_written),
