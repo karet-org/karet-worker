@@ -34,8 +34,7 @@ All required to start the worker; it fails fast if any is unset.
 
 ## Job queue
 
-The Redis stream is the only job transport (design:
-`karet-jobs-redis-design.html` in the workspace):
+The Redis stream is the only job transport:
 
 - Claims jobs from the `karet:jobs:stream` consumer group; a per-pipeline
   lock serializes runs; busy jobs defer to a delayed ZSET.
