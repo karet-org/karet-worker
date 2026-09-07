@@ -162,9 +162,7 @@ fn to_base36(mut n: i64) -> String {
     String::from_utf8(out).unwrap()
 }
 
-/// Mint a job id in the same shape the web app uses:
-/// `job-<base36 ms>-<6 chars>`. Ids are opaque — nothing parses them;
-/// ordering always comes from stored record data.
+/// `job-<base36 ms>-<rand6>`, the web app's shape. Opaque: never parsed.
 pub fn new_job_id() -> String {
     let suffix: String = uuid::Uuid::new_v4()
         .simple()
@@ -1198,7 +1196,6 @@ mod tests {
     #[test]
     fn new_job_id_matches_web_shape() {
         let id = new_job_id();
-        // job-<base36 ms>-<6 chars>; opaque, never parsed for meaning.
         let parts: Vec<&str> = id.splitn(3, '-').collect();
         assert_eq!(parts[0], "job");
         assert!(
