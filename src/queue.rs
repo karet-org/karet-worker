@@ -147,7 +147,24 @@ fn now_iso() -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// Mint a job id in the same shape the web app uses.
+/// Base36 (0-9a-z) rendering of a non-negative integer.
+fn to_base36(mut n: i64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n <= 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+
+/// Mint a job id in the same shape the web app uses:
+/// `job-<base36 ms>-<6 chars>`. Ids are opaque — nothing parses them;
+/// ordering always comes from stored record data.
 pub fn new_job_id() -> String {
     let suffix: String = uuid::Uuid::new_v4()
         .simple()
@@ -155,7 +172,7 @@ pub fn new_job_id() -> String {
         .chars()
         .take(6)
         .collect();
-    format!("job-{}-{}", now_ms(), suffix)
+    format!("job-{}-{}", to_base36(now_ms()), suffix)
 }
 
 /// Retry backoff: 30s * 2^(attempts-1), capped at 10 minutes.
@@ -1181,11 +1198,23 @@ mod tests {
     #[test]
     fn new_job_id_matches_web_shape() {
         let id = new_job_id();
-        // job-<ms>-<6 chars>
+        // job-<base36 ms>-<6 chars>; opaque, never parsed for meaning.
         let parts: Vec<&str> = id.splitn(3, '-').collect();
         assert_eq!(parts[0], "job");
-        assert!(parts[1].parse::<i64>().is_ok(), "{id}");
+        assert!(
+            !parts[1].is_empty()
+                && parts[1].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "{id}"
+        );
         assert_eq!(parts[2].len(), 6, "{id}");
+    }
+
+    #[test]
+    fn base36_renders_known_values() {
+        assert_eq!(to_base36(0), "0");
+        assert_eq!(to_base36(35), "z");
+        assert_eq!(to_base36(36), "10");
+        assert_eq!(to_base36(1_788_797_272_117), "mtrfpkqd");
     }
 
     #[test]
