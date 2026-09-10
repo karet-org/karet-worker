@@ -151,7 +151,7 @@ impl DimensionMatcher {
             None => match &self.on_miss {
                 OnMiss::Null => None,
                 OnMiss::Passthrough => Some(input.to_string()),
-                OnMiss::Literal { literal } => Some(literal.clone()),
+                OnMiss::Literal(literal) => Some(literal.clone()),
             },
         }
     }
@@ -332,7 +332,7 @@ mod tests {
         let lit = inline(
             "d",
             MatchMode::Exact,
-            OnMiss::Literal { literal: "Uncategorized".into() },
+            OnMiss::Literal("Uncategorized".into()),
             vec![row(&["CA"], "Canada", 0)],
         );
         let reg = build_inline_registry(std::slice::from_ref(&lit)).unwrap();
@@ -402,6 +402,28 @@ mod tests {
         assert_eq!(err, DimensionError::MissingColumn { id: "geo".into(), column: "region".into() });
     }
 
+    #[test]
+    fn on_miss_wire_forms_are_strings_or_a_literal_object() {
+        // The web writes `"null"`, `"passthrough"` or `{"literal": "OTHER"}`;
+        // the migration script emits the third for a lookup's catch_all.
+        assert_eq!(
+            serde_json::from_str::<OnMiss>("\"null\"").unwrap(),
+            OnMiss::Null
+        );
+        assert_eq!(
+            serde_json::from_str::<OnMiss>("\"passthrough\"").unwrap(),
+            OnMiss::Passthrough
+        );
+        assert_eq!(
+            serde_json::from_str::<OnMiss>("{\"literal\":\"OTHER\"}").unwrap(),
+            OnMiss::Literal("OTHER".into())
+        );
+        assert_eq!(
+            serde_json::to_string(&OnMiss::Literal("OTHER".into())).unwrap(),
+            "{\"literal\":\"OTHER\"}"
+        );
+    }
+
     // --- Behaviours ported from the Lookup matcher this node replaces ---
 
     #[test]
@@ -456,7 +478,7 @@ mod tests {
         let dim = inline(
             "d",
             MatchMode::KeywordSubstring,
-            OnMiss::Literal { literal: "fallback".into() },
+            OnMiss::Literal("fallback".into()),
             vec![row(&["x"], "hit", 0)],
         );
         let reg = build_inline_registry(std::slice::from_ref(&dim)).unwrap();
