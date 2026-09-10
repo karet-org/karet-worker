@@ -62,6 +62,11 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
                 .contains_literal(compile(pattern, ctx)?))
         }
 
+        // --- Boolean composition ---
+        AstNode::And { left, right } => Ok(compile(left, ctx)?.and(compile(right, ctx)?)),
+        AstNode::Or { left, right } => Ok(compile(left, ctx)?.or(compile(right, ctx)?)),
+        AstNode::Not { input } => Ok(compile(input, ctx)?.not()),
+
         // --- String ops ---
         AstNode::Upper { input } => Ok(compile(input, ctx)?.str().to_uppercase()),
         AstNode::Lower { input } => Ok(compile(input, ctx)?.str().to_lowercase()),

@@ -118,11 +118,15 @@ pub fn ingest_file(
         compiled_exprs.push(expr.alias(column.name.as_str()));
     }
 
-    projected
-        .lazy()
-        .select(compiled_exprs)
-        .collect()
-        .map_err(|e| PipelineError::polars(key, e))
+    let mut lazy = projected.lazy().select(compiled_exprs);
+
+    // After the projection, so the predicate sees output column names.
+    if let Some(predicate) = &mapping.where_ {
+        let expr = compile(predicate, &ctx).map_err(|e| PipelineError::eval(key, e))?;
+        lazy = lazy.filter(expr);
+    }
+
+    lazy.collect().map_err(|e| PipelineError::polars(key, e))
 }
 
 /// Ingest many CSV files through their respective mappings and return the
@@ -546,6 +550,7 @@ mod tests {
                 name: String::new(),
                 source_container_id: "src".into(),
                 analytic_table_id: "t".into(),
+                where_: None,
                 columns: vec![MappingColumn {
                     name: "upper_desc".into(),
                     expr: AstNode::Upper {
@@ -584,6 +589,59 @@ mod tests {
         let col = df.column("upper_desc").expect("upper_desc column").as_materialized_series();
         let s = col.str().expect("string column");
         assert_eq!(s.get(0), Some("HELLO"));
+    }
+
+    #[test]
+    fn where_drops_non_matching_rows() {
+        // Predicate references the mapping's *output* column (upper_desc),
+        // proving the filter runs after the projection.
+        let mut cfg = simple_config();
+        cfg.mappings[0].where_ = Some(AstNode::Eq {
+            left: Box::new(AstNode::Col { name: "upper_desc".into() }),
+            right: Box::new(AstNode::Str { value: "KEEP".into() }),
+        });
+        let matchers = HashMap::new();
+        let csv = b"date,description,amount\n2024-01-01,keep,1.0\n2024-01-02,drop,2.0\n";
+
+        let df = ingest_file("raw/src/f.csv", csv, &cfg, &cfg.mappings[0], &matchers)
+            .expect("ingest should succeed");
+
+        assert_eq!(df.height(), 1);
+        let s = df.column("upper_desc").unwrap().as_materialized_series().str().unwrap().get(0);
+        assert_eq!(s, Some("KEEP"));
+    }
+
+    #[test]
+    fn where_composes_with_and_or_not() {
+        let mut cfg = simple_config();
+        // NOT(upper_desc == "DROP") AND (upper_desc == "A" OR upper_desc == "B")
+        let is = |v: &str| AstNode::Eq {
+            left: Box::new(AstNode::Col { name: "upper_desc".into() }),
+            right: Box::new(AstNode::Str { value: v.into() }),
+        };
+        cfg.mappings[0].where_ = Some(AstNode::And {
+            left: Box::new(AstNode::Not { input: Box::new(is("DROP")) }),
+            right: Box::new(AstNode::Or {
+                left: Box::new(is("A")),
+                right: Box::new(is("B")),
+            }),
+        });
+        let matchers = HashMap::new();
+        let csv = b"date,description,amount\n2024-01-01,a,1\n2024-01-02,b,2\n2024-01-03,drop,3\n2024-01-04,c,4\n";
+
+        let df = ingest_file("raw/src/f.csv", csv, &cfg, &cfg.mappings[0], &matchers)
+            .expect("ingest should succeed");
+
+        assert_eq!(df.height(), 2, "only A and B survive");
+    }
+
+    #[test]
+    fn absent_where_keeps_every_row() {
+        let cfg = simple_config();
+        let matchers = HashMap::new();
+        let csv = b"date,description,amount\n2024-01-01,a,1\n2024-01-02,b,2\n";
+        let df = ingest_file("raw/src/f.csv", csv, &cfg, &cfg.mappings[0], &matchers).unwrap();
+        assert_eq!(df.height(), 2);
     }
 
     #[test]
@@ -830,6 +888,7 @@ mod tests {
             id: "m".into(),
             name: String::new(),
             source_container_id: "src".into(),
+            where_: None,
             analytic_table_id: table_id.into(),
             columns: vec![],
         }

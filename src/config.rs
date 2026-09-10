@@ -98,6 +98,11 @@ pub struct Mapping {
     pub source_container_id: String,
     pub analytic_table_id: String,
     pub columns: Vec<MappingColumn>,
+    /// Row filter applied after the column expressions, so the predicate
+    /// references this mapping's output columns. Non-true rows are dropped
+    /// before dedup and partitioning.
+    #[serde(default, rename = "where")]
+    pub where_: Option<AstNode>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -251,6 +256,36 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
                         });
                     }
                 }
+            });
+        }
+
+        // The `where` predicate is validated like a column expression, except
+        // its `Col` refs name this mapping's output columns: it runs after the
+        // projection, not against source rows.
+        if let Some(predicate) = &mapping.where_ {
+            let where_path = format!("/mappings/{i}/where");
+            let out_cols: HashSet<&str> =
+                mapping.columns.iter().map(|c| c.name.as_str()).collect();
+            walk_ast(predicate, &mut |node| match node {
+                AstNode::LookupRef { lookup_id, .. } => {
+                    if resolve_lookup(lookup_id, &cfg.lookup_mappings).is_none() {
+                        errors.push(ConfigError::DanglingReference {
+                            path: where_path.clone(),
+                            kind: "lookup".to_string(),
+                            target: lookup_id.clone(),
+                        });
+                    }
+                }
+                AstNode::Col { name } => {
+                    if !out_cols.contains(name.as_str()) {
+                        errors.push(ConfigError::DanglingReference {
+                            path: where_path.clone(),
+                            kind: "mapping_column".to_string(),
+                            target: format!("{}.{}", mapping.id, name),
+                        });
+                    }
+                }
+                _ => {}
             });
         }
 
@@ -462,10 +497,14 @@ fn walk_ast(node: &AstNode, visit: &mut impl FnMut(&AstNode)) {
         | AstNode::Gt { left, right }
         | AstNode::Lt { left, right }
         | AstNode::Ge { left, right }
-        | AstNode::Le { left, right } => {
+        | AstNode::Le { left, right }
+        | AstNode::And { left, right }
+        | AstNode::Or { left, right } => {
             walk_ast(left, visit);
             walk_ast(right, visit);
         }
+
+        AstNode::Not { input } => walk_ast(input, visit),
 
         AstNode::Concat { args, .. } => {
             for arg in args {
@@ -573,6 +612,7 @@ mod tests {
                 name: String::new(),
                 source_container_id: "src".to_string(),
                 analytic_table_id: "t".to_string(),
+                where_: None,
                 columns: vec![
                     MappingColumn {
                         name: "cat".to_string(),
@@ -633,6 +673,36 @@ mod tests {
             e,
             ConfigError::DuplicateId { kind, id, .. } if kind == "source_container" && id == "src"
         )));
+    }
+
+    #[test]
+    fn where_predicate_referencing_unknown_column_is_reported() {
+        let mut cfg = minimal_valid_config();
+        cfg.mappings[0].where_ = Some(AstNode::Eq {
+            left: Box::new(AstNode::Col { name: "not_an_output_column".into() }),
+            right: Box::new(AstNode::Str { value: "x".into() }),
+        });
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ConfigError::DanglingReference { kind, .. } if kind == "mapping_column"
+            )),
+            "expected a mapping_column dangling reference, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn where_predicate_over_output_columns_validates() {
+        let mut cfg = minimal_valid_config();
+        let out = cfg.mappings[0].columns[0].name.clone();
+        cfg.mappings[0].where_ = Some(AstNode::Not {
+            input: Box::new(AstNode::Eq {
+                left: Box::new(AstNode::Col { name: out }),
+                right: Box::new(AstNode::Null),
+            }),
+        });
+        assert_eq!(validate(&cfg), Ok(()));
     }
 
     #[test]
@@ -720,6 +790,7 @@ mod tests {
                 name: String::new(),
                 source_container_id: "src".to_string(),
                 analytic_table_id: "t".to_string(),
+                where_: None,
                 columns: vec![MappingColumn {
                     name: "out".to_string(),
                     expr: AstNode::Col {
@@ -1027,6 +1098,7 @@ mod tests {
                                 Mapping {
                                                 id: format!("m{i}"),
                                                 name: String::new(),
+                                                where_: None,
                                                 source_container_id: format!("s{}", src_idxs[i]),
                                                 analytic_table_id: format!("t{}", tbl_idxs[i]),
                                                                                 columns: vec![MappingColumn {
