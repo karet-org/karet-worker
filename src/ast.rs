@@ -53,6 +53,14 @@ pub enum AstNode {
     /// Substring test: `pattern` occurs inside `input`.
     Contains { input: Box<AstNode>, pattern: Box<AstNode> },
 
+    // --- Boolean composition ---
+    /// Logical AND over two boolean expressions.
+    And { left: Box<AstNode>, right: Box<AstNode> },
+    /// Logical OR over two boolean expressions.
+    Or { left: Box<AstNode>, right: Box<AstNode> },
+    /// Logical negation.
+    Not { input: Box<AstNode> },
+
     // --- Control flow ---
     /// Conditional: `if cond then then-branch else else-branch`.
     ///
