@@ -133,7 +133,9 @@ pub enum OnMiss {
     Null,
     /// Emit the input unchanged: "map what we know, keep the rest".
     Passthrough,
-    Literal { literal: String },
+    /// Externally tagged, so the wire form is `{"literal": "OTHER"}` while
+    /// the unit variants stay plain strings.
+    Literal(String),
 }
 
 /// Where a dimension's rows come from.
