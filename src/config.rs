@@ -539,7 +539,7 @@ fn walk_ast(node: &AstNode, visit: &mut impl FnMut(&AstNode)) {
             walk_ast(right, visit);
         }
 
-        AstNode::Not { input } => walk_ast(input, visit),
+        AstNode::Not { input } | AstNode::FromUnix { input, .. } => walk_ast(input, visit),
 
         AstNode::Concat { args, .. } => {
             for arg in args {
