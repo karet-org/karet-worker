@@ -9,6 +9,7 @@ use crate::assertions::validate_assertions;
 use crate::config::{self, PipelineConfig};
 use crate::dimension;
 use crate::pipeline;
+use crate::rollup as rollup_mod;
 use crate::s3 as s3mod;
 
 /// Where a job run currently is; surfaced as live progress.
@@ -216,6 +217,8 @@ pub async fn execute_job(
 
     let mut total_partitions = 0usize;
     let mut total_deduped: usize = 0;
+    // Object keys this run wrote, so rollups know which partitions to redo.
+    let mut written_keys: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let files_processed = all_files.len();
     let mappings_total = cfg.mappings.len();
@@ -317,6 +320,7 @@ pub async fn execute_job(
         match upload_partitions_async(ctx, prefix, &partitions).await {
             Ok(count) => {
                 total_partitions += count;
+                written_keys.extend(partitions.iter().map(|p| p.key.clone()));
                 // Upload first, then reap this mapping's stale outputs
                 // (previous layouts, vanished partitions), so a failed
                 // upload never costs existing data.
@@ -354,6 +358,92 @@ pub async fn execute_job(
         mappings_total,
         partitions_written: total_partitions,
     });
+
+    // Rollups read the source table, not this run's frame, but only the
+    // partitions the run touched: validation guarantees those cover whole
+    // target partitions.
+    for rollup in &cfg.rollups {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        let dirs = rollup_mod::affected_dirs(&written_keys, &rollup.source_table_id);
+        if dirs.is_empty() {
+            continue;
+        }
+        let source = cfg
+            .analytic_tables
+            .iter()
+            .find(|t| t.id == rollup.source_table_id)
+            .expect("validated: source table exists");
+        let target = cfg
+            .analytic_tables
+            .iter()
+            .find(|t| t.id == rollup.analytic_table_id)
+            .expect("validated: target table exists");
+
+        for dir in dirs {
+            let listing =
+                match s3mod::list_keys(&ctx.s3_client, &ctx.warehouse_bucket, &format!("{prefix}{dir}"))
+                    .await
+                {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        errors.push(format!("rollup {}: listing {dir}: {e}", rollup.id));
+                        continue;
+                    }
+                };
+            let mut objects: Vec<(String, Vec<u8>)> = Vec::new();
+            for key in listing.iter().filter(|k| k.ends_with(".parquet")) {
+                match s3mod::get_bytes(&ctx.s3_client, &ctx.warehouse_bucket, key).await {
+                    Ok(bytes) => objects.push((key.clone(), bytes)),
+                    Err(e) => errors.push(format!("rollup {}: reading {key}: {e}", rollup.id)),
+                }
+            }
+            if objects.is_empty() {
+                continue;
+            }
+
+            let rollup_cloned = rollup.clone();
+            let source_cloned = source.clone();
+            let target_cloned = target.clone();
+            let dir_cloned = dir.clone();
+            let computed = tokio::task::spawn_blocking(move || {
+                let df = rollup_mod::read_partition(
+                    &rollup_cloned,
+                    &source_cloned,
+                    &dir_cloned,
+                    &objects,
+                )
+                .map_err(|e| e.to_string())?;
+                match df {
+                    None => Ok::<Vec<pipeline::PartitionOutput>, String>(Vec::new()),
+                    Some(df) => pipeline::produce_partitions_for(
+                        &df,
+                        &rollup_cloned.id,
+                        &target_cloned,
+                    )
+                    .map_err(|e| format!("rollup {}: {e}", rollup_cloned.id)),
+                }
+            })
+            .await;
+
+            let partitions = match computed {
+                Ok(Ok(p)) => p,
+                Ok(Err(msg)) => {
+                    errors.push(msg);
+                    continue;
+                }
+                Err(join_err) => {
+                    errors.push(format!("rollup {} task panicked: {join_err}", rollup.id));
+                    continue;
+                }
+            };
+            match upload_partitions_async(ctx, prefix, &partitions).await {
+                Ok(count) => total_partitions += count,
+                Err(e) => errors.push(format!("upload rollup {}: {e}", rollup.id)),
+            }
+        }
+    }
 
     Ok(JobOutcome {
         partitions_written: total_partitions,

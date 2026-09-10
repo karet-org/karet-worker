@@ -14,6 +14,7 @@ pub mod json_source;
 pub mod dimension;
 pub mod pipeline;
 pub mod queue;
+pub mod rollup;
 pub mod s3;
 
 #[cfg(any(test, feature = "test-support"))]

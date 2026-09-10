@@ -13,6 +13,9 @@ pub struct PipelineConfig {
     pub dimensions: Vec<Dimension>,
     pub mappings: Vec<Mapping>,
     pub analytic_tables: Vec<AnalyticTable>,
+    /// Group-by aggregations from one analytic table into another.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rollups: Vec<Rollup>,
     #[serde(default)]
     pub layout: HashMap<String, LayoutPosition>,
 }
@@ -200,6 +203,60 @@ pub struct AnalyticTable {
     pub dedup_keys: Vec<String>,
 }
 
+/// Group-by aggregation from `source_table_id` into `analytic_table_id`.
+///
+/// The input is the source **table**, not the run's batch, so a rollup is
+/// correct however many runs a grain spans. To keep that affordable, a run
+/// recomputes only the source partitions it touched, which validation makes
+/// sound by requiring the target's partition keys to be a subset of the
+/// source's and `group_by` to cover them.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Rollup {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub source_table_id: String,
+    pub analytic_table_id: String,
+    pub group_by: Vec<String>,
+    pub aggregates: Vec<RollupAggregate>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RollupAggregate {
+    /// Output column name; `avg` writes `<name>_sum` and `<name>_count`.
+    pub name: String,
+    #[serde(rename = "fn")]
+    pub fn_: AggFn,
+    /// Column being aggregated. Only `count` may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// Restricts this aggregate to the group's matching rows.
+    #[serde(rename = "where", default, skip_serializing_if = "Option::is_none")]
+    pub where_: Option<AstNode>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AggFn {
+    Count,
+    Sum,
+    Min,
+    Max,
+    /// Stored as a sum/count pair so coarser rollups can be built from it.
+    Avg,
+    CountDistinct,
+    Median,
+}
+
+impl AggFn {
+    /// True for functions that need a column to aggregate.
+    pub fn needs_column(self) -> bool {
+        !matches!(self, AggFn::Count)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LayoutPosition {
     pub x: f64,
@@ -262,7 +319,7 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
     check_unique_and_required_ids(
         &cfg.dimensions,
         "dimensions",
-        "lookup_mapping",
+        "dimension",
         |l| &l.id,
         |_| None,
         &mut errors,
@@ -281,6 +338,14 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
         "analytic_table",
         |t| &t.id,
         |t| Some(&t.name),
+        &mut errors,
+    );
+    check_unique_and_required_ids(
+        &cfg.rollups,
+        "rollups",
+        "rollup",
+        |r| &r.id,
+        |_| None,
         &mut errors,
     );
 
@@ -481,6 +546,156 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
         }
     }
 
+    // Rollups: refs resolve, every produced column is declared, and the
+    // partitioning lets a run recompute only what it touched.
+    let tables_by_id: HashMap<&str, &AnalyticTable> =
+        cfg.analytic_tables.iter().map(|t| (t.id.as_str(), t)).collect();
+    for (i, rollup) in cfg.rollups.iter().enumerate() {
+        let path = format!("/rollups/{i}");
+        let source = tables_by_id.get(rollup.source_table_id.as_str());
+        let target = tables_by_id.get(rollup.analytic_table_id.as_str());
+        if source.is_none() {
+            errors.push(ConfigError::DanglingReference {
+                path: format!("{path}/source_table_id"),
+                kind: "analytic_table".to_string(),
+                target: rollup.source_table_id.clone(),
+            });
+        }
+        if target.is_none() {
+            errors.push(ConfigError::DanglingReference {
+                path: format!("{path}/analytic_table_id"),
+                kind: "analytic_table".to_string(),
+                target: rollup.analytic_table_id.clone(),
+            });
+        }
+        let (Some(source), Some(target)) = (source, target) else {
+            continue;
+        };
+        if rollup.source_table_id == rollup.analytic_table_id {
+            errors.push(ConfigError::Schema {
+                path: path.clone(),
+                message: "a rollup cannot read and write the same table".to_string(),
+            });
+        }
+        if rollup.group_by.is_empty() {
+            errors.push(ConfigError::MissingField {
+                path: format!("{path}/group_by"),
+                field: "group_by".to_string(),
+            });
+        }
+        if rollup.aggregates.is_empty() {
+            errors.push(ConfigError::MissingField {
+                path: format!("{path}/aggregates"),
+                field: "aggregates".to_string(),
+            });
+        }
+
+        let source_cols: HashSet<&str> =
+            source.schema.iter().map(|c| c.name.as_str()).collect();
+        let target_cols: HashSet<&str> =
+            target.schema.iter().map(|c| c.name.as_str()).collect();
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for key in &rollup.group_by {
+            if !seen.insert(key.as_str()) {
+                errors.push(ConfigError::Schema {
+                    path: format!("{path}/group_by"),
+                    message: format!("duplicate group_by column `{key}`"),
+                });
+            }
+            if !source_cols.contains(key.as_str()) {
+                errors.push(ConfigError::DanglingReference {
+                    path: format!("{path}/group_by"),
+                    kind: "schema_column".to_string(),
+                    target: key.clone(),
+                });
+            }
+            if !target_cols.contains(key.as_str()) {
+                errors.push(ConfigError::DanglingReference {
+                    path: format!("{path}/group_by"),
+                    kind: "rollup_column".to_string(),
+                    target: key.clone(),
+                });
+            }
+        }
+
+        // A run recomputes the partitions its incoming rows touch, so every
+        // target partition key must be a group_by column, and re-reading an
+        // affected source partition must cover whole target partitions.
+        for key in &target.partition_keys {
+            if !rollup.group_by.iter().any(|g| g == key) {
+                errors.push(ConfigError::Schema {
+                    path: format!("{path}/group_by"),
+                    message: format!(
+                        "group_by must include the target table's partition key `{key}`, \
+                         otherwise a run cannot recompute a partition in isolation"
+                    ),
+                });
+            }
+            if !source.partition_keys.iter().any(|s| s == key) {
+                errors.push(ConfigError::Schema {
+                    path: format!("{path}/analytic_table_id"),
+                    message: format!(
+                        "partition key `{key}` is not a partition key of source table \
+                         `{}`; the rollup could not be recomputed one partition at a time",
+                        source.id
+                    ),
+                });
+            }
+        }
+
+        let mut produced: HashSet<String> = HashSet::new();
+        for (j, agg) in rollup.aggregates.iter().enumerate() {
+            let apath = format!("{path}/aggregates/{j}");
+            match (&agg.column, agg.fn_.needs_column()) {
+                (None, true) => errors.push(ConfigError::MissingField {
+                    path: apath.clone(),
+                    field: "column".to_string(),
+                }),
+                (Some(c), _) if !source_cols.contains(c.as_str()) => {
+                    errors.push(ConfigError::DanglingReference {
+                        path: format!("{apath}/column"),
+                        kind: "schema_column".to_string(),
+                        target: c.clone(),
+                    })
+                }
+                _ => {}
+            }
+            if let Some(pred) = &agg.where_ {
+                let mut missing: Vec<String> = Vec::new();
+                walk_ast(pred, &mut |node| {
+                    if let AstNode::Col { name } = node {
+                        if !source_cols.contains(name.as_str()) {
+                            missing.push(name.clone());
+                        }
+                    }
+                });
+                for target in missing {
+                    errors.push(ConfigError::DanglingReference {
+                        path: format!("{apath}/where"),
+                        kind: "schema_column".to_string(),
+                        target,
+                    });
+                }
+            }
+            for name in crate::rollup::output_columns(agg) {
+                if !target_cols.contains(name.as_str()) {
+                    errors.push(ConfigError::DanglingReference {
+                        path: apath.clone(),
+                        kind: "rollup_column".to_string(),
+                        target: name.clone(),
+                    });
+                }
+                if !produced.insert(name.clone()) {
+                    errors.push(ConfigError::Schema {
+                        path: apath.clone(),
+                        message: format!("duplicate output column `{name}`"),
+                    });
+                }
+            }
+        }
+    }
+
     // Source prefixes: well-formed absolute lake key prefixes, and no
     // source's prefix may be a prefix of another's (ingest resolves a
     // file's source by prefix match; nesting makes that ambiguous).
@@ -639,8 +854,8 @@ fn resolve_dimension<'a>(id: &str, dimensions: &'a [Dimension]) -> Option<&'a Di
 mod tests {
     use super::*;
 
-    /// Minimal valid config: one source, one lookup (with a child), one
-    /// mapping referencing them, one analytic table.
+    /// Minimal valid config: one source, two dimensions, one mapping
+    /// referencing them, one analytic table.
     fn minimal_valid_config() -> PipelineConfig {
         PipelineConfig {
             version: 1,
@@ -741,6 +956,7 @@ mod tests {
                 partition_keys: vec![],
                 dedup_keys: vec![],
             }],
+            rollups: vec![],
             layout: HashMap::new(),
         }
     }
@@ -802,6 +1018,148 @@ mod tests {
             ConfigError::DanglingReference { kind, target, .. }
                 if kind == "source_container" && target == "missing"
         )));
+    }
+
+    /// A config with a valid rollup: `t` (partitioned by `cat`) rolled up
+    /// into `t_daily` on the same key.
+    fn config_with_rollup() -> PipelineConfig {
+        let mut cfg = minimal_valid_config();
+        let table = cfg.analytic_tables[0].clone();
+        cfg.analytic_tables[0].partition_keys = vec!["cat".to_string()];
+        cfg.analytic_tables.push(AnalyticTable {
+            id: "t_daily".to_string(),
+            name: "T Daily".to_string(),
+            schema: vec![
+                ColumnSchema {
+                    name: "cat".to_string(),
+                    type_: "string".to_string(),
+                    nullable: Some(true),
+                    assertions: None,
+                    path: None,
+                },
+                ColumnSchema {
+                    name: "rows".to_string(),
+                    type_: "int64".to_string(),
+                    nullable: Some(true),
+                    assertions: None,
+                    path: None,
+                },
+            ],
+            partition_keys: vec!["cat".to_string()],
+            dedup_keys: vec![],
+        });
+        let _ = table;
+        cfg.rollups = vec![Rollup {
+            id: "daily".to_string(),
+            name: Some("Daily".to_string()),
+            source_table_id: "t".to_string(),
+            analytic_table_id: "t_daily".to_string(),
+            group_by: vec!["cat".to_string()],
+            aggregates: vec![RollupAggregate {
+                name: "rows".to_string(),
+                fn_: AggFn::Count,
+                column: None,
+                where_: None,
+            }],
+        }];
+        cfg
+    }
+
+    #[test]
+    fn a_well_formed_rollup_validates() {
+        assert!(validate(&config_with_rollup()).is_ok());
+    }
+
+    #[test]
+    fn rollup_grain_must_cover_the_target_partition_key() {
+        let mut cfg = config_with_rollup();
+        cfg.rollups[0].group_by = vec![];
+        let msgs: Vec<String> = validate(&cfg)
+            .unwrap_err()
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("must include the target table's partition key `cat`")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn rollup_target_cannot_partition_on_a_key_the_source_does_not() {
+        let mut cfg = config_with_rollup();
+        cfg.analytic_tables[0].partition_keys = vec![];
+        let msgs: Vec<String> = validate(&cfg)
+            .unwrap_err()
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("not a partition key of source table")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn rollup_output_columns_must_be_declared_on_the_target() {
+        let mut cfg = config_with_rollup();
+        cfg.rollups[0].aggregates[0].name = "undeclared".to_string();
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ConfigError::DanglingReference { kind, target, .. }
+                    if kind == "rollup_column" && target == "undeclared"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_sum_without_a_column_is_reported() {
+        let mut cfg = config_with_rollup();
+        cfg.rollups[0].aggregates[0].fn_ = AggFn::Sum;
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ConfigError::MissingField { field, .. } if field == "column"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn an_avg_needs_both_pair_columns_declared() {
+        let mut cfg = config_with_rollup();
+        cfg.rollups[0].aggregates[0] = RollupAggregate {
+            name: "size".to_string(),
+            fn_: AggFn::Avg,
+            column: Some("cat".to_string()),
+            where_: None,
+        };
+        let msgs: Vec<String> = validate(&cfg)
+            .unwrap_err()
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(msgs.iter().any(|m| m.contains("size_sum")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("size_count")), "{msgs:?}");
+    }
+
+    #[test]
+    fn a_rollup_reading_and_writing_one_table_is_reported() {
+        let mut cfg = config_with_rollup();
+        cfg.rollups[0].analytic_table_id = "t".to_string();
+        let msgs: Vec<String> = validate(&cfg)
+            .unwrap_err()
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("cannot read and write the same table")),
+            "{msgs:?}"
+        );
     }
 
     #[test]
@@ -877,6 +1235,7 @@ mod tests {
                 }],
             }],
             dimensions: vec![],
+            rollups: vec![],
             mappings: vec![Mapping {
                 id: "m".to_string(),
                 name: String::new(),
@@ -1216,6 +1575,7 @@ mod tests {
                             version: 1,
                             source_containers,
                             dimensions,
+                            rollups: vec![],
                             mappings,
                             analytic_tables,
                             layout: HashMap::new(),

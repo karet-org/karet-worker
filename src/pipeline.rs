@@ -287,13 +287,22 @@ pub fn produce_partitions(
         "produce_partitions: mapping.analytic_table_id (`{}`) must equal table.id (`{}`)",
         mapping.analytic_table_id, table.id
     );
+    produce_partitions_for(df, &mapping.id, table)
+}
 
+/// [`produce_partitions`] for any writer id. Rollups write under their own id
+/// for the same reason mappings do: several writers may share a table.
+pub fn produce_partitions_for(
+    df: &DataFrame,
+    writer_id: &str,
+    table: &AnalyticTable,
+) -> Result<Vec<PartitionOutput>, PipelineError> {
     if table.partition_keys.is_empty() {
         let mut owned = df.clone();
         let bytes =
             write_parquet_bytes(&mut owned).map_err(|e| PipelineError::polars("<partition>", e))?;
         return Ok(vec![PartitionOutput {
-            key: unpartitioned_key(&table.id, &mapping.id),
+            key: unpartitioned_key(&table.id, writer_id),
             bytes,
         }]);
     }
@@ -338,7 +347,7 @@ pub fn produce_partitions(
         let bytes =
             write_parquet_bytes(&mut sub).map_err(|e| PipelineError::polars("<partition>", e))?;
         out.push(PartitionOutput {
-            key: format!("{}/{}/{}.parquet", table.id, segments.join("/"), mapping.id),
+            key: format!("{}/{}/{}.parquet", table.id, segments.join("/"), writer_id),
             bytes,
         });
     }
@@ -578,6 +587,7 @@ mod tests {
                 ],
             }],
             dimensions: vec![],
+            rollups: vec![],
             mappings: vec![Mapping {
                 id: "m".into(),
                 name: String::new(),

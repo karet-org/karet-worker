@@ -27,9 +27,19 @@ pub struct CompileCtx<'a> {
 }
 
 impl<'a> CompileCtx<'a> {
-    /// Create a new context wrapping a reference to the lookup registry.
+    /// Create a new context wrapping a reference to the dimension registry.
     pub fn new(dimensions: &'a HashMap<String, Arc<DimensionMatcher>>) -> Self {
         Self { dimensions }
+    }
+
+    /// A context with no dimensions, for expressions that cannot contain a
+    /// `dim_ref` (rollup aggregate predicates run over an analytic table).
+    pub fn empty() -> Self {
+        static EMPTY: std::sync::OnceLock<HashMap<String, Arc<DimensionMatcher>>> =
+            std::sync::OnceLock::new();
+        Self {
+            dimensions: EMPTY.get_or_init(HashMap::new),
+        }
     }
 }
 
