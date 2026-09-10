@@ -89,24 +89,50 @@ pub fn ingest_file(
 ) -> Result<DataFrame, PipelineError> {
     let source_container = resolve_source_container(key, cfg)?;
 
-    let df = read_source(key, csv_bytes)?;
+    // JSON sources bind schema columns to paths inside each record, so the
+    // reader already emits exactly the declared columns: there are no headers
+    // to validate and nothing to project.
+    let projected = if source_container.format == crate::config::SourceFormat::Csv {
+        let df = read_source(key, csv_bytes)?;
 
-    // Collect header names as owned strings so the borrow against `df` is
-    // released before `df.select` below.
-    let headers: Vec<String> = df
-        .get_column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    if let Err(missing) = validate_csv_headers(&headers, &source_container.schema) {
-        return Err(PipelineError::MissingColumns {
-            key: key.to_string(),
-            missing,
-        });
-    }
+        // Collect header names as owned strings so the borrow against `df` is
+        // released before `df.select` below.
+        let headers: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if let Err(missing) = validate_csv_headers(&headers, &source_container.schema) {
+            return Err(PipelineError::MissingColumns {
+                key: key.to_string(),
+                missing,
+            });
+        }
 
-    let projected = project_schema_columns(&df, &source_container.schema)
-        .map_err(|e| PipelineError::polars(key, e))?;
+        project_schema_columns(&df, &source_container.schema)
+            .map_err(|e| PipelineError::polars(key, e))?
+    } else {
+        let (df, skipped) = crate::json_source::read_json_source(csv_bytes, source_container)
+            .map_err(|message| PipelineError::JsonRead {
+                key: key.to_string(),
+                message,
+            })?;
+        if skipped > 0 {
+            tracing::warn!(key, skipped, "skipped unparseable JSON records");
+        }
+        // Record-level filter runs before the column expressions so unrelated
+        // entries in a shared log stream never reach the mapping.
+        if let Some(filter) = &source_container.record_filter {
+            let ctx = CompileCtx::new(matchers);
+            let expr = compile(filter, &ctx).map_err(|e| PipelineError::eval(key, e))?;
+            df.lazy()
+                .filter(expr)
+                .collect()
+                .map_err(|e| PipelineError::polars(key, e))?
+        } else {
+            df
+        }
+    };
 
     // Compile every mapping column against the registry, aliasing to the
     // declared output name. Errors are collected eagerly so they point at
@@ -386,6 +412,7 @@ mod tests {
                 type_: "string".to_string(),
                 nullable: None,
                 assertions: None,
+                path: None,
             }),
             0..=8,
         )
@@ -470,6 +497,7 @@ mod tests {
                     type_: "string".to_string(),
                     nullable: None,
                     assertions: None,
+                    path: None,
                 })
                 .collect();
 
@@ -510,7 +538,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::ast::AstNode;
-    use crate::config::{AnalyticTable, Mapping, MappingColumn, PipelineConfig, SourceContainer};
+    use crate::config::{AnalyticTable, Mapping, MappingColumn, PipelineConfig, SourceContainer, SourceFormat};
     use std::collections::HashMap;
 
     /// Build a minimal config with one source container, one mapping that
@@ -523,24 +551,29 @@ mod tests {
                 id: "src".into(),
                 name: "Src".into(),
                 path_prefix: "raw/src/".into(),
+                format: SourceFormat::Csv,
+                record_filter: None,
                 schema: vec![
                     ColumnSchema {
                         name: "date".into(),
                         type_: "string".into(),
                         nullable: None,
                         assertions: None,
+                        path: None,
                     },
                     ColumnSchema {
                         name: "description".into(),
                         type_: "string".into(),
                         nullable: None,
                         assertions: None,
+                        path: None,
                     },
                     ColumnSchema {
                         name: "amount".into(),
                         type_: "number".into(),
                         nullable: None,
                         assertions: None,
+                        path: None,
                     },
                 ],
             }],
@@ -568,6 +601,7 @@ mod tests {
                     type_: "string".into(),
                     nullable: None,
                     assertions: None,
+                    path: None,
                 }],
                 partition_keys: vec![],
                 dedup_keys: vec![],

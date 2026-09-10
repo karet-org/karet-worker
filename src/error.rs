@@ -4,6 +4,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
+    /// A JSON source file could not be parsed, or a schema path is malformed.
+    #[error("JSON read failed for `{key}`: {message}")]
+    JsonRead { key: String, message: String },
+
     #[error("unknown source container for key `{key}`")]
     UnknownSourceContainer { key: String },
 

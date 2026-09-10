@@ -22,12 +22,47 @@ pub struct SourceContainer {
     pub id: String,
     pub name: String,
     pub path_prefix: String,
+    /// Wire format of the files under `path_prefix`. Drives both the
+    /// extension filter when listing and the reader used to parse.
+    #[serde(default)]
+    pub format: SourceFormat,
     pub schema: Vec<ColumnSchema>,
+    /// JSON only: records not matching this predicate are skipped before
+    /// path extraction. Lets one log stream carry unrelated entries.
+    #[serde(default)]
+    pub record_filter: Option<AstNode>,
+}
+
+/// Source wire format.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceFormat {
+    #[default]
+    Csv,
+    /// One JSON object per line.
+    Ndjson,
+    /// A single JSON array of objects per file.
+    JsonArray,
+}
+
+impl SourceFormat {
+    /// File extensions accepted when listing the lake for this format.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            SourceFormat::Csv => &[".csv"],
+            SourceFormat::Ndjson => &[".json", ".jsonl", ".ndjson"],
+            SourceFormat::JsonArray => &[".json"],
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ColumnSchema {
     pub name: String,
+    /// JSON sources only: dotted path with optional `[n]` indices, e.g.
+    /// `request.headers.User-Agent[0]`. Defaults to `name`.
+    #[serde(default)]
+    pub path: Option<String>,
     /// Logical type name: `"string"`, `"number"`, `"int64"`, `"float64"`,
     /// `"date"`, `"bool"`.
     #[serde(rename = "type")]
@@ -575,11 +610,14 @@ mod tests {
                 id: "src".to_string(),
                 name: "Src".to_string(),
                 path_prefix: "raw/src/".to_string(),
+                format: SourceFormat::Csv,
+                record_filter: None,
                 schema: vec![ColumnSchema {
                     name: "a".to_string(),
                     type_: "string".to_string(),
                     nullable: None,
                     assertions: None,
+                    path: None,
                 }],
             }],
             lookup_mappings: vec![LookupMapping {
@@ -643,12 +681,14 @@ mod tests {
                         type_: "string".to_string(),
                         nullable: Some(true),
                         assertions: None,
+                        path: None,
                     },
                     ColumnSchema {
                         name: "mer".to_string(),
                         type_: "string".to_string(),
                         nullable: Some(true),
                         assertions: None,
+                        path: None,
                     },
                 ],
                 partition_keys: vec![],
@@ -777,11 +817,14 @@ mod tests {
                 id: "src".to_string(),
                 name: "Src".to_string(),
                 path_prefix: "raw/src/".to_string(),
+                format: SourceFormat::Csv,
+                record_filter: None,
                 schema: vec![ColumnSchema {
                     name: "a".to_string(),
                     type_: "string".to_string(),
                     nullable: None,
                     assertions: None,
+                    path: None,
                 }],
             }],
             lookup_mappings: vec![],
@@ -806,6 +849,7 @@ mod tests {
                     type_: "string".to_string(),
                     nullable: Some(true),
                     assertions: None,
+                    path: None,
                 }],
                 partition_keys: vec![],
                 dedup_keys: vec![],
@@ -859,6 +903,7 @@ mod tests {
             type_: "float64".to_string(),
             nullable: Some(true),
             assertions: None,
+            path: None,
         });
         cfg.mappings[0].columns.push(MappingColumn {
             name: "amt".to_string(),
@@ -879,6 +924,7 @@ mod tests {
             type_: "number".to_string(),
             nullable: Some(true),
             assertions: None,
+            path: None,
         });
         cfg.mappings[0].columns.push(MappingColumn {
             name: "n".to_string(),
@@ -906,6 +952,7 @@ mod tests {
             type_: "float64".to_string(),
             nullable: Some(true),
             assertions: None,
+            path: None,
         });
         cfg.mappings[0].columns.push(MappingColumn {
             name: "amt".to_string(),
@@ -1034,11 +1081,14 @@ mod tests {
                                 id: format!("s{i}"),
                                 name: format!("S{i}"),
                                 path_prefix: format!("raw/s{i}/"),
+                                format: SourceFormat::Csv,
+                                record_filter: None,
                                 schema: vec![ColumnSchema {
                                     name: "c0".to_string(),
                                     type_: "string".to_string(),
                                     nullable: None,
                                     assertions: None,
+                                    path: None,
                                 }],
                             })
                             .collect();
@@ -1068,6 +1118,7 @@ mod tests {
                                     type_: "string".to_string(),
                                     nullable: Some(true),
                                     assertions: None,
+                                    path: None,
                                 }],
                                 partition_keys: vec![],
                                 dedup_keys: vec![],
