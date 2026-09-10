@@ -56,8 +56,11 @@ impl PipelineError {
 
 #[derive(Debug, Error)]
 pub enum EvalError {
-    #[error("unknown lookup id: {id}")]
-    UnknownLookup { id: String },
+    #[error("unknown dimension `{id}`")]
+    UnknownDimension { id: String },
+
+    #[error("dimension `{id}` has no value column `{value}`")]
+    UnknownDimensionValue { id: String, value: String },
 
     #[error("polars error: {0}")]
     Polars(#[from] polars::prelude::PolarsError),

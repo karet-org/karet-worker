@@ -88,7 +88,13 @@ pub enum AstNode {
     /// Parse a string column into a date using a strftime format.
     ParseDate { input: Box<AstNode>, format: String },
     /// Reference into a `Lookup_Mapping` by dotted id (`parent.child`).
-    LookupRef { lookup_id: String, input: Box<AstNode> },
+    DimRef {
+        dim_id: String,
+        /// Which value column to return; defaults to the first.
+        #[serde(default)]
+        value: Option<String>,
+        input: Box<AstNode>,
+    },
 
     // --- Date parts ---
     /// Calendar year of a date input, as Int64.

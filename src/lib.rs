@@ -11,7 +11,7 @@ pub mod evaluator;
 pub mod http;
 pub mod job;
 pub mod json_source;
-pub mod lookup;
+pub mod dimension;
 pub mod pipeline;
 pub mod queue;
 pub mod s3;

@@ -564,7 +564,7 @@ mod tests {
     const VALID_CONFIG: &str = r#"{
         "version": 1,
         "source_containers": [],
-        "lookup_mappings": [],
+        "dimensions": [],
         "mappings": [],
         "analytic_tables": [],
         "layout": {}
@@ -641,7 +641,7 @@ mod tests {
                 {"id": "s", "name": "S", "path_prefix": "raw/s/", "schema": [{"name":"c","type":"string"}]},
                 {"id": "s", "name": "S2", "path_prefix": "raw/s2/", "schema": [{"name":"c","type":"string"}]}
             ],
-            "lookup_mappings": [],
+            "dimensions": [],
             "mappings": [],
             "analytic_tables": [],
             "layout": {}

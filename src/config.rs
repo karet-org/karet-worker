@@ -10,7 +10,7 @@ use crate::ast::AstNode;
 pub struct PipelineConfig {
     pub version: u32,
     pub source_containers: Vec<SourceContainer>,
-    pub lookup_mappings: Vec<LookupMapping>,
+    pub dimensions: Vec<Dimension>,
     pub mappings: Vec<Mapping>,
     pub analytic_tables: Vec<AnalyticTable>,
     #[serde(default)]
@@ -87,39 +87,78 @@ pub struct ColumnAssertions {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct LookupMapping {
+pub struct Dimension {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    /// Matching strategy, e.g. `"keyword_substring"`. Parent-only.
+    /// How an input is matched against row patterns.
     #[serde(default, rename = "match")]
-    pub match_: Option<String>,
+    pub match_: MatchMode,
     #[serde(default)]
     pub case_insensitive: Option<bool>,
-    pub rows: Vec<LookupRow>,
+    /// What a non-matching input produces.
     #[serde(default)]
-    pub children: Vec<LookupMapping>,
-    /// Fallback hit emitted when no row's patterns match (after children
-    /// have also missed). Unset = miss yields `None` (null in the output
-    /// column), preserving pre-catch-all behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub catch_all: Option<LookupCatchAll>,
+    pub on_miss: OnMiss,
+    pub rows: DimensionRows,
 }
 
-/// Output for a [`LookupMapping::catch_all`] fallback.
+impl Dimension {
+    /// Value column names in declaration order.
+    pub fn value_columns(&self) -> &[String] {
+        match &self.rows {
+            DimensionRows::Inline { values, .. } => values,
+            DimensionRows::File { values, .. } => values,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    /// Whole-value equality; keys must be unique.
+    #[default]
+    Exact,
+    /// Any pattern occurring inside the input, highest `priority` winning.
+    KeywordSubstring,
+}
+
+/// Result for an input that matches no row.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnMiss {
+    #[default]
+    Null,
+    /// Emit the input unchanged: "map what we know, keep the rest".
+    Passthrough,
+    Literal { literal: String },
+}
+
+/// Where a dimension's rows come from.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct LookupCatchAll {
-    pub output: String,
+#[serde(untagged)]
+pub enum DimensionRows {
+    /// Rows written in the config: small, hand-edited tables.
+    Inline {
+        /// Value column names; each row supplies one entry per name.
+        values: Vec<String>,
+        rows: Vec<InlineDimensionRow>,
+    },
+    /// Rows read from a CSV file in the lake: large or externally maintained.
+    File {
+        path_prefix: String,
+        key: String,
+        values: Vec<String>,
+        #[serde(default)]
+        priority_column: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct LookupRow {
-    pub input_patterns: Vec<String>,
-    pub output: String,
-    /// Tie-breaker when more than one row in the same lookup node matches an
-    /// input. The matcher picks the matching row with the highest `priority`;
-    /// ties fall back to definition order. Defaults to `0`, so omitting the
-    /// field preserves first-match-wins behavior.
+pub struct InlineDimensionRow {
+    /// Exact keys or substring patterns.
+    pub patterns: Vec<String>,
+    /// One value per the dimension's `values` column list.
+    pub values: Vec<String>,
     #[serde(default)]
     pub priority: i64,
 }
@@ -221,8 +260,8 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
         &mut errors,
     );
     check_unique_and_required_ids(
-        &cfg.lookup_mappings,
-        "lookup_mappings",
+        &cfg.dimensions,
+        "dimensions",
         "lookup_mapping",
         |l| &l.id,
         |_| None,
@@ -282,13 +321,24 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
         for (j, column) in mapping.columns.iter().enumerate() {
             let expr_path = format!("/mappings/{i}/columns/{j}/expr");
             walk_ast(&column.expr, &mut |node| {
-                if let AstNode::LookupRef { lookup_id, .. } = node {
-                    if resolve_lookup(lookup_id, &cfg.lookup_mappings).is_none() {
-                        errors.push(ConfigError::DanglingReference {
+                if let AstNode::DimRef { dim_id, value, .. } = node {
+                    match resolve_dimension(dim_id, &cfg.dimensions) {
+                        None => errors.push(ConfigError::DanglingReference {
                             path: expr_path.clone(),
-                            kind: "lookup".to_string(),
-                            target: lookup_id.clone(),
-                        });
+                            kind: "dimension".to_string(),
+                            target: dim_id.clone(),
+                        }),
+                        Some(dim) => {
+                            if let Some(v) = value {
+                                if !dim.value_columns().iter().any(|c| c == v) {
+                                    errors.push(ConfigError::DanglingReference {
+                                        path: expr_path.clone(),
+                                        kind: "dimension_value".to_string(),
+                                        target: format!("{dim_id}.{v}"),
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -302,12 +352,12 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
             let out_cols: HashSet<&str> =
                 mapping.columns.iter().map(|c| c.name.as_str()).collect();
             walk_ast(predicate, &mut |node| match node {
-                AstNode::LookupRef { lookup_id, .. } => {
-                    if resolve_lookup(lookup_id, &cfg.lookup_mappings).is_none() {
+                AstNode::DimRef { dim_id, .. } => {
+                    if resolve_dimension(dim_id, &cfg.dimensions).is_none() {
                         errors.push(ConfigError::DanglingReference {
                             path: where_path.clone(),
-                            kind: "lookup".to_string(),
-                            target: lookup_id.clone(),
+                            kind: "dimension".to_string(),
+                            target: dim_id.clone(),
                         });
                     }
                 }
@@ -561,7 +611,7 @@ fn walk_ast(node: &AstNode, visit: &mut impl FnMut(&AstNode)) {
         | AstNode::Year { input }
         | AstNode::Month { input }
         | AstNode::Day { input }
-        | AstNode::LookupRef { input, .. }
+        | AstNode::DimRef { input, .. }
         | AstNode::Cast { input, .. } => {
             walk_ast(input, visit);
         }
@@ -579,22 +629,10 @@ fn walk_ast(node: &AstNode, visit: &mut impl FnMut(&AstNode)) {
     }
 }
 
-/// Resolve a dotted lookup path (e.g. `categories.merchants`) against the
-/// top-level lookups. Returns `None` if any segment fails to resolve.
-fn resolve_lookup<'a>(path: &str, lookups: &'a [LookupMapping]) -> Option<&'a LookupMapping> {
-    let mut segments = path.split('.');
-    let head = segments.next()?;
-    if head.is_empty() {
-        return None;
-    }
-    let mut current: &LookupMapping = lookups.iter().find(|l| l.id == head)?;
-    for segment in segments {
-        if segment.is_empty() {
-            return None;
-        }
-        current = current.children.iter().find(|c| c.id == segment)?;
-    }
-    Some(current)
+/// Resolve a dimension by id. Ids are flat: hierarchical lookups had no
+/// live users and row `priority` expresses the same specificity.
+fn resolve_dimension<'a>(id: &str, dimensions: &'a [Dimension]) -> Option<&'a Dimension> {
+    dimensions.iter().find(|d| d.id == id)
 }
 
 #[cfg(test)]
@@ -620,31 +658,38 @@ mod tests {
                     path: None,
                 }],
             }],
-            lookup_mappings: vec![LookupMapping {
-                id: "categories".to_string(),
-                name: Some("Categories".to_string()),
-                match_: Some("keyword_substring".to_string()),
-                case_insensitive: Some(true),
-                rows: vec![LookupRow {
-                    input_patterns: vec!["UBER".to_string()],
-                    output: "TRANSPORT".to_string(),
-                    priority: 0,
-                }],
-                children: vec![LookupMapping {
+            dimensions: vec![
+                Dimension {
+                    id: "categories".to_string(),
+                    name: Some("Categories".to_string()),
+                    match_: MatchMode::KeywordSubstring,
+                    case_insensitive: Some(true),
+                    on_miss: OnMiss::Null,
+                    rows: DimensionRows::Inline {
+                        values: vec!["category".to_string()],
+                        rows: vec![InlineDimensionRow {
+                            patterns: vec!["UBER".to_string()],
+                            values: vec!["TRANSPORT".to_string()],
+                            priority: 0,
+                        }],
+                    },
+                },
+                Dimension {
                     id: "merchants".to_string(),
                     name: None,
-                    match_: None,
+                    match_: MatchMode::KeywordSubstring,
                     case_insensitive: None,
-                    rows: vec![LookupRow {
-                        input_patterns: vec!["UBER".to_string()],
-                        output: "UBER".to_string(),
-                        priority: 0,
-                    }],
-                    children: vec![],
-                    catch_all: None,
-                }],
-                catch_all: None,
-            }],
+                    on_miss: OnMiss::Null,
+                    rows: DimensionRows::Inline {
+                        values: vec!["merchant".to_string()],
+                        rows: vec![InlineDimensionRow {
+                            patterns: vec!["UBER".to_string()],
+                            values: vec!["UBER".to_string()],
+                            priority: 0,
+                        }],
+                    },
+                },
+            ],
             mappings: vec![Mapping {
                 id: "m".to_string(),
                 name: String::new(),
@@ -654,8 +699,9 @@ mod tests {
                 columns: vec![
                     MappingColumn {
                         name: "cat".to_string(),
-                        expr: AstNode::LookupRef {
-                            lookup_id: "categories".to_string(),
+                        expr: AstNode::DimRef {
+                            dim_id: "categories".to_string(),
+                            value: None,
                             input: Box::new(AstNode::Col {
                                 name: "a".to_string(),
                             }),
@@ -663,8 +709,9 @@ mod tests {
                     },
                     MappingColumn {
                         name: "mer".to_string(),
-                        expr: AstNode::LookupRef {
-                            lookup_id: "categories.merchants".to_string(),
+                        expr: AstNode::DimRef {
+                            dim_id: "merchants".to_string(),
+                            value: None,
                             input: Box::new(AstNode::Col {
                                 name: "a".to_string(),
                             }),
@@ -758,10 +805,11 @@ mod tests {
     }
 
     #[test]
-    fn dangling_lookup_reference_is_reported() {
+    fn dangling_dimension_reference_is_reported() {
         let mut cfg = minimal_valid_config();
-        cfg.mappings[0].columns[0].expr = AstNode::LookupRef {
-            lookup_id: "does_not_exist".to_string(),
+        cfg.mappings[0].columns[0].expr = AstNode::DimRef {
+            value: None,
+            dim_id: "does_not_exist".to_string(),
             input: Box::new(AstNode::Col {
                 name: "a".to_string(),
             }),
@@ -770,15 +818,16 @@ mod tests {
         assert!(errs.iter().any(|e| matches!(
             e,
             ConfigError::DanglingReference { kind, target, .. }
-                if kind == "lookup" && target == "does_not_exist"
+                if kind == "dimension" && target == "does_not_exist"
         )));
     }
 
     #[test]
-    fn dangling_child_lookup_reference_is_reported() {
+    fn dangling_dimension_value_column_is_reported() {
         let mut cfg = minimal_valid_config();
-        cfg.mappings[0].columns[1].expr = AstNode::LookupRef {
-            lookup_id: "categories.missing_child".to_string(),
+        cfg.mappings[0].columns[1].expr = AstNode::DimRef {
+            value: Some("not_a_value_column".to_string()),
+            dim_id: "categories".to_string(),
             input: Box::new(AstNode::Col {
                 name: "a".to_string(),
             }),
@@ -787,7 +836,7 @@ mod tests {
         assert!(errs.iter().any(|e| matches!(
             e,
             ConfigError::DanglingReference { kind, target, .. }
-                if kind == "lookup" && target == "categories.missing_child"
+                if kind == "dimension_value" && target == "categories.not_a_value_column"
         )));
     }
 
@@ -807,7 +856,7 @@ mod tests {
         )));
     }
 
-    /// A config with zero lookup_mappings must validate when no mapping
+    /// A config with zero dimensions must validate when no mapping
     /// references a lookup.
     #[test]
     fn valid_config_without_lookups_passes() {
@@ -827,7 +876,7 @@ mod tests {
                     path: None,
                 }],
             }],
-            lookup_mappings: vec![],
+            dimensions: vec![],
             mappings: vec![Mapping {
                 id: "m".to_string(),
                 name: String::new(),
@@ -1045,7 +1094,7 @@ mod tests {
         DropMappingId,
         BreakMappingSourceRef,
         BreakMappingTableRef,
-        BreakLookupRef,
+        BreakDimRef,
     }
 
     fn arb_mutation() -> impl Strategy<Value = Mutation> {
@@ -1055,7 +1104,7 @@ mod tests {
             Just(Mutation::DropMappingId),
             Just(Mutation::BreakMappingSourceRef),
             Just(Mutation::BreakMappingTableRef),
-            Just(Mutation::BreakLookupRef),
+            Just(Mutation::BreakDimRef),
         ]
     }
 
@@ -1067,7 +1116,7 @@ mod tests {
                     Just(0u8), // Col
                     Just(1u8), // Str
                     Just(2u8), // Num
-                    Just(3u8), // LookupRef (only valid when n_lookups > 0)
+                    Just(3u8), // DimRef (only valid when n_lookups > 0)
                 ];
                 (
                     proptest::collection::vec(0usize..n_sources, n_mappings),
@@ -1093,19 +1142,21 @@ mod tests {
                             })
                             .collect();
 
-                        let lookup_mappings: Vec<LookupMapping> = (0..n_lookups)
-                            .map(|i| LookupMapping {
+                        let dimensions: Vec<Dimension> = (0..n_lookups)
+                            .map(|i| Dimension {
                                 id: format!("l{i}"),
                                 name: Some(format!("L{i}")),
-                                match_: Some("keyword_substring".to_string()),
+                                match_: MatchMode::KeywordSubstring,
                                 case_insensitive: Some(true),
-                                rows: vec![LookupRow {
-                                    input_patterns: vec!["x".to_string()],
-                                    output: "Y".to_string(),
-                                    priority: 0,
-                                }],
-                                children: vec![],
-                                catch_all: None,
+                                on_miss: OnMiss::Null,
+                                rows: DimensionRows::Inline {
+                                    values: vec!["v".to_string()],
+                                    rows: vec![InlineDimensionRow {
+                                        patterns: vec!["x".to_string()],
+                                        values: vec!["Y".to_string()],
+                                        priority: 0,
+                                    }],
+                                },
                             })
                             .collect();
 
@@ -1135,8 +1186,9 @@ mod tests {
                                         value: "x".to_string(),
                                     },
                                     2 => AstNode::Num { value: 1.0 },
-                                    _ if n_lookups > 0 => AstNode::LookupRef {
-                                        lookup_id: format!("l{}", lk_idxs[i] % n_lookups),
+                                    _ if n_lookups > 0 => AstNode::DimRef {
+                                        dim_id: format!("l{}", lk_idxs[i] % n_lookups),
+                                        value: None,
                                         input: Box::new(AstNode::Col {
                                             name: "c0".to_string(),
                                         }),
@@ -1163,7 +1215,7 @@ mod tests {
                         PipelineConfig {
                             version: 1,
                             source_containers,
-                            lookup_mappings,
+                            dimensions,
                             mappings,
                             analytic_tables,
                             layout: HashMap::new(),
@@ -1201,11 +1253,12 @@ mod tests {
                 let m = cfg.mappings.first_mut()?;
                 m.analytic_table_id = "__does_not_exist__".to_string();
             }
-            Mutation::BreakLookupRef => {
+            Mutation::BreakDimRef => {
                 let m = cfg.mappings.first_mut()?;
                 let col = m.columns.first_mut()?;
-                col.expr = AstNode::LookupRef {
-                    lookup_id: "__does_not_exist__".to_string(),
+                col.expr = AstNode::DimRef {
+                    dim_id: "__does_not_exist__".to_string(),
+                    value: None,
                     input: Box::new(AstNode::Col {
                         name: "c0".to_string(),
                     }),
