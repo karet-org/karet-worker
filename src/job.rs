@@ -7,7 +7,7 @@
 
 use crate::assertions::validate_assertions;
 use crate::config::{self, PipelineConfig};
-use crate::lookup;
+use crate::dimension;
 use crate::pipeline;
 use crate::s3 as s3mod;
 
@@ -62,9 +62,12 @@ pub enum JobError {
     /// The config parsed but fails cross-reference validation. Permanent.
     #[error("config invalid: {0}")]
     ConfigInvalid(String),
-    /// No CSV files found under any source container prefix.
+    /// No source files found under any source container prefix.
     #[error("no CSV files found to process")]
     NoFiles,
+    /// A dimension could not be built (duplicate key, row cap, bad file).
+    #[error("dimension error: {0}")]
+    Dimension(String),
     /// The run lock was lost to a newer attempt; abort without writing.
     #[error("cancelled: lock lost to a newer attempt")]
     Cancelled,
@@ -172,8 +175,44 @@ pub async fn execute_job(
         return Err(JobError::NoFiles);
     }
 
-    // Precompile the lookup registry once per job; shared by every mapping.
-    let matchers = lookup::build_registry(&cfg.lookup_mappings);
+    // Precompile the dimension registry once per job; shared by every mapping.
+    // Inline rows compile from config; file-backed rows are fetched from the
+    // lake here, where S3 access lives.
+    let mut matchers = dimension::build_inline_registry(&cfg.dimensions)
+        .map_err(|e| JobError::Dimension(e.to_string()))?;
+    for dim in &cfg.dimensions {
+        if let crate::config::DimensionRows::File {
+            path_prefix,
+            key,
+            values,
+            priority_column,
+        } = &dim.rows
+        {
+            let keys = s3mod::list_keys(&ctx.s3_client, &ctx.lake_bucket, path_prefix)
+                .await
+                .map_err(|e| JobError::Dimension(format!("listing {path_prefix}: {e}")))?;
+            let mut rows = Vec::new();
+            for object_key in keys.iter().filter(|k| k.ends_with(".csv")) {
+                let bytes = s3mod::get_bytes(&ctx.s3_client, &ctx.lake_bucket, object_key)
+                    .await
+                    .map_err(|e| JobError::Dimension(format!("reading {object_key}: {e}")))?;
+                rows.extend(
+                    dimension::rows_from_csv(
+                        dim,
+                        key,
+                        values,
+                        priority_column.as_deref(),
+                        &bytes,
+                    )
+                    .map_err(|e| JobError::Dimension(e.to_string()))?,
+                );
+            }
+            let matcher = dimension::DimensionMatcher::new(dim, rows)
+                .map_err(|e| JobError::Dimension(e.to_string()))?;
+            matchers.insert(dim.id.clone(), std::sync::Arc::new(matcher));
+        }
+    }
+    let matchers = matchers;
 
     let mut total_partitions = 0usize;
     let mut total_deduped: usize = 0;

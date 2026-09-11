@@ -9,7 +9,7 @@ use polars::prelude::*;
 use crate::config::{AnalyticTable, ColumnSchema, Mapping, PipelineConfig, SourceContainer};
 use crate::error::PipelineError;
 use crate::evaluator::{compile, CompileCtx};
-use crate::lookup::LookupMatcher;
+use crate::dimension::DimensionMatcher;
 
 /// Check a CSV header row against a source container's declared schema.
 ///
@@ -85,7 +85,7 @@ pub fn ingest_file(
     csv_bytes: &[u8],
     cfg: &PipelineConfig,
     mapping: &Mapping,
-    matchers: &HashMap<String, Arc<LookupMatcher>>,
+    matchers: &HashMap<String, Arc<DimensionMatcher>>,
 ) -> Result<DataFrame, PipelineError> {
     let source_container = resolve_source_container(key, cfg)?;
 
@@ -165,7 +165,7 @@ pub fn ingest_many(
     files: &[(String, Vec<u8>)],
     cfg: &PipelineConfig,
     mapping: &Mapping,
-    matchers: &HashMap<String, Arc<LookupMatcher>>,
+    matchers: &HashMap<String, Arc<DimensionMatcher>>,
 ) -> Result<LazyFrame, PipelineError> {
     let mut frames: Vec<LazyFrame> = Vec::with_capacity(files.len());
 
@@ -577,7 +577,7 @@ mod tests {
                     },
                 ],
             }],
-            lookup_mappings: vec![],
+            dimensions: vec![],
             mappings: vec![Mapping {
                 id: "m".into(),
                 name: String::new(),
