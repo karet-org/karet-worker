@@ -129,20 +129,20 @@ impl Builder {
     }
 }
 
-/// Split file bytes into records according to the format. Unparseable
-/// NDJSON lines are skipped (count returned) rather than failing the file.
+/// Split file bytes into records: one JSON object per line. Unparseable lines
+/// are skipped (count returned) rather than failing the whole file, because a
+/// truncated last line is normal in a log that is still being written.
 fn parse_records(bytes: &[u8], format: SourceFormat) -> Result<(Vec<Value>, usize), String> {
     match format {
-        SourceFormat::JsonArray => {
-            let parsed: Value =
-                serde_json::from_slice(bytes).map_err(|e| format!("invalid JSON: {e}"))?;
-            match parsed {
-                Value::Array(items) => Ok((items, 0)),
-                other => Ok((vec![other], 0)),
-            }
-        }
         SourceFormat::Ndjson => {
             let text = std::str::from_utf8(bytes).map_err(|e| format!("invalid UTF-8: {e}"))?;
+            if text.trim_start().starts_with('[') {
+                return Err(
+                    "file looks like a single JSON array; this source reads one JSON object \
+                     per line (NDJSON)"
+                        .to_string(),
+                );
+            }
             let mut records = Vec::new();
             let mut skipped = 0usize;
             for line in text.lines() {
@@ -298,11 +298,13 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_json_array_file() {
+    fn a_whole_file_json_array_is_rejected_with_a_useful_message() {
+        // Only NDJSON is supported; an array would otherwise skip every line
+        // and look like an empty file.
         let body = br#"[{"a":1},{"a":2},{"a":3}]"#;
-        let src = source(SourceFormat::JsonArray, vec![col("a", "int64", None)]);
-        let (df, _) = read_json_source(body, &src).unwrap();
-        assert_eq!(df.height(), 3);
+        let src = source(SourceFormat::Ndjson, vec![col("a", "int64", None)]);
+        let err = read_json_source(body, &src).unwrap_err();
+        assert!(err.to_string().contains("one JSON object"), "{err}");
     }
 
     #[test]
