@@ -53,6 +53,14 @@ pub enum AstNode {
     /// Substring test: `pattern` occurs inside `input`.
     Contains { input: Box<AstNode>, pattern: Box<AstNode> },
 
+    /// Epoch timestamp to date. `unit` is `"s"` or `"ms"`; JSON log streams
+    /// almost always carry epochs, which `parse_date` cannot read.
+    FromUnix {
+        input: Box<AstNode>,
+        #[serde(default)]
+        unit: Option<String>,
+    },
+
     // --- Boolean composition ---
     /// Logical AND over two boolean expressions.
     And { left: Box<AstNode>, right: Box<AstNode> },

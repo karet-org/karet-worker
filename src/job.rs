@@ -143,10 +143,12 @@ pub async fn execute_job(
         // path_prefix is an absolute lake key prefix; sources may point at
         // any folder in the lake, not just this pipeline's.
         match s3mod::list_keys(&ctx.s3_client, &ctx.lake_bucket, &sc.path_prefix).await {
-            Ok(keys) => candidate_keys.extend(
-                keys.into_iter()
-                    .filter(|k| k.ends_with(".csv") && seen.insert(k.clone())),
-            ),
+            Ok(keys) => {
+                let exts = sc.format.extensions();
+                candidate_keys.extend(keys.into_iter().filter(|k| {
+                    exts.iter().any(|e| k.ends_with(e)) && seen.insert(k.clone())
+                }))
+            }
             Err(e) => tracing::warn!("failed to list keys for {}: {e}", sc.path_prefix),
         }
     }

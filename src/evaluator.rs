@@ -62,6 +62,18 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
                 .contains_literal(compile(pattern, ctx)?))
         }
 
+        AstNode::FromUnix { input, unit } => {
+            // Seconds (default) or milliseconds since the epoch -> Date.
+            let millis = match unit.as_deref() {
+                Some("ms") => compile(input, ctx)?,
+                _ => compile(input, ctx)? * lit(1000.0),
+            };
+            Ok(millis
+                .cast(DataType::Int64)
+                .cast(DataType::Datetime(TimeUnit::Milliseconds, None))
+                .cast(DataType::Date))
+        }
+
         // --- Boolean composition ---
         AstNode::And { left, right } => Ok(compile(left, ctx)?.and(compile(right, ctx)?)),
         AstNode::Or { left, right } => Ok(compile(left, ctx)?.or(compile(right, ctx)?)),
@@ -215,6 +227,60 @@ mod tests {
         assert_eq!(out.column("y").unwrap().i64().unwrap().get(0), Some(2026));
         assert_eq!(out.column("m").unwrap().i64().unwrap().get(0), Some(9));
         assert_eq!(out.column("day").unwrap().i64().unwrap().get(1), Some(31));
+    }
+
+    #[test]
+    fn from_unix_converts_epoch_seconds_and_millis() {
+        // 1788934940.86 s and the same instant in ms -> 2026-09-09 (UTC).
+        let df = df!["s" => [1788934940.86_f64], "ms" => [1788934940860.0_f64]].unwrap();
+        let registry = HashMap::new();
+        let ctx = CompileCtx::new(&registry);
+        let out = df
+            .lazy()
+            .select([
+                compile(
+                    &AstNode::FromUnix {
+                        input: Box::new(AstNode::Col { name: "s".into() }),
+                        unit: None,
+                    },
+                    &ctx,
+                )
+                .unwrap()
+                .alias("from_s"),
+                compile(
+                    &AstNode::FromUnix {
+                        input: Box::new(AstNode::Col { name: "ms".into() }),
+                        unit: Some("ms".into()),
+                    },
+                    &ctx,
+                )
+                .unwrap()
+                .alias("from_ms"),
+            ])
+            .collect()
+            .unwrap();
+
+        let a = out.column("from_s").unwrap();
+        let b = out.column("from_ms").unwrap();
+        assert_eq!(a.dtype(), &DataType::Date);
+        assert_eq!(
+            a.as_materialized_series().get(0).unwrap(),
+            b.as_materialized_series().get(0).unwrap(),
+            "seconds and millis of the same instant agree"
+        );
+        // Sanity-check the actual date via year/month/day.
+        let parts = out
+            .lazy()
+            .select([
+                col("from_s").dt().year().alias("y"),
+                col("from_s").dt().month().alias("m"),
+                col("from_s").dt().day().alias("d"),
+            ])
+            .collect()
+            .unwrap();
+        assert_eq!(parts.column("y").unwrap().i32().unwrap().get(0), Some(2026));
+        assert_eq!(parts.column("m").unwrap().i8().unwrap().get(0), Some(9));
+        assert_eq!(parts.column("d").unwrap().i8().unwrap().get(0), Some(9));
     }
 
     #[test]
