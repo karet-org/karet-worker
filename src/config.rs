@@ -41,8 +41,6 @@ pub enum SourceFormat {
     Csv,
     /// One JSON object per line.
     Ndjson,
-    /// A single JSON array of objects per file.
-    JsonArray,
 }
 
 impl SourceFormat {
@@ -51,7 +49,6 @@ impl SourceFormat {
         match self {
             SourceFormat::Csv => &[".csv"],
             SourceFormat::Ndjson => &[".json", ".jsonl", ".ndjson"],
-            SourceFormat::JsonArray => &[".json"],
         }
     }
 }
