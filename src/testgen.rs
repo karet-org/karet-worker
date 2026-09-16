@@ -139,15 +139,16 @@ pub fn arb_ast_node() -> impl Strategy<Value = AstNode> {
                 ),
                 vec(inner.clone(), 0..5)
                     .prop_map(|args| AstNode::Coalesce { args }),
-                // Date and lookup
+                // Date and dimension
                 (inner.clone(), "[%A-Za-z0-9_/-]{1,10}").prop_map(|(input, format)| {
                     AstNode::ParseDate {
                         input: Box::new(input),
                         format,
                     }
                 }),
-                (arb_id(), inner.clone()).prop_map(|(lookup_id, input)| AstNode::LookupRef {
-                    lookup_id,
+                (arb_id(), inner.clone()).prop_map(|(dim_id, input)| AstNode::DimRef {
+                    dim_id,
+                    value: None,
                     input: Box::new(input),
                 }),
                 // Cast

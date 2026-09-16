@@ -2,7 +2,7 @@
 //!
 //! Compilation is pure: [`compile`] walks an [`AstNode`] and returns a
 //! Polars [`Expr`] that evaluates the node vectorized over a `DataFrame`.
-//! [`CompileCtx`] carries a registry of precompiled [`LookupMatcher`]s
+//! [`CompileCtx`] carries a registry of precompiled [`DimensionMatcher`]s
 //! keyed by dotted lookup id for nodes that can't be expressed as pure
 //! Polars operators.
 
@@ -13,23 +13,23 @@ use polars::prelude::*;
 
 use crate::ast::{AstNode, CastType};
 use crate::error::EvalError;
-use crate::lookup::LookupMatcher;
+use crate::dimension::DimensionMatcher;
 
 /// Context passed to [`compile`].
 ///
-/// Carries a registry of [`LookupMatcher`]s keyed by dotted lookup id
+/// Carries a registry of [`DimensionMatcher`]s keyed by dimension id
 /// (`"categories"`, `"categories.merchants"`, …). The registry is typically
 /// built once per job from the `Pipeline_Config` via
-/// [`crate::lookup::build_registry`] and shared by reference across every
+/// [`crate::dimension::build_inline_registry`] and shared by reference across every
 /// mapping column compiled in that job.
 pub struct CompileCtx<'a> {
-    pub lookups: &'a HashMap<String, Arc<LookupMatcher>>,
+    pub dimensions: &'a HashMap<String, Arc<DimensionMatcher>>,
 }
 
 impl<'a> CompileCtx<'a> {
     /// Create a new context wrapping a reference to the lookup registry.
-    pub fn new(lookups: &'a HashMap<String, Arc<LookupMatcher>>) -> Self {
-        Self { lookups }
+    pub fn new(dimensions: &'a HashMap<String, Arc<DimensionMatcher>>) -> Self {
+        Self { dimensions }
     }
 }
 
@@ -61,6 +61,23 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
                 .str()
                 .contains_literal(compile(pattern, ctx)?))
         }
+
+        AstNode::FromUnix { input, unit } => {
+            // Seconds (default) or milliseconds since the epoch -> Date.
+            let millis = match unit.as_deref() {
+                Some("ms") => compile(input, ctx)?,
+                _ => compile(input, ctx)? * lit(1000.0),
+            };
+            Ok(millis
+                .cast(DataType::Int64)
+                .cast(DataType::Datetime(TimeUnit::Milliseconds, None))
+                .cast(DataType::Date))
+        }
+
+        // --- Boolean composition ---
+        AstNode::And { left, right } => Ok(compile(left, ctx)?.and(compile(right, ctx)?)),
+        AstNode::Or { left, right } => Ok(compile(left, ctx)?.or(compile(right, ctx)?)),
+        AstNode::Not { input } => Ok(compile(input, ctx)?.not()),
 
         // --- String ops ---
         AstNode::Upper { input } => Ok(compile(input, ctx)?.str().to_uppercase()),
@@ -145,26 +162,30 @@ pub fn compile(node: &AstNode, ctx: &CompileCtx) -> Result<Expr, EvalError> {
         //
         // Resolve the dotted lookup id against the registry; compile the
         // `input` expression; wrap the matcher in a Polars `map` closure that
-        // runs `match_first` over each string in the input column. On a hit
-        // we return the matcher's `output` value; on a miss we yield `None`.
+        // Dimension probe over each string in the input column, returning the
+        // requested value column (or `on_miss`).
         //
         // The closure must be `Fn + Send + Sync + 'static`, so we clone an
-        // `Arc<LookupMatcher>` into it rather than capturing `ctx`.
-        AstNode::LookupRef { lookup_id, input } => {
+        // `Arc<DimensionMatcher>` into it rather than capturing `ctx`.
+        AstNode::DimRef { dim_id, value, input } => {
             let matcher = ctx
-                .lookups
-                .get(lookup_id)
-                .ok_or_else(|| EvalError::UnknownLookup {
-                    id: lookup_id.clone(),
-                })?
+                .dimensions
+                .get(dim_id)
+                .ok_or_else(|| EvalError::UnknownDimension { id: dim_id.clone() })?
                 .clone();
+            let value_index = matcher.value_index(value.as_deref()).ok_or_else(|| {
+                EvalError::UnknownDimensionValue {
+                    id: dim_id.clone(),
+                    value: value.clone().unwrap_or_default(),
+                }
+            })?;
             let input_expr = compile(input, ctx)?;
             Ok(input_expr.map(
                 move |column| {
                     let result: StringChunked = column
                         .str()?
                         .iter()
-                        .map(|s_opt| s_opt.and_then(|s| matcher.match_first(s)))
+                        .map(|s_opt| s_opt.and_then(|s| matcher.lookup(s, value_index)))
                         .collect();
                     Ok(result.into_column())
                 },
@@ -210,6 +231,60 @@ mod tests {
         assert_eq!(out.column("y").unwrap().i64().unwrap().get(0), Some(2026));
         assert_eq!(out.column("m").unwrap().i64().unwrap().get(0), Some(9));
         assert_eq!(out.column("day").unwrap().i64().unwrap().get(1), Some(31));
+    }
+
+    #[test]
+    fn from_unix_converts_epoch_seconds_and_millis() {
+        // 1788934940.86 s and the same instant in ms -> 2026-09-09 (UTC).
+        let df = df!["s" => [1788934940.86_f64], "ms" => [1788934940860.0_f64]].unwrap();
+        let registry = HashMap::new();
+        let ctx = CompileCtx::new(&registry);
+        let out = df
+            .lazy()
+            .select([
+                compile(
+                    &AstNode::FromUnix {
+                        input: Box::new(AstNode::Col { name: "s".into() }),
+                        unit: None,
+                    },
+                    &ctx,
+                )
+                .unwrap()
+                .alias("from_s"),
+                compile(
+                    &AstNode::FromUnix {
+                        input: Box::new(AstNode::Col { name: "ms".into() }),
+                        unit: Some("ms".into()),
+                    },
+                    &ctx,
+                )
+                .unwrap()
+                .alias("from_ms"),
+            ])
+            .collect()
+            .unwrap();
+
+        let a = out.column("from_s").unwrap();
+        let b = out.column("from_ms").unwrap();
+        assert_eq!(a.dtype(), &DataType::Date);
+        assert_eq!(
+            a.as_materialized_series().get(0).unwrap(),
+            b.as_materialized_series().get(0).unwrap(),
+            "seconds and millis of the same instant agree"
+        );
+        // Sanity-check the actual date via year/month/day.
+        let parts = out
+            .lazy()
+            .select([
+                col("from_s").dt().year().alias("y"),
+                col("from_s").dt().month().alias("m"),
+                col("from_s").dt().day().alias("d"),
+            ])
+            .collect()
+            .unwrap();
+        assert_eq!(parts.column("y").unwrap().i32().unwrap().get(0), Some(2026));
+        assert_eq!(parts.column("m").unwrap().i8().unwrap().get(0), Some(9));
+        assert_eq!(parts.column("d").unwrap().i8().unwrap().get(0), Some(9));
     }
 
     #[test]
@@ -383,18 +458,16 @@ mod tests {
             prop_assert_eq!(s.get(0), Some(expected.as_str()));
         }
 
-        // lookup_ref AST evaluation equals direct matcher call
+        // dim_ref AST evaluation equals a direct matcher call.
         //
-        // Building a single-row DataFrame with `"x" = input`, compiling
-        // `LookupRef { lookup_id: "l", input: Col { name: "x" } }` against a
-        // registry built from a randomly generated flat `LookupMapping`, and
-        // collecting the result must yield the same scalar as calling
-        // `LookupMatcher::from_config(&cfg).match_first(&input)`
-        // directly. This pins down the contract that the Polars `map` wiring
-        // in the `LookupRef` compile arm is a faithful lift of the matcher.
-        //
+        // Build a single-row DataFrame with `"x" = input`, compile
+        // `DimRef { dim_id: "l", input: Col { name: "x" } }` against a registry
+        // built from a randomly generated inline dimension, and require the
+        // collected result to equal `DimensionMatcher::lookup(&input, 0)`. This
+        // pins the contract that the Polars `map` wiring in the DimRef compile
+        // arm is a faithful lift of the matcher.
         #[test]
-        fn lookup_ref_eval_equals_direct_call(
+        fn dim_ref_eval_equals_direct_call(
             case_insensitive in any::<bool>(),
             rows in proptest::collection::vec(
                 (proptest::collection::vec("[a-zA-Z]{1,8}", 1..=3), "[A-Z]{1,8}"),
@@ -402,29 +475,32 @@ mod tests {
             ),
             input in ".{0,30}",
         ) {
-            let cfg_rows: Vec<crate::config::LookupRow> = rows.iter().map(|(pats, out)| {
-                crate::config::LookupRow {
-                    input_patterns: pats.clone(),
-                    output: out.clone(),
+            let dim_rows: Vec<crate::config::InlineDimensionRow> = rows.iter().map(|(pats, out)| {
+                crate::config::InlineDimensionRow {
+                    patterns: pats.clone(),
+                    values: vec![out.clone()],
                     priority: 0,
                 }
             }).collect();
 
-            let cfg = crate::config::LookupMapping {
+            let cfg = crate::config::Dimension {
                 id: "l".into(),
                 name: None,
-                match_: Some("keyword_substring".into()),
+                match_: crate::config::MatchMode::KeywordSubstring,
                 case_insensitive: Some(case_insensitive),
-                rows: cfg_rows,
-                children: vec![],
-                catch_all: None,
+                on_miss: crate::config::OnMiss::Null,
+                rows: crate::config::DimensionRows::Inline {
+                    values: vec!["v".into()],
+                    rows: dim_rows,
+                },
             };
 
-            let direct_matcher = crate::lookup::LookupMatcher::from_config(&cfg);
-            let registry = crate::lookup::build_registry(std::slice::from_ref(&cfg));
+            let registry = crate::dimension::build_inline_registry(std::slice::from_ref(&cfg)).unwrap();
+            let direct_matcher = registry.get("l").unwrap().clone();
 
-            let ast = AstNode::LookupRef {
-                lookup_id: "l".to_string(),
+            let ast = AstNode::DimRef {
+                dim_id: "l".to_string(),
+                value: None,
                 input: Box::new(AstNode::Col { name: "x".to_string() }),
             };
             let ctx = CompileCtx::new(&registry);
@@ -440,7 +516,7 @@ mod tests {
             let s = series.str().unwrap();
             let got: Option<String> = s.get(0).map(|v| v.to_string());
 
-            let expected: Option<String> = direct_matcher.match_first(&input);
+            let expected: Option<String> = direct_matcher.lookup(&input, 0);
 
             prop_assert_eq!(got, expected);
         }

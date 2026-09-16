@@ -9,7 +9,7 @@ use polars::prelude::*;
 use crate::config::{AnalyticTable, ColumnSchema, Mapping, PipelineConfig, SourceContainer};
 use crate::error::PipelineError;
 use crate::evaluator::{compile, CompileCtx};
-use crate::lookup::LookupMatcher;
+use crate::dimension::DimensionMatcher;
 
 /// Check a CSV header row against a source container's declared schema.
 ///
@@ -85,28 +85,54 @@ pub fn ingest_file(
     csv_bytes: &[u8],
     cfg: &PipelineConfig,
     mapping: &Mapping,
-    matchers: &HashMap<String, Arc<LookupMatcher>>,
+    matchers: &HashMap<String, Arc<DimensionMatcher>>,
 ) -> Result<DataFrame, PipelineError> {
     let source_container = resolve_source_container(key, cfg)?;
 
-    let df = read_source(key, csv_bytes)?;
+    // JSON sources bind schema columns to paths inside each record, so the
+    // reader already emits exactly the declared columns: there are no headers
+    // to validate and nothing to project.
+    let projected = if source_container.format == crate::config::SourceFormat::Csv {
+        let df = read_source(key, csv_bytes)?;
 
-    // Collect header names as owned strings so the borrow against `df` is
-    // released before `df.select` below.
-    let headers: Vec<String> = df
-        .get_column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    if let Err(missing) = validate_csv_headers(&headers, &source_container.schema) {
-        return Err(PipelineError::MissingColumns {
-            key: key.to_string(),
-            missing,
-        });
-    }
+        // Collect header names as owned strings so the borrow against `df` is
+        // released before `df.select` below.
+        let headers: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if let Err(missing) = validate_csv_headers(&headers, &source_container.schema) {
+            return Err(PipelineError::MissingColumns {
+                key: key.to_string(),
+                missing,
+            });
+        }
 
-    let projected = project_schema_columns(&df, &source_container.schema)
-        .map_err(|e| PipelineError::polars(key, e))?;
+        project_schema_columns(&df, &source_container.schema)
+            .map_err(|e| PipelineError::polars(key, e))?
+    } else {
+        let (df, skipped) = crate::json_source::read_json_source(csv_bytes, source_container)
+            .map_err(|message| PipelineError::JsonRead {
+                key: key.to_string(),
+                message,
+            })?;
+        if skipped > 0 {
+            tracing::warn!(key, skipped, "skipped unparseable JSON records");
+        }
+        // Record-level filter runs before the column expressions so unrelated
+        // entries in a shared log stream never reach the mapping.
+        if let Some(filter) = &source_container.record_filter {
+            let ctx = CompileCtx::new(matchers);
+            let expr = compile(filter, &ctx).map_err(|e| PipelineError::eval(key, e))?;
+            df.lazy()
+                .filter(expr)
+                .collect()
+                .map_err(|e| PipelineError::polars(key, e))?
+        } else {
+            df
+        }
+    };
 
     // Compile every mapping column against the registry, aliasing to the
     // declared output name. Errors are collected eagerly so they point at
@@ -118,11 +144,15 @@ pub fn ingest_file(
         compiled_exprs.push(expr.alias(column.name.as_str()));
     }
 
-    projected
-        .lazy()
-        .select(compiled_exprs)
-        .collect()
-        .map_err(|e| PipelineError::polars(key, e))
+    let mut lazy = projected.lazy().select(compiled_exprs);
+
+    // After the projection, so the predicate sees output column names.
+    if let Some(predicate) = &mapping.where_ {
+        let expr = compile(predicate, &ctx).map_err(|e| PipelineError::eval(key, e))?;
+        lazy = lazy.filter(expr);
+    }
+
+    lazy.collect().map_err(|e| PipelineError::polars(key, e))
 }
 
 /// Ingest many CSV files through their respective mappings and return the
@@ -135,7 +165,7 @@ pub fn ingest_many(
     files: &[(String, Vec<u8>)],
     cfg: &PipelineConfig,
     mapping: &Mapping,
-    matchers: &HashMap<String, Arc<LookupMatcher>>,
+    matchers: &HashMap<String, Arc<DimensionMatcher>>,
 ) -> Result<LazyFrame, PipelineError> {
     let mut frames: Vec<LazyFrame> = Vec::with_capacity(files.len());
 
@@ -382,6 +412,7 @@ mod tests {
                 type_: "string".to_string(),
                 nullable: None,
                 assertions: None,
+                path: None,
             }),
             0..=8,
         )
@@ -466,6 +497,7 @@ mod tests {
                     type_: "string".to_string(),
                     nullable: None,
                     assertions: None,
+                    path: None,
                 })
                 .collect();
 
@@ -506,7 +538,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::ast::AstNode;
-    use crate::config::{AnalyticTable, Mapping, MappingColumn, PipelineConfig, SourceContainer};
+    use crate::config::{AnalyticTable, Mapping, MappingColumn, PipelineConfig, SourceContainer, SourceFormat};
     use std::collections::HashMap;
 
     /// Build a minimal config with one source container, one mapping that
@@ -519,33 +551,39 @@ mod tests {
                 id: "src".into(),
                 name: "Src".into(),
                 path_prefix: "raw/src/".into(),
+                format: SourceFormat::Csv,
+                record_filter: None,
                 schema: vec![
                     ColumnSchema {
                         name: "date".into(),
                         type_: "string".into(),
                         nullable: None,
                         assertions: None,
+                        path: None,
                     },
                     ColumnSchema {
                         name: "description".into(),
                         type_: "string".into(),
                         nullable: None,
                         assertions: None,
+                        path: None,
                     },
                     ColumnSchema {
                         name: "amount".into(),
                         type_: "number".into(),
                         nullable: None,
                         assertions: None,
+                        path: None,
                     },
                 ],
             }],
-            lookup_mappings: vec![],
+            dimensions: vec![],
             mappings: vec![Mapping {
                 id: "m".into(),
                 name: String::new(),
                 source_container_id: "src".into(),
                 analytic_table_id: "t".into(),
+                where_: None,
                 columns: vec![MappingColumn {
                     name: "upper_desc".into(),
                     expr: AstNode::Upper {
@@ -563,6 +601,7 @@ mod tests {
                     type_: "string".into(),
                     nullable: None,
                     assertions: None,
+                    path: None,
                 }],
                 partition_keys: vec![],
                 dedup_keys: vec![],
@@ -584,6 +623,59 @@ mod tests {
         let col = df.column("upper_desc").expect("upper_desc column").as_materialized_series();
         let s = col.str().expect("string column");
         assert_eq!(s.get(0), Some("HELLO"));
+    }
+
+    #[test]
+    fn where_drops_non_matching_rows() {
+        // Predicate references the mapping's *output* column (upper_desc),
+        // proving the filter runs after the projection.
+        let mut cfg = simple_config();
+        cfg.mappings[0].where_ = Some(AstNode::Eq {
+            left: Box::new(AstNode::Col { name: "upper_desc".into() }),
+            right: Box::new(AstNode::Str { value: "KEEP".into() }),
+        });
+        let matchers = HashMap::new();
+        let csv = b"date,description,amount\n2024-01-01,keep,1.0\n2024-01-02,drop,2.0\n";
+
+        let df = ingest_file("raw/src/f.csv", csv, &cfg, &cfg.mappings[0], &matchers)
+            .expect("ingest should succeed");
+
+        assert_eq!(df.height(), 1);
+        let s = df.column("upper_desc").unwrap().as_materialized_series().str().unwrap().get(0);
+        assert_eq!(s, Some("KEEP"));
+    }
+
+    #[test]
+    fn where_composes_with_and_or_not() {
+        let mut cfg = simple_config();
+        // NOT(upper_desc == "DROP") AND (upper_desc == "A" OR upper_desc == "B")
+        let is = |v: &str| AstNode::Eq {
+            left: Box::new(AstNode::Col { name: "upper_desc".into() }),
+            right: Box::new(AstNode::Str { value: v.into() }),
+        };
+        cfg.mappings[0].where_ = Some(AstNode::And {
+            left: Box::new(AstNode::Not { input: Box::new(is("DROP")) }),
+            right: Box::new(AstNode::Or {
+                left: Box::new(is("A")),
+                right: Box::new(is("B")),
+            }),
+        });
+        let matchers = HashMap::new();
+        let csv = b"date,description,amount\n2024-01-01,a,1\n2024-01-02,b,2\n2024-01-03,drop,3\n2024-01-04,c,4\n";
+
+        let df = ingest_file("raw/src/f.csv", csv, &cfg, &cfg.mappings[0], &matchers)
+            .expect("ingest should succeed");
+
+        assert_eq!(df.height(), 2, "only A and B survive");
+    }
+
+    #[test]
+    fn absent_where_keeps_every_row() {
+        let cfg = simple_config();
+        let matchers = HashMap::new();
+        let csv = b"date,description,amount\n2024-01-01,a,1\n2024-01-02,b,2\n";
+        let df = ingest_file("raw/src/f.csv", csv, &cfg, &cfg.mappings[0], &matchers).unwrap();
+        assert_eq!(df.height(), 2);
     }
 
     #[test]
@@ -830,6 +922,7 @@ mod tests {
             id: "m".into(),
             name: String::new(),
             source_container_id: "src".into(),
+            where_: None,
             analytic_table_id: table_id.into(),
             columns: vec![],
         }

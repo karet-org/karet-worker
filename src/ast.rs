@@ -53,6 +53,22 @@ pub enum AstNode {
     /// Substring test: `pattern` occurs inside `input`.
     Contains { input: Box<AstNode>, pattern: Box<AstNode> },
 
+    /// Epoch timestamp to date. `unit` is `"s"` or `"ms"`; JSON log streams
+    /// almost always carry epochs, which `parse_date` cannot read.
+    FromUnix {
+        input: Box<AstNode>,
+        #[serde(default)]
+        unit: Option<String>,
+    },
+
+    // --- Boolean composition ---
+    /// Logical AND over two boolean expressions.
+    And { left: Box<AstNode>, right: Box<AstNode> },
+    /// Logical OR over two boolean expressions.
+    Or { left: Box<AstNode>, right: Box<AstNode> },
+    /// Logical negation.
+    Not { input: Box<AstNode> },
+
     // --- Control flow ---
     /// Conditional: `if cond then then-branch else else-branch`.
     ///
@@ -72,7 +88,13 @@ pub enum AstNode {
     /// Parse a string column into a date using a strftime format.
     ParseDate { input: Box<AstNode>, format: String },
     /// Reference into a `Lookup_Mapping` by dotted id (`parent.child`).
-    LookupRef { lookup_id: String, input: Box<AstNode> },
+    DimRef {
+        dim_id: String,
+        /// Which value column to return; defaults to the first.
+        #[serde(default)]
+        value: Option<String>,
+        input: Box<AstNode>,
+    },
 
     // --- Date parts ---
     /// Calendar year of a date input, as Int64.

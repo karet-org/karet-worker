@@ -779,7 +779,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
             tracing::warn!("run cancelled for {} (fenced out)", msg.job_id);
             Ok(())
         }
-        Err(e @ (JobError::ConfigParse(_) | JobError::ConfigInvalid(_))) => {
+        Err(e @ (JobError::ConfigParse(_) | JobError::ConfigInvalid(_) | JobError::Dimension(_))) => {
             finish_job(
                 ctx, &mut conn, &msg, &stream_id, &started_at_iso, attempts,
                 Terminal {

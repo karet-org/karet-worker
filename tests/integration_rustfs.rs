@@ -37,7 +37,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use karet_worker::config::PipelineConfig;
-use karet_worker::lookup;
+use karet_worker::dimension;
 use karet_worker::pipeline::{
     ingest_many, produce_partitions, upload_partitions, PartitionUploader,
 };
@@ -76,7 +76,7 @@ const PIPELINE_CONFIG: &str = r#"{
             ]
         }
     ],
-    "lookup_mappings": [],
+    "dimensions": [],
     "mappings": [
         {
             "id": "visa_to_tx",
@@ -370,10 +370,10 @@ async fn worker_reads_raw_csvs_and_writes_partitioned_parquet() {
 
     // ---- 6. Run the worker's ingestion pipeline --------------------------
     //
-    // Compile the lookup registry (empty for this config), ingest the
+    // Compile the dimension registry (empty for this config), ingest the
     // CSVs, partition the resulting frame, and write each partition back
     // to S3 via the uploader wrapper.
-    let matchers = lookup::build_registry(&cfg.lookup_mappings);
+    let matchers = dimension::build_inline_registry(&cfg.dimensions).expect("registry builds");
 
     let lf = ingest_many(&files, &cfg, &cfg.mappings[0], &matchers).expect("ingest_many succeeds on seeded CSVs");
     let df = lf.collect().expect("collect ingested frame");
