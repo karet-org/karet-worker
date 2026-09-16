@@ -14,6 +14,10 @@ use crate::config::{Dimension, DimensionRows, MatchMode, OnMiss};
 /// A reference table that quietly grows must fail loudly, not OOM a worker.
 pub const MAX_DIMENSION_ROWS: usize = 1_000_000;
 
+/// One row on its way into a matcher: the keys or patterns it matches, one
+/// value per declared value column, and its priority.
+pub type MatcherRow = (Vec<String>, Vec<Option<String>>, i64);
+
 #[derive(Debug, Clone)]
 struct CompiledRow {
     /// Exact keys or substring patterns, already case-folded when the
@@ -55,7 +59,7 @@ impl DimensionMatcher {
     /// `(patterns, values, priority)` triples.
     pub fn new(
         dim: &Dimension,
-        rows: Vec<(Vec<String>, Vec<Option<String>>, i64)>,
+        rows: Vec<MatcherRow>,
     ) -> Result<Self, DimensionError> {
         if rows.len() > MAX_DIMENSION_ROWS {
             return Err(DimensionError::TooManyRows {
@@ -189,7 +193,7 @@ pub fn rows_from_csv(
     values: &[String],
     priority_column: Option<&str>,
     bytes: &[u8],
-) -> Result<Vec<(Vec<String>, Vec<Option<String>>, i64)>, DimensionError> {
+) -> Result<Vec<MatcherRow>, DimensionError> {
     let text = std::str::from_utf8(bytes).map_err(|e| DimensionError::FileRead {
         id: dim.id.clone(),
         message: format!("invalid UTF-8: {e}"),
