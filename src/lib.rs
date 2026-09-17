@@ -10,6 +10,7 @@ pub mod error;
 pub mod evaluator;
 pub mod http;
 pub mod job;
+pub mod manifest;
 pub mod json_source;
 pub mod dimension;
 pub mod pipeline;
