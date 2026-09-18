@@ -80,14 +80,14 @@ pub enum AstNode {
         r#else: Box<AstNode>,
     },
     /// First non-null `args[i]`; `null` for empty `args`. Pairs well
-    /// with `lookup_ref` (which yields null on a miss): e.g.
-    /// `coalesce(lookup_ref("merchants", desc), desc)`.
+    /// with `dim_ref` (which yields null on a miss): e.g.
+    /// `coalesce(dim_ref("merchants", desc), desc)`.
     Coalesce { args: Vec<AstNode> },
 
-    // --- Date and lookup ---
+    // --- Date and dimension ---
     /// Parse a string column into a date using a strftime format.
     ParseDate { input: Box<AstNode>, format: String },
-    /// Reference into a `Lookup_Mapping` by dotted id (`parent.child`).
+    /// Look an input up in a `Dimension`, by flat id.
     DimRef {
         dim_id: String,
         /// Which value column to return; defaults to the first.

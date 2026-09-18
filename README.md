@@ -4,11 +4,12 @@
 [![Publish Docker image](https://github.com/karet-org/karet-worker/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/karet-org/karet-worker/actions/workflows/docker-publish.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2b2c33)](./LICENSE)
 
-Rust/Axum data pipeline worker for the Karet analytics platform. Ingests
-source CSVs from S3 (karet-lake bucket), evaluates AST-JSON mapping
-expressions (parse_date, cast, upper/lower/trim, arithmetic, comparisons,
-`if`, `coalesce`, keyword lookups, etc.) with Polars, and writes
-partitioned Parquet output to S3 (karet-warehouse bucket).
+Rust/Axum data pipeline worker for Karet, a self-hosted ETL and dashboard
+stack. Ingests CSV and NDJSON sources from S3 (karet-lake bucket), evaluates
+AST-JSON mapping expressions (parse_date, from_unix, cast, upper/lower/trim,
+arithmetic, comparisons, `if`, `coalesce`, `dim_ref`, etc.) with Polars,
+filters rows, and writes partitioned Parquet output to S3 (karet-warehouse
+bucket).
 
 See the `compose.yml` in the [`karet`](https://github.com/karet-org/karet)
 repo for the full stack (rustfs + worker + web).
