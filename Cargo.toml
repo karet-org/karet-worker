@@ -10,6 +10,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 aws-config = "1"
 aws-sdk-s3 = "1"
+# Control-plane database: job rows and the config version a run is pinned to.
+# `runtime-tokio-rustls` keeps us off OpenSSL, matching the rest of the tree.
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio-rustls",
+  "postgres",
+  "json",
+  "chrono",
+  "macros",
+] }
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -67,6 +67,11 @@ async fn make_ctx(url: &str) -> (Arc<QueueCtx>, tokio::sync::watch::Sender<bool>
             pipelines_bucket: "karet-pipelines".into(),
             lake_bucket: "karet-lake".into(),
             warehouse_bucket: "karet-warehouse".into(),
+            // These tests exercise queue mechanics, not the database: the pool is
+            // lazy, so an address nothing listens on is never dialled.
+            db: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                .expect("lazy pool"),
         },
         consumer_name: format!("test-consumer-{}", std::process::id()),
         settings: QueueSettings {
@@ -124,6 +129,7 @@ fn msg(job_id: &str, pipeline: &str) -> JobMessage {
         job_id: job_id.into(),
         pipeline: pipeline.into(),
         prefix: format!("pipelines/{pipeline}/"),
+        config_version_id: None,
         clean_run: false,
         trigger: "manual".into(),
         enqueued_at: queue::now_ms(),
