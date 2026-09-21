@@ -7,11 +7,9 @@
 //!   cargo test --test integration_redis -- --ignored --nocapture
 //! ```
 //!
-//! CI runs this with a `valkey` service container. The S3 side is not
-//! exercised here (no S3 available); jobs use a prefix whose config read
-//! will fail fast, which exercises the full claim → run → retry/terminal
-//! machinery — including the S3-record write failure path, where the live
-//! hash still reaches a terminal state. What this test pins:
+//! CI runs this with a `valkey` service container. Neither Postgres nor S3 is
+//! reachable, so every config read fails fast, which is what exercises the full
+//! claim → run → retry/terminal machinery. What this test pins:
 //!
 //!   - enqueue writes the stream entry, live hash, and index
 //!   - a consumer claims and the job reaches `running` then terminal
@@ -67,9 +65,12 @@ async fn make_ctx(url: &str) -> (Arc<QueueCtx>, tokio::sync::watch::Sender<bool>
             pipelines_bucket: "karet-pipelines".into(),
             lake_bucket: "karet-lake".into(),
             warehouse_bucket: "karet-warehouse".into(),
-            // These tests exercise queue mechanics, not the database: the pool is
-            // lazy, so an address nothing listens on is never dialled.
+            // These tests exercise queue mechanics, not the database, so the pool
+            // points nowhere and every config read fails. It must fail *fast*:
+            // sqlx's default 30s acquire timeout is longer than the deadlines
+            // here, which made a retry look like a job that never retried.
             db: sqlx::postgres::PgPoolOptions::new()
+                .acquire_timeout(std::time::Duration::from_millis(500))
                 .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
                 .expect("lazy pool"),
         },
