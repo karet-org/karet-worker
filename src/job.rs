@@ -81,6 +81,8 @@ pub struct JobContext {
     pub pipelines_bucket: String,
     pub lake_bucket: String,
     pub warehouse_bucket: String,
+    /// The control-plane database: where configs and job rows live.
+    pub db: sqlx::PgPool,
 }
 
 /// Execute one pipeline run for `prefix` (validated by the caller).
@@ -92,17 +94,30 @@ pub struct JobContext {
 pub async fn execute_job(
     ctx: &JobContext,
     prefix: &str,
+    pipeline: &str,
+    config_version_id: Option<i64>,
     clean_run: bool,
     progress: &dyn ProgressSink,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<JobOutcome, JobError> {
     use std::sync::atomic::Ordering;
-    let config_key = format!("{prefix}pipeline.json");
-    let config_bytes = s3mod::get_bytes(&ctx.s3_client, &ctx.pipelines_bucket, &config_key)
+    // The run is pinned to a config version, so a save partway through cannot
+    // change what this run does, and the job row records which config it used.
+    let version_id = match config_version_id {
+        Some(id) => id,
+        None => crate::db::current_version_for(&ctx.db, pipeline)
+            .await
+            .map_err(|e| JobError::ConfigRead(format!("resolving live config version: {e}")))?
+            .ok_or_else(|| {
+                JobError::ConfigRead(format!("pipeline {pipeline} has no published config"))
+            })?,
+    };
+    let config_json = crate::db::config_for_version(&ctx.db, version_id)
         .await
-        .map_err(JobError::ConfigRead)?;
+        .map_err(|e| JobError::ConfigRead(format!("reading config version {version_id}: {e}")))?
+        .ok_or_else(|| JobError::ConfigRead(format!("config version {version_id} not found")))?;
     let cfg: PipelineConfig =
-        serde_json::from_slice(&config_bytes).map_err(|e| JobError::ConfigParse(e.to_string()))?;
+        serde_json::from_value(config_json).map_err(|e| JobError::ConfigParse(e.to_string()))?;
     if let Err(errs) = config::validate(&cfg) {
         let joined = errs
             .iter()

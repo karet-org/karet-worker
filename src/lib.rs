@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod assertions;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod evaluator;
 pub mod http;
@@ -30,6 +31,7 @@ pub const REQUIRED_ENV_VARS: &[&str] = &[
     "AWS_REGION",
     "AWS_ENDPOINT_URL",
     "KARET_WORKER_TOKEN",
+    "DATABASE_URL",
     "REDIS_URL",
     "KARET_WEBHOOK_SECRET",
 ];
@@ -88,6 +90,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let client = redis::Client::open(redis_url.as_str())?;
+
+    // The control plane. Connecting here rather than lazily means a bad
+    // DATABASE_URL fails at startup with a clear message instead of at the first
+    // job, and the schema the web owns is expected to exist already.
+    let database_url = std::env::var("DATABASE_URL").expect("checked above");
+    let db_pool = db::connect(&database_url).await.map_err(|e| {
+        tracing::error!("cannot reach the database at startup: {e}");
+        e
+    })?;
+    tracing::info!("database connected");
     let consumer_name = format!(
         "worker-{}-{}",
         std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into()),
@@ -106,6 +118,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             pipelines_bucket: pipelines_bucket.clone(),
             lake_bucket: lake_bucket.clone(),
             warehouse_bucket: warehouse_bucket.clone(),
+            db: db_pool.clone(),
         },
         consumer_name,
         settings,
