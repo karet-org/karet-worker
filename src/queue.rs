@@ -102,6 +102,11 @@ pub struct JobMessage {
     pub job_id: String,
     pub pipeline: String,
     pub prefix: String,
+    /// Which config version this run must use. Absent for runs enqueued by
+    /// something that only knows a prefix (an upload webhook), which resolve the
+    /// live version at execution time.
+    #[serde(default)]
+    pub config_version_id: Option<i64>,
     #[serde(default)]
     pub clean_run: bool,
     pub trigger: String,
@@ -411,61 +416,37 @@ async fn finish_job(
     }
 
     let completed_at = now_iso();
-    let mut record = serde_json::json!({
-        "id": msg.job_id,
-        "pipeline": msg.pipeline,
-        "status": terminal.status,
-        "startedAt": started_at_iso,
-        "completedAt": completed_at,
-        "trigger": msg.trigger,
-        "attempts": attempts,
-        "worker": ctx.consumer_name,
-    });
-    if let Some(e) = &terminal.error {
-        record["error"] = serde_json::json!(e);
-    }
+    // Per-mapping failures collapse into `error`: the row carries one message and
+    // the detail stays in the logs.
+    let mut error = terminal.error;
     if !terminal.errors.is_empty() {
-        record["errors"] = serde_json::json!(terminal.errors);
-    }
-    if let Some(n) = terminal.partitions_written {
-        record["partitions_written"] = serde_json::json!(n);
-    }
-    if let Some(n) = terminal.files_processed {
-        record["files_processed"] = serde_json::json!(n);
-    }
-    if let Some(n) = terminal.rows_deduped.filter(|&n| n > 0) {
-        record["rows_deduped"] = serde_json::json!(n);
+        let joined = terminal.errors.join("; ");
+        error = Some(match error {
+            Some(prior) => format!("{prior} ({joined})"),
+            None => joined,
+        });
     }
 
-    let key = format!("{}jobs/{}.json", msg.prefix, msg.job_id);
-    let record_write = ctx
-        .job_ctx
-        .s3_client
-        .put_object()
-        .bucket(&ctx.job_ctx.pipelines_bucket)
-        .key(&key)
-        .body(aws_sdk_s3::primitives::ByteStream::from(
-            serde_json::to_vec(&record).expect("record serializes"),
-        ))
-        .content_type("application/json")
-        .send()
-        .await;
-    // A failed record write must not wedge the job in `running`: keep the
-    // terminal state visible in the live hash (its TTL is the availability
-    // window) and surface the miss in `error`. Worst case per the design's
-    // failure matrix: one terminal record lost while S3 is down.
-    let mut error = terminal.error;
-    if let Err(e) = record_write {
-        let miss = format!(
-            "terminal record write failed for {key}: {}",
-            crate::s3::err_chain(&e)
-        );
+    let outcome = crate::db::JobOutcomeRow {
+        status: terminal.status.to_string(),
+        error: error.clone(),
+        files_processed: terminal.files_processed.map(|n| n as i32),
+        partitions_written: terminal.partitions_written.map(|n| n as i32),
+        rows_deduped: terminal.rows_deduped.filter(|&n| n > 0).map(|n| n as i32),
+    };
+    // A failed row write must not wedge the job in `running`: the terminal state
+    // stays visible in the live hash (its TTL is the availability window) and the
+    // miss is surfaced in `error`. Worst case: one row lost while the database is
+    // down, with the run itself already finished.
+    if let Err(e) = crate::db::mark_finished(&ctx.job_ctx.db, &msg.job_id, &outcome).await {
+        let miss = format!("terminal row write failed for {}: {e}", msg.job_id);
         tracing::error!("{miss}");
         error = Some(match error {
             Some(prior) => format!("{prior} ({miss})"),
             None => miss,
         });
     }
+    let _ = started_at_iso;
 
     let live = live_key(&msg.job_id);
     let mut pipe = redis::pipe();
@@ -624,6 +605,12 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
         .await;
     publish_job_event(&mut conn, &msg.pipeline, &msg.job_id).await;
 
+    // An UPDATE, so a job whose row does not exist yet simply matches nothing;
+    // the terminal write is what history depends on.
+    if let Err(e) = crate::db::mark_running(&ctx.job_ctx.db, &msg.job_id, &ctx.consumer_name).await {
+        tracing::warn!("could not mark {} running: {e}", msg.job_id);
+    }
+
     // Set when the heartbeat discovers the lock was lost to a newer
     // attempt; the executor checks it between stages and aborts.
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -691,7 +678,16 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
     let (progress, progress_task) =
         RedisProgress::start(conn.clone(), msg.pipeline.clone(), msg.job_id.clone());
     let outcome =
-        job::execute_job(&ctx.job_ctx, &msg.prefix, msg.clean_run, &progress, &cancelled).await;
+        job::execute_job(
+            &ctx.job_ctx,
+            &msg.prefix,
+            &msg.pipeline,
+            msg.config_version_id,
+            msg.clean_run,
+            &progress,
+            &cancelled,
+        )
+        .await;
     drop(progress); // close channel so the drain task ends
     let _ = progress_task.await;
     heartbeat.abort();
@@ -1143,6 +1139,9 @@ pub async fn debounce_scheduler_loop(ctx: Arc<QueueCtx>) {
                         job_id: new_job_id(),
                         pipeline: slug.clone(),
                         prefix: format!("pipelines/{slug}/"),
+                        // An upload knows a prefix, not a version: the executor
+                        // resolves whichever config is live when it starts.
+                        config_version_id: None,
                         clean_run: false,
                         trigger: "webhook".into(),
                         enqueued_at: now_ms(),
@@ -1171,6 +1170,7 @@ mod tests {
             job_id: "job-123-abc".into(),
             pipeline: "demo".into(),
             prefix: "pipelines/demo/".into(),
+            config_version_id: Some(7),
             clean_run: true,
             trigger: "manual".into(),
             enqueued_at: 1_700_000_000_000,

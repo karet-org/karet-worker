@@ -8,6 +8,7 @@
 use crate::assertions::validate_assertions;
 use crate::config::{self, PipelineConfig};
 use crate::dimension;
+use crate::manifest;
 use crate::pipeline;
 use crate::s3 as s3mod;
 
@@ -80,6 +81,8 @@ pub struct JobContext {
     pub pipelines_bucket: String,
     pub lake_bucket: String,
     pub warehouse_bucket: String,
+    /// The control-plane database: where configs and job rows live.
+    pub db: sqlx::PgPool,
 }
 
 /// Execute one pipeline run for `prefix` (validated by the caller).
@@ -91,17 +94,30 @@ pub struct JobContext {
 pub async fn execute_job(
     ctx: &JobContext,
     prefix: &str,
+    pipeline: &str,
+    config_version_id: Option<i64>,
     clean_run: bool,
     progress: &dyn ProgressSink,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<JobOutcome, JobError> {
     use std::sync::atomic::Ordering;
-    let config_key = format!("{prefix}pipeline.json");
-    let config_bytes = s3mod::get_bytes(&ctx.s3_client, &ctx.pipelines_bucket, &config_key)
+    // The run is pinned to a config version, so a save partway through cannot
+    // change what this run does, and the job row records which config it used.
+    let version_id = match config_version_id {
+        Some(id) => id,
+        None => crate::db::current_version_for(&ctx.db, pipeline)
+            .await
+            .map_err(|e| JobError::ConfigRead(format!("resolving live config version: {e}")))?
+            .ok_or_else(|| {
+                JobError::ConfigRead(format!("pipeline {pipeline} has no published config"))
+            })?,
+    };
+    let config_json = crate::db::config_for_version(&ctx.db, version_id)
         .await
-        .map_err(JobError::ConfigRead)?;
+        .map_err(|e| JobError::ConfigRead(format!("reading config version {version_id}: {e}")))?
+        .ok_or_else(|| JobError::ConfigRead(format!("config version {version_id} not found")))?;
     let cfg: PipelineConfig =
-        serde_json::from_slice(&config_bytes).map_err(|e| JobError::ConfigParse(e.to_string()))?;
+        serde_json::from_value(config_json).map_err(|e| JobError::ConfigParse(e.to_string()))?;
     if let Err(errs) = config::validate(&cfg) {
         let joined = errs
             .iter()
@@ -111,30 +127,35 @@ pub async fn execute_job(
         return Err(JobError::ConfigInvalid(joined));
     }
 
-    // clean_run: delete existing warehouse output under the tables the
-    // current config declares (so stale tables from prior configs aren't
-    // wiped).
-    if clean_run {
-        for table in &cfg.analytic_tables {
-            let table_prefix = format!("{prefix}{}/", table.id);
-            match s3mod::list_keys(&ctx.s3_client, &ctx.warehouse_bucket, &table_prefix).await {
-                Ok(keys) => {
-                    for key in keys {
-                        let _ = ctx
-                            .s3_client
-                            .delete_object()
-                            .bucket(&ctx.warehouse_bucket)
-                            .key(&key)
-                            .send()
-                            .await;
-                    }
-                    tracing::info!("clean_run: deleted existing clean output under {table_prefix}");
-                }
-                Err(e) => tracing::warn!(
-                    "clean_run: failed to list clean keys under {table_prefix}: {e}"
-                ),
-            }
-        }
+    // Per-table publish state. Writes land under `v<next>/` and become visible
+    // only when the manifest and pointer are written after every mapping has
+    // run, so a reader never sees one mapping's half of a union table.
+    //
+    // clean_run starts from an empty file list instead of deleting anything:
+    // the old objects stay readable under their own version until vacuum
+    // retires them, which is what makes a bad run recoverable.
+    struct TablePublish {
+        prefix: String,
+        version: u64,
+        files: Vec<manifest::ManifestFile>,
+        touched: bool,
+    }
+    let mut publishes: std::collections::HashMap<String, TablePublish> =
+        std::collections::HashMap::new();
+    for table in &cfg.analytic_tables {
+        let table_prefix = format!("{prefix}{}/", table.id);
+        let current = manifest::read_current(&ctx.s3_client, &ctx.warehouse_bucket, &table_prefix)
+            .await
+            .map_err(JobError::ConfigRead)?;
+        publishes.insert(
+            table.id.clone(),
+            TablePublish {
+                prefix: table_prefix,
+                version: current.version + 1,
+                files: if clean_run { Vec::new() } else { current.files },
+                touched: false,
+            },
+        );
     }
 
     // Download every raw CSV file under each source container's
@@ -314,38 +335,61 @@ pub async fn execute_job(
         };
 
         total_deduped += dropped;
-        match upload_partitions_async(ctx, prefix, &partitions).await {
-            Ok(count) => {
-                total_partitions += count;
-                // Upload first, then reap this mapping's stale outputs
-                // (previous layouts, vanished partitions), so a failed
-                // upload never costs existing data.
-                let table_prefix = format!("{prefix}{}/", mapping.analytic_table_id);
-                let uploaded: std::collections::HashSet<String> = partitions
-                    .iter()
-                    .map(|p| format!("{prefix}{}", p.key))
-                    .collect();
-                match s3mod::list_keys(&ctx.s3_client, &ctx.warehouse_bucket, &table_prefix).await {
-                    Ok(existing) => {
-                        for key in pipeline::stale_keys(&existing, &uploaded, &mapping.id) {
-                            if let Err(e) = ctx
-                                .s3_client
-                                .delete_object()
-                                .bucket(&ctx.warehouse_bucket)
-                                .key(&key)
-                                .send()
-                                .await
-                            {
-                                tracing::warn!("stale output delete failed for {key}: {e}");
-                            } else {
-                                tracing::info!(mapping = %mapping.id, key, "reaped stale output");
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!("stale output listing failed under {table_prefix}: {e}"),
-                }
+        let Some(publish) = publishes.get_mut(&mapping.analytic_table_id) else {
+            errors.push(format!(
+                "mapping {}: table {} not declared",
+                mapping.id, mapping.analytic_table_id
+            ));
+            continue;
+        };
+        match upload_partitions_async(ctx, prefix, publish.version, &mapping.id, &partitions).await {
+            Ok(written) => {
+                total_partitions += written.len();
+                publish.files =
+                    manifest::apply_mapping_writes(&publish.files, &mapping.id, written);
+                publish.touched = true;
             }
             Err(e) => errors.push(format!("upload {}: {e}", mapping.id)),
+        }
+    }
+
+    // Publish each table that got new output, then collect what no retained
+    // version references. A table whose every mapping failed is left on its
+    // previous version.
+    for (table_id, publish) in publishes.iter() {
+        if !publish.touched {
+            continue;
+        }
+        let manifest = manifest::TableManifest {
+            version: publish.version,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            job_id: None,
+            files: publish.files.clone(),
+        };
+        if let Err(e) =
+            manifest::publish(&ctx.s3_client, &ctx.warehouse_bucket, &publish.prefix, &manifest)
+                .await
+        {
+            errors.push(format!("publish {table_id}: {e}"));
+            continue;
+        }
+        tracing::info!(
+            table = %table_id,
+            version = manifest.version,
+            files = manifest.files.len(),
+            "published table version",
+        );
+        match manifest::vacuum(
+            &ctx.s3_client,
+            &ctx.warehouse_bucket,
+            &publish.prefix,
+            manifest.version,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(table = %table_id, deleted = n, "vacuumed unreferenced objects"),
+            Err(e) => tracing::warn!(table = %table_id, "vacuum skipped: {e}"),
         }
     }
 
@@ -363,15 +407,26 @@ pub async fn execute_job(
     })
 }
 
-/// Upload partitions under `prefix`, short-circuiting on first failure.
+/// Upload partitions under `prefix`, into the table's staging version.
+///
+/// `PartitionOutput::key` is `<table>/<hive segments>/<mapping>.parquet`; the
+/// version is spliced in after the table so the hive segments stay in the path
+/// for readers to re-materialize partition columns from.
 async fn upload_partitions_async(
     ctx: &JobContext,
     prefix: &str,
+    version: u64,
+    mapping_id: &str,
     partitions: &[pipeline::PartitionOutput],
-) -> Result<usize, String> {
-    let mut uploaded = 0usize;
+) -> Result<Vec<manifest::ManifestFile>, String> {
+    let mut written = Vec::with_capacity(partitions.len());
     for p in partitions {
-        let full_key = format!("{prefix}{}", p.key);
+        let (table_id, rest) = p
+            .key
+            .split_once('/')
+            .ok_or_else(|| format!("partition key {} has no table segment", p.key))?;
+        let relative = format!("{}{rest}", manifest::version_prefix(version));
+        let full_key = format!("{prefix}{table_id}/{relative}");
         ctx.s3_client
             .put_object()
             .bucket(&ctx.warehouse_bucket)
@@ -381,7 +436,11 @@ async fn upload_partitions_async(
             .send()
             .await
             .map_err(|e| format!("S3 PutObject failed for {full_key}: {}", s3mod::err_chain(&e)))?;
-        uploaded += 1;
+        written.push(manifest::ManifestFile {
+            key: relative,
+            mapping_id: mapping_id.to_string(),
+            bytes: p.bytes.len() as u64,
+        });
     }
-    Ok(uploaded)
+    Ok(written)
 }
