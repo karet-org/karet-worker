@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 pub const CURRENT_KEY: &str = "_current.json";
 /// Directory of manifests, keyed by version.
 pub const MANIFEST_PREFIX: &str = "_manifests/";
+/// Directory of per-version source records, see [`crate::incremental`].
+pub const SOURCES_PREFIX: &str = "_sources/";
 /// How many versions stay readable (and rollback-able) behind the current one.
 pub const RETAINED_VERSIONS: usize = 10;
 
@@ -76,10 +78,31 @@ pub fn manifest_key(version: u64) -> String {
     format!("{MANIFEST_PREFIX}{version}.json")
 }
 
+/// Key of a version's source record, relative to the table prefix.
+pub fn sources_key(version: u64) -> String {
+    format!("{SOURCES_PREFIX}{version}.json")
+}
+
+/// A file key without its `v<n>/` version directory: the partition path plus
+/// the mapping's file name, e.g. `year=2026/month=9/m.parquet`. Two versions of
+/// the same partition share it.
+pub fn partition_path(key: &str) -> &str {
+    match key.split_once('/') {
+        Some((dir, rest))
+            if dir.len() > 1
+                && dir.starts_with('v')
+                && dir[1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            rest
+        }
+        _ => key,
+    }
+}
+
 /// Replace `mapping_id`'s contribution to a file list, keeping every other
-/// mapping's files untouched.
+/// mapping's files untouched. Used by full runs.
 ///
-/// A mapping's output is complete on every run (each run re-reads the whole
+/// A full run's output for a mapping is complete (it re-reads the whole
 /// source prefix), so its previous files are always superseded: that is what
 /// makes a partition that no longer exists in the source disappear from the
 /// table. Other mappings writing the same table (a union) are carried forward
@@ -93,6 +116,29 @@ pub fn apply_mapping_writes(
     let mut out: Vec<ManifestFile> = previous
         .iter()
         .filter(|f| f.mapping_id != mapping_id)
+        .cloned()
+        .collect();
+    out.extend(files);
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
+}
+
+/// Replace only the partitions `files` rewrote in `mapping_id`'s contribution.
+///
+/// An incremental run writes just the partitions its new rows landed in, so
+/// the mapping's other partitions are carried forward from the versions that
+/// wrote them. Vacuum keeps those older objects because a retained manifest
+/// still lists them.
+pub fn apply_partition_writes(
+    previous: &[ManifestFile],
+    mapping_id: &str,
+    files: Vec<ManifestFile>,
+) -> Vec<ManifestFile> {
+    let rewritten: std::collections::HashSet<&str> =
+        files.iter().map(|f| partition_path(&f.key)).collect();
+    let mut out: Vec<ManifestFile> = previous
+        .iter()
+        .filter(|f| f.mapping_id != mapping_id || !rewritten.contains(partition_path(&f.key)))
         .cloned()
         .collect();
     out.extend(files);
@@ -121,7 +167,10 @@ pub fn unreferenced_keys(retained: &[TableManifest], present: &[String]) -> Vec<
     present
         .iter()
         .filter(|k| {
-            !k.starts_with(MANIFEST_PREFIX) && *k != CURRENT_KEY && !referenced.contains(k.as_str())
+            !k.starts_with(MANIFEST_PREFIX)
+                && !k.starts_with(SOURCES_PREFIX)
+                && *k != CURRENT_KEY
+                && !referenced.contains(k.as_str())
         })
         .cloned()
         .collect()
@@ -225,6 +274,8 @@ pub async fn vacuum(
     let mut deleted = 0usize;
     let mut targets = unreferenced_keys(&retained, &relative);
     targets.extend(doomed.iter().map(|v| manifest_key(*v)));
+    // A version may have no source record; deleting a missing key is a no-op.
+    targets.extend(doomed.iter().map(|v| sources_key(*v)));
     for key in targets {
         let full = format!("{table_prefix}{key}");
         match client.delete_object().bucket(bucket).key(&full).send().await {
@@ -293,6 +344,45 @@ mod tests {
             next.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
             vec!["v1/a.parquet", "v2/b.parquet"]
         );
+    }
+
+    #[test]
+    fn partition_path_strips_only_the_version_directory() {
+        assert_eq!(partition_path("v12/month=2026-09/m.parquet"), "month=2026-09/m.parquet");
+        assert_eq!(partition_path("v3/m.parquet"), "m.parquet");
+        assert_eq!(partition_path("vendor=a/m.parquet"), "vendor=a/m.parquet");
+        assert_eq!(partition_path("v/m.parquet"), "v/m.parquet");
+    }
+
+    #[test]
+    fn partition_writes_replace_only_rewritten_partitions() {
+        let prev = vec![
+            file("v1/month=8/m.parquet", "m"),
+            file("v2/month=9/m.parquet", "m"),
+            file("v2/month=9/other.parquet", "other"),
+        ];
+        let next = apply_partition_writes(
+            &prev,
+            "m",
+            vec![file("v3/month=9/m.parquet", "m"), file("v3/month=10/m.parquet", "m")],
+        );
+        assert_eq!(
+            next.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
+            vec![
+                "v1/month=8/m.parquet",
+                "v2/month=9/other.parquet",
+                "v3/month=10/m.parquet",
+                "v3/month=9/m.parquet",
+            ],
+            "month 8 is carried forward, month 9 is replaced, the other mapping's month 9 stays"
+        );
+    }
+
+    #[test]
+    fn vacuum_never_collects_source_records() {
+        let retained = vec![manifest(2, vec![file("v2/m.parquet", "m")])];
+        let present = vec!["v2/m.parquet".to_string(), "_sources/2.json".to_string()];
+        assert!(unreferenced_keys(&retained, &present).is_empty());
     }
 
     #[test]

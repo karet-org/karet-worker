@@ -282,20 +282,32 @@ pub fn produce_partitions(
     mapping: &Mapping,
     table: &AnalyticTable,
 ) -> Result<Vec<PartitionOutput>, PipelineError> {
+    partition_frames(df, mapping, table)?
+        .into_iter()
+        .map(|(key, mut frame)| {
+            let bytes = write_parquet_bytes(&mut frame)
+                .map_err(|e| PipelineError::polars("<partition>", e))?;
+            Ok(PartitionOutput { key, bytes })
+        })
+        .collect()
+}
+
+/// The frames [`produce_partitions`] would encode, with their keys: one per
+/// distinct partition key tuple, key columns dropped. Incremental runs use
+/// this to merge new rows into a partition before encoding it.
+pub fn partition_frames(
+    df: &DataFrame,
+    mapping: &Mapping,
+    table: &AnalyticTable,
+) -> Result<Vec<(String, DataFrame)>, PipelineError> {
     debug_assert_eq!(
         mapping.analytic_table_id, table.id,
-        "produce_partitions: mapping.analytic_table_id (`{}`) must equal table.id (`{}`)",
+        "partition_frames: mapping.analytic_table_id (`{}`) must equal table.id (`{}`)",
         mapping.analytic_table_id, table.id
     );
 
     if table.partition_keys.is_empty() {
-        let mut owned = df.clone();
-        let bytes =
-            write_parquet_bytes(&mut owned).map_err(|e| PipelineError::polars("<partition>", e))?;
-        return Ok(vec![PartitionOutput {
-            key: unpartitioned_key(&table.id, &mapping.id),
-            bytes,
-        }]);
+        return Ok(vec![(unpartitioned_key(&table.id, &mapping.id), df.clone())]);
     }
 
     // Fail fast on null key values, naming the column and row count.
@@ -323,7 +335,7 @@ pub fn produce_partitions(
         .partition_by_stable(keys.clone(), true)
         .map_err(|e| PipelineError::polars("<partition>", e))?;
 
-    let mut out: Vec<PartitionOutput> = Vec::with_capacity(groups.len());
+    let mut out: Vec<(String, DataFrame)> = Vec::with_capacity(groups.len());
     for group in groups {
         let mut segments: Vec<String> = Vec::with_capacity(table.partition_keys.len());
         for key in &table.partition_keys {
@@ -333,14 +345,11 @@ pub fn produce_partitions(
                 .map_err(|e| PipelineError::polars("<partition>", e))?;
             segments.push(format!("{key}={}", segment_value(&av)?));
         }
-        let mut sub = group
-            .drop_many(keys.iter().cloned());
-        let bytes =
-            write_parquet_bytes(&mut sub).map_err(|e| PipelineError::polars("<partition>", e))?;
-        out.push(PartitionOutput {
-            key: format!("{}/{}/{}.parquet", table.id, segments.join("/"), mapping.id),
-            bytes,
-        });
+        let sub = group.drop_many(keys.iter().cloned());
+        out.push((
+            format!("{}/{}/{}.parquet", table.id, segments.join("/"), mapping.id),
+            sub,
+        ));
     }
     Ok(out)
 }
