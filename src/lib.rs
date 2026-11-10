@@ -24,7 +24,6 @@ pub mod testgen;
 
 /// Env vars the worker cannot start without.
 pub const REQUIRED_ENV_VARS: &[&str] = &[
-    "S3_BUCKET_PIPELINES",
     "S3_BUCKET_LAKE",
     "S3_BUCKET_WAREHOUSE",
     "AWS_ACCESS_KEY_ID",
@@ -69,7 +68,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err(message.into());
     }
 
-    let pipelines_bucket = std::env::var("S3_BUCKET_PIPELINES").expect("checked above");
     let lake_bucket = std::env::var("S3_BUCKET_LAKE").expect("checked above");
     let warehouse_bucket = std::env::var("S3_BUCKET_WAREHOUSE").expect("checked above");
     let auth_token = std::env::var("KARET_WORKER_TOKEN").expect("checked above");
@@ -116,7 +114,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         client,
         job_ctx: job::JobContext {
             s3_client: s3_client.clone(),
-            pipelines_bucket: pipelines_bucket.clone(),
             lake_bucket: lake_bucket.clone(),
             warehouse_bucket: warehouse_bucket.clone(),
             db: db_pool.clone(),
@@ -129,7 +126,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     let state = http::AppState {
-        pipelines_bucket,
         lake_bucket,
         warehouse_bucket,
         s3_client: Some(s3_client),

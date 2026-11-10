@@ -19,8 +19,6 @@ use crate::config::{self, ConfigError, PipelineConfig};
 
 #[derive(Clone)]
 pub struct AppState {
-    /// Bucket for ELT control-plane data (configs, dashboards, jobs).
-    pub pipelines_bucket: String,
     /// Bucket for raw ingested CSV data.
     pub lake_bucket: String,
     /// Bucket for query-ready partitioned Parquet output.
@@ -49,22 +47,8 @@ pub struct RoutingCache {
 
 /// How long the routing table is trusted before a rebuild. A short TTL
 /// keeps a just-published source from missing uploads for long, without
-/// hitting S3 on every event.
+/// querying the database on every event.
 const ROUTING_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The subset of `pipeline.json` the router needs. Parsed leniently so a
-/// config from any schema era still routes.
-#[derive(serde::Deserialize)]
-struct RoutingConfig {
-    #[serde(default)]
-    source_containers: Vec<RoutingSource>,
-}
-
-#[derive(serde::Deserialize)]
-struct RoutingSource {
-    #[serde(default)]
-    path_prefix: String,
-}
 
 /// Return the slugs of every pipeline with a source prefix matching `key`,
 /// rebuilding the routing table if stale. One upload may route to several
@@ -97,44 +81,19 @@ fn match_key(entries: &[(String, String)], key: &str) -> Vec<String> {
     slugs
 }
 
-/// List `pipelines/<slug>/pipeline.json` objects and collect every source
-/// prefix. Errors degrade to an empty table (logged); the next event or
-/// TTL expiry retries.
+/// Every source prefix in every pipeline's live config. Errors degrade to an
+/// empty table (logged); the next event or TTL expiry retries.
 async fn build_routing(state: &AppState) -> Vec<(String, String)> {
-    let Some(client) = &state.s3_client else {
+    let Some(queue) = &state.queue else {
         return Vec::new();
     };
-    let keys = match crate::s3::list_keys(client, &state.pipelines_bucket, "pipelines/").await {
-        Ok(k) => k,
+    match crate::db::live_source_prefixes(&queue.job_ctx.db).await {
+        Ok(entries) => entries,
         Err(e) => {
-            tracing::error!("routing: list pipelines failed: {e}");
-            return Vec::new();
-        }
-    };
-    let mut entries = Vec::new();
-    for key in keys {
-        let Some(slug) = key
-            .strip_prefix("pipelines/")
-            .and_then(|r| r.strip_suffix("/pipeline.json"))
-        else {
-            continue;
-        };
-        if slug.is_empty() || slug.contains('/') {
-            continue;
-        }
-        match crate::s3::get_bytes(client, &state.pipelines_bucket, &key).await {
-            Ok(bytes) => match serde_json::from_slice::<RoutingConfig>(&bytes) {
-                Ok(cfg) => {
-                    for sc in cfg.source_containers {
-                        entries.push((sc.path_prefix, slug.to_string()));
-                    }
-                }
-                Err(e) => tracing::warn!("routing: parse {key} failed: {e}"),
-            },
-            Err(e) => tracing::warn!("routing: read {key} failed: {e}"),
+            tracing::error!("routing: reading live configs failed: {e}");
+            Vec::new()
         }
     }
-    entries
 }
 
 pub fn router(state: AppState) -> Router {
@@ -575,7 +534,6 @@ mod tests {
     fn test_state() -> AppState {
         AppState {
             routing: Arc::new(tokio::sync::RwLock::new(RoutingCache::default())),
-            pipelines_bucket: "karet-pipelines".into(),
             lake_bucket: "karet-lake".into(),
             warehouse_bucket: "karet-warehouse".into(),
             s3_client: None,
