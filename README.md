@@ -22,7 +22,6 @@ See `REQUIRED_ENV_VARS` in `src/lib.rs`.
 |----------|-------------|
 | `DATABASE_URL` | Postgres connection string. Pipeline configs, the version each run is pinned to, and job rows. |
 | `REDIS_URL` | Valkey connection string, e.g. `redis://valkey:6379`. Jobs arrive on the `karet:jobs:stream` consumer group. |
-| `S3_BUCKET_PIPELINES` | Bucket for dashboards and saved queries. |
 | `S3_BUCKET_LAKE` | Bucket holding the source files a run reads. |
 | `S3_BUCKET_WAREHOUSE` | Bucket the Parquet output is written to. |
 | `AWS_ENDPOINT_URL` | S3 endpoint, `http://rustfs:9000` locally or `https://s3.<region>.amazonaws.com` for AWS. |

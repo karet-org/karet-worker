@@ -84,7 +84,6 @@ pub enum JobError {
 #[derive(Clone)]
 pub struct JobContext {
     pub s3_client: aws_sdk_s3::Client,
-    pub pipelines_bucket: String,
     pub lake_bucket: String,
     pub warehouse_bucket: String,
     /// The control-plane database: where configs and job rows live.

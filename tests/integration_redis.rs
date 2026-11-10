@@ -62,7 +62,6 @@ async fn make_ctx(url: &str) -> (Arc<QueueCtx>, tokio::sync::watch::Sender<bool>
         client,
         job_ctx: JobContext {
             s3_client: dead_s3_client().await,
-            pipelines_bucket: "karet-pipelines".into(),
             lake_bucket: "karet-lake".into(),
             warehouse_bucket: "karet-warehouse".into(),
             // These tests exercise queue mechanics, not the database, so the pool

@@ -57,6 +57,22 @@ pub async fn current_version_for(
     Ok(row.map(|(id,)| id))
 }
 
+/// `(source path_prefix, pipeline)` for every source in every pipeline's live
+/// config, for routing uploads.
+pub async fn live_source_prefixes(pool: &PgPool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT sc->>'path_prefix', c.pipeline
+           FROM pipelines_current c
+           JOIN config_versions v ON v.id = c.config_version_id
+          CROSS JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(v.config->'source_containers') = 'array'
+                     THEN v.config->'source_containers' ELSE '[]'::jsonb END) AS sc
+          WHERE coalesce(sc->>'path_prefix', '') <> ''",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Record a job as queued. Idempotent on job id so a retried enqueue does not
 /// duplicate history.
 #[allow(clippy::too_many_arguments)]
