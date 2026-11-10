@@ -5,9 +5,15 @@
 //! (clean_run semantics, per-mapping error containment, partition upload)
 //! is identical regardless of transport.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use polars::prelude::DataFrame;
+
 use crate::assertions::validate_assertions;
 use crate::config::{self, PipelineConfig};
 use crate::dimension;
+use crate::incremental::{self, SourceObject};
 use crate::manifest;
 use crate::pipeline;
 use crate::s3 as s3mod;
@@ -127,78 +133,64 @@ pub async fn execute_job(
         return Err(JobError::ConfigInvalid(joined));
     }
 
-    // Per-table publish state. Writes land under `v<next>/` and become visible
-    // only when the manifest and pointer are written after every mapping has
-    // run, so a reader never sees one mapping's half of a union table.
+    // Writes land under `v<next>/` and become visible only when the manifest
+    // and pointer are written after every mapping has run, so a reader never
+    // sees one mapping's half of a union table.
     //
     // clean_run starts from an empty file list instead of deleting anything:
     // the old objects stay readable under their own version until vacuum
     // retires them, which is what makes a bad run recoverable.
-    struct TablePublish {
-        prefix: String,
-        version: u64,
-        files: Vec<manifest::ManifestFile>,
-        touched: bool,
-    }
-    let mut publishes: std::collections::HashMap<String, TablePublish> =
-        std::collections::HashMap::new();
+    let mut publishes: HashMap<String, TablePublish> = HashMap::new();
     for table in &cfg.analytic_tables {
         let table_prefix = format!("{prefix}{}/", table.id);
         let current = manifest::read_current(&ctx.s3_client, &ctx.warehouse_bucket, &table_prefix)
             .await
             .map_err(JobError::ConfigRead)?;
+        let sources = if clean_run {
+            HashMap::new()
+        } else {
+            incremental::read_record(&ctx.s3_client, &ctx.warehouse_bucket, &table_prefix, &current)
+                .await
+        };
         publishes.insert(
             table.id.clone(),
             TablePublish {
                 prefix: table_prefix,
                 version: current.version + 1,
                 files: if clean_run { Vec::new() } else { current.files },
+                sources,
                 touched: false,
             },
         );
     }
 
-    // Download every raw CSV file under each source container's
-    // path_prefix from the lake bucket.
     progress.update(Progress::Downloading { done: 0, total: 0 });
-    let mut candidate_keys: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut listings: HashMap<String, Vec<SourceObject>> = HashMap::new();
+    let mut seen = HashSet::new();
     for sc in &cfg.source_containers {
         // path_prefix is an absolute lake key prefix; sources may point at
         // any folder in the lake, not just this pipeline's.
-        match s3mod::list_keys(&ctx.s3_client, &ctx.lake_bucket, &sc.path_prefix).await {
-            Ok(keys) => {
+        match s3mod::list_objects(&ctx.s3_client, &ctx.lake_bucket, &sc.path_prefix).await {
+            Ok(objects) => {
                 let exts = sc.format.extensions();
-                candidate_keys.extend(keys.into_iter().filter(|k| {
-                    exts.iter().any(|e| k.ends_with(e)) && seen.insert(k.clone())
-                }))
+                let mut listing: Vec<SourceObject> = objects
+                    .into_iter()
+                    .filter(|o| exts.iter().any(|e| o.key.ends_with(e)) && seen.insert(o.key.clone()))
+                    .collect();
+                listing.sort();
+                listings.insert(sc.id.clone(), listing);
             }
             Err(e) => tracing::warn!("failed to list keys for {}: {e}", sc.path_prefix),
         }
     }
-
-    let mut all_files: Vec<(String, Vec<u8>)> = Vec::new();
-    let total = candidate_keys.len();
-    for (i, key) in candidate_keys.iter().enumerate() {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(JobError::Cancelled);
-        }
-        match s3mod::get_bytes(&ctx.s3_client, &ctx.lake_bucket, key).await {
-            Ok(bytes) => {
-                all_files.push((key.clone(), bytes));
-            }
-            Err(e) => tracing::warn!("failed to download {key}: {e}"),
-        }
-        progress.update(Progress::Downloading { done: i + 1, total });
-    }
-
-    if all_files.is_empty() {
+    if listings.values().all(|l| l.is_empty()) {
         return Err(JobError::NoFiles);
     }
 
     // Precompile the dimension registry once per job; shared by every mapping.
     // Inline rows compile from config; file-backed rows are fetched from the
     // lake here, where S3 access lives.
+    let mut dimension_files: Vec<SourceObject> = Vec::new();
     let mut matchers = dimension::build_inline_registry(&cfg.dimensions)
         .map_err(|e| JobError::Dimension(e.to_string()))?;
     for dim in &cfg.dimensions {
@@ -209,11 +201,15 @@ pub async fn execute_job(
             priority_column,
         } = &dim.rows
         {
-            let keys = s3mod::list_keys(&ctx.s3_client, &ctx.lake_bucket, path_prefix)
+            let objects = s3mod::list_objects(&ctx.s3_client, &ctx.lake_bucket, path_prefix)
                 .await
                 .map_err(|e| JobError::Dimension(format!("listing {path_prefix}: {e}")))?;
+            let objects: Vec<SourceObject> =
+                objects.into_iter().filter(|o| o.key.ends_with(".csv")).collect();
+            let keys: Vec<String> = objects.iter().map(|o| o.key.clone()).collect();
+            dimension_files.extend(objects);
             let mut rows = Vec::new();
-            for object_key in keys.iter().filter(|k| k.ends_with(".csv")) {
+            for object_key in &keys {
                 let bytes = s3mod::get_bytes(&ctx.s3_client, &ctx.lake_bucket, object_key)
                     .await
                     .map_err(|e| JobError::Dimension(format!("reading {object_key}: {e}")))?;
@@ -234,11 +230,59 @@ pub async fn execute_job(
         }
     }
     let matchers = matchers;
+    dimension_files.sort();
+
+    let empty: Vec<SourceObject> = Vec::new();
+    let mut plans: Vec<(incremental::Plan, String)> = Vec::with_capacity(cfg.mappings.len());
+    for mapping in &cfg.mappings {
+        let fingerprint = incremental::fingerprint(&cfg, mapping, &dimension_files);
+        let listing = listings.get(&mapping.source_container_id).unwrap_or(&empty);
+        let order_matters = cfg
+            .analytic_tables
+            .iter()
+            .find(|t| t.id == mapping.analytic_table_id)
+            .is_none_or(|t| !t.dedup_keys.is_empty());
+        let plan = if clean_run {
+            incremental::Plan::Full(incremental::FullReason::Requested)
+        } else {
+            let previous = publishes
+                .get(&mapping.analytic_table_id)
+                .and_then(|p| p.sources.get(&mapping.id));
+            incremental::plan(previous, &fingerprint, listing, order_matters)
+        };
+        tracing::info!(mapping = %mapping.id, "{plan}");
+        plans.push((plan, fingerprint));
+    }
+
+    let mut needed: Vec<String> = Vec::new();
+    let mut wanted = HashSet::new();
+    for (mapping, (plan, _)) in cfg.mappings.iter().zip(&plans) {
+        let keys: &[SourceObject] = match plan {
+            incremental::Plan::Full(_) => listings.get(&mapping.source_container_id).unwrap_or(&empty),
+            incremental::Plan::Append(new) => new,
+            incremental::Plan::Unchanged => &[],
+        };
+        needed.extend(keys.iter().filter(|o| wanted.insert(o.key.clone())).map(|o| o.key.clone()));
+    }
+    needed.sort();
+
+    let mut downloaded: HashMap<String, Vec<u8>> = HashMap::new();
+    let total = needed.len();
+    for (i, key) in needed.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(JobError::Cancelled);
+        }
+        download(ctx, key, &mut downloaded).await;
+        progress.update(Progress::Downloading { done: i + 1, total });
+    }
+
+    if !needed.is_empty() && downloaded.is_empty() {
+        return Err(JobError::NoFiles);
+    }
 
     let mut total_partitions = 0usize;
     let mut total_deduped: usize = 0;
     let mut errors: Vec<String> = Vec::new();
-    let files_processed = all_files.len();
     let mappings_total = cfg.mappings.len();
 
     for (mapping_idx, mapping) in cfg.mappings.iter().enumerate() {
@@ -251,80 +295,96 @@ pub async fn execute_job(
             partitions_written: total_partitions,
         });
 
-        let sc = match cfg
+        if !cfg
             .source_containers
             .iter()
-            .find(|s| s.id == mapping.source_container_id)
+            .any(|s| s.id == mapping.source_container_id)
         {
-            Some(s) => s,
-            None => continue,
-        };
-        let mapping_files: Vec<(String, Vec<u8>)> = all_files
-            .iter()
-            .filter(|(k, _)| k.starts_with(&sc.path_prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        if mapping_files.is_empty() {
             continue;
         }
+        let listing = listings.get(&mapping.source_container_id).unwrap_or(&empty);
+        let (plan, fingerprint) = &plans[mapping_idx];
+        let Some(publish) = publishes.get_mut(&mapping.analytic_table_id) else {
+            errors.push(format!(
+                "mapping {}: table {} not declared",
+                mapping.id, mapping.analytic_table_id
+            ));
+            continue;
+        };
+
+        match plan {
+            incremental::Plan::Unchanged => continue,
+            incremental::Plan::Full(_) => {}
+            incremental::Plan::Append(new) => {
+                match append_mapping(ctx, prefix, &cfg, mapping, new, &downloaded, &matchers, publish)
+                    .await
+                {
+                    Ok(appended) => {
+                        total_partitions += appended.files.len();
+                        total_deduped += appended.dropped;
+                        publish.files = manifest::apply_partition_writes(
+                            &publish.files,
+                            &mapping.id,
+                            appended.files,
+                        );
+                        let previous =
+                            publish.sources.get(&mapping.id).map(|s| s.files.as_slice()).unwrap_or(&[]);
+                        let files = incremental::record_files(previous, appended.read);
+                        publish.record(&mapping.id, fingerprint, files);
+                        continue;
+                    }
+                    Err(Failure::Mapping(msg)) => {
+                        errors.push(msg);
+                        continue;
+                    }
+                    Err(Failure::Fallback(msg)) => {
+                        tracing::warn!(mapping = %mapping.id, "incremental run failed, running in full: {msg}");
+                        for o in listing {
+                            if !downloaded.contains_key(&o.key) {
+                                download(ctx, &o.key, &mut downloaded).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let read: Vec<SourceObject> = listing
+            .iter()
+            .filter(|o| downloaded.contains_key(&o.key))
+            .cloned()
+            .collect();
+        if read.is_empty() {
+            continue;
+        }
+        let mapping_files: Vec<(String, Vec<u8>)> = read
+            .iter()
+            .map(|o| (o.key.clone(), downloaded[&o.key].clone()))
+            .collect();
 
         // Polars work is CPU-bound: run it on the blocking pool so
         // heartbeats and health checks stay responsive. Uploads happen
         // back on the async runtime.
-        let cfg_cloned = cfg.clone();
-        let mapping_id = mapping.id.clone();
-        let table_id = mapping.analytic_table_id.clone();
-        let matchers_cloned = matchers.clone();
-        let partitions_result: Result<Result<(Vec<pipeline::PartitionOutput>, usize), String>, _> =
-            tokio::task::spawn_blocking(move || {
-                let mapping = cfg_cloned
-                    .mappings
-                    .iter()
-                    .find(|m| m.id == mapping_id)
-                    .expect("mapping exists; cloned from same config");
-                let lf = pipeline::ingest_many(&mapping_files, &cfg_cloned, mapping, &matchers_cloned)
-                    .map_err(|e| format!("ingest {}: {e}", mapping.id))?;
-                let df = lf
-                    .collect()
-                    .map_err(|e| format!("collect {}: {e}", mapping.id))?;
-
-                let table = cfg_cloned
-                    .analytic_tables
-                    .iter()
-                    .find(|t| t.id == table_id)
-                    .ok_or_else(|| format!("table {table_id} not found"))?;
-
-                // Assertions: failure fails this mapping only; others run.
-                let violations = validate_assertions(&df, table);
-                if !violations.is_empty() {
-                    let msgs: Vec<String> = violations
-                        .iter()
-                        .map(|v| format!("assertion {}: {v}", mapping.id))
-                        .collect();
-                    tracing::warn!(
-                        mapping = %mapping.id,
-                        count = violations.len(),
-                        "assertion violations; skipping upload",
-                    );
-                    return Err(msgs.join("; "));
-                }
-
-                let (df, dropped) = pipeline::dedup_rows(&df, table)
-                    .map_err(|e| format!("dedup {}: {e}", mapping.id))?;
-                if dropped > 0 {
-                    tracing::info!(mapping = %mapping.id, dropped, "dedup dropped duplicate rows");
-                }
-
-                pipeline::produce_partitions(&df, mapping, table)
-                    .map_err(|e| format!("partition {}: {e}", mapping.id))
-                    .map(|parts| (parts, dropped))
-            })
-            .await;
+        let (cfg_c, mapping_c, matchers_c) = (cfg.clone(), mapping.clone(), matchers.clone());
+        let partitions_result = tokio::task::spawn_blocking(move || {
+            let (df, dropped) = ingest_checked(&mapping_files, &cfg_c, &mapping_c, &matchers_c)?
+                .ok_or_else(|| {
+                    Failure::Mapping(format!(
+                        "ingest {}: {}",
+                        mapping_c.id,
+                        crate::error::PipelineError::NoFilesSucceeded
+                    ))
+                })?;
+            let table = table_for(&cfg_c, &mapping_c)?;
+            pipeline::produce_partitions(&df, &mapping_c, table)
+                .map_err(|e| Failure::Mapping(format!("partition {}: {e}", mapping_c.id)))
+                .map(|parts| (parts, dropped))
+        })
+        .await;
 
         let (partitions, dropped) = match partitions_result {
             Ok(Ok(p)) => p,
-            Ok(Err(msg)) => {
+            Ok(Err(Failure::Mapping(msg) | Failure::Fallback(msg))) => {
                 errors.push(msg);
                 continue;
             }
@@ -335,23 +395,17 @@ pub async fn execute_job(
         };
 
         total_deduped += dropped;
-        let Some(publish) = publishes.get_mut(&mapping.analytic_table_id) else {
-            errors.push(format!(
-                "mapping {}: table {} not declared",
-                mapping.id, mapping.analytic_table_id
-            ));
-            continue;
-        };
         match upload_partitions_async(ctx, prefix, publish.version, &mapping.id, &partitions).await {
             Ok(written) => {
                 total_partitions += written.len();
                 publish.files =
                     manifest::apply_mapping_writes(&publish.files, &mapping.id, written);
-                publish.touched = true;
+                publish.record(&mapping.id, fingerprint, read);
             }
             Err(e) => errors.push(format!("upload {}: {e}", mapping.id)),
         }
     }
+    let files_processed = downloaded.len();
 
     // Publish each table that got new output, then collect what no retained
     // version references. A table whose every mapping failed is left on its
@@ -366,6 +420,19 @@ pub async fn execute_job(
             job_id: None,
             files: publish.files.clone(),
         };
+        // A failed write only costs a full run next time: the record will not
+        // match the manifest.
+        if let Err(e) = incremental::write_record(
+            &ctx.s3_client,
+            &ctx.warehouse_bucket,
+            &publish.prefix,
+            &manifest,
+            &publish.sources,
+        )
+        .await
+        {
+            tracing::warn!(table = %table_id, "source record not written: {e}");
+        }
         if let Err(e) =
             manifest::publish(&ctx.s3_client, &ctx.warehouse_bucket, &publish.prefix, &manifest)
                 .await
@@ -405,6 +472,203 @@ pub async fn execute_job(
         rows_deduped: total_deduped,
         errors,
     })
+}
+
+/// One table's next version, built up while the mappings run.
+struct TablePublish {
+    prefix: String,
+    version: u64,
+    files: Vec<manifest::ManifestFile>,
+    /// What each mapping's files were built from, by mapping id.
+    sources: HashMap<String, incremental::MappingSources>,
+    touched: bool,
+}
+
+impl TablePublish {
+    fn record(&mut self, mapping_id: &str, fingerprint: &str, files: Vec<SourceObject>) {
+        self.sources.insert(
+            mapping_id.to_string(),
+            incremental::MappingSources {
+                mapping_id: mapping_id.to_string(),
+                fingerprint: fingerprint.to_string(),
+                files,
+            },
+        );
+        self.touched = true;
+    }
+}
+
+async fn download(ctx: &JobContext, key: &str, into: &mut HashMap<String, Vec<u8>>) {
+    match s3mod::get_bytes(&ctx.s3_client, &ctx.lake_bucket, key).await {
+        Ok(bytes) => {
+            into.insert(key.to_string(), bytes);
+        }
+        Err(e) => tracing::warn!("failed to download {key}: {e}"),
+    }
+}
+
+/// How a mapping's run failed.
+enum Failure {
+    /// The mapping fails this run and keeps its previous files.
+    Mapping(String),
+    /// An incremental run hit something a full run does not depend on, such
+    /// as a stored file it could not read; the mapping runs in full instead.
+    Fallback(String),
+}
+
+fn table_for<'a>(
+    cfg: &'a PipelineConfig,
+    mapping: &crate::config::Mapping,
+) -> Result<&'a crate::config::AnalyticTable, Failure> {
+    cfg.analytic_tables
+        .iter()
+        .find(|t| t.id == mapping.analytic_table_id)
+        .ok_or_else(|| Failure::Mapping(format!("table {} not found", mapping.analytic_table_id)))
+}
+
+/// Ingest, assert and dedup one mapping's files. `None` when no file could be
+/// ingested. Assertion failures are [`Failure::Mapping`]; the rest are
+/// [`Failure::Fallback`], which a full run reports like a mapping failure.
+fn ingest_checked(
+    files: &[(String, Vec<u8>)],
+    cfg: &PipelineConfig,
+    mapping: &crate::config::Mapping,
+    matchers: &HashMap<String, Arc<dimension::DimensionMatcher>>,
+) -> Result<Option<(DataFrame, usize)>, Failure> {
+    let lf = match pipeline::ingest_many(files, cfg, mapping, matchers) {
+        Ok(lf) => lf,
+        Err(crate::error::PipelineError::NoFilesSucceeded) => return Ok(None),
+        Err(e) => return Err(Failure::Fallback(format!("ingest {}: {e}", mapping.id))),
+    };
+    let df = lf
+        .collect()
+        .map_err(|e| Failure::Fallback(format!("collect {}: {e}", mapping.id)))?;
+    let table = table_for(cfg, mapping)?;
+
+    let violations = validate_assertions(&df, table);
+    if !violations.is_empty() {
+        tracing::warn!(
+            mapping = %mapping.id,
+            count = violations.len(),
+            "assertion violations; skipping upload",
+        );
+        let msgs: Vec<String> = violations
+            .iter()
+            .map(|v| format!("assertion {}: {v}", mapping.id))
+            .collect();
+        return Err(Failure::Mapping(msgs.join("; ")));
+    }
+
+    let (df, dropped) = pipeline::dedup_rows(&df, table)
+        .map_err(|e| Failure::Fallback(format!("dedup {}: {e}", mapping.id)))?;
+    if dropped > 0 {
+        tracing::info!(mapping = %mapping.id, dropped, "dedup dropped duplicate rows");
+    }
+    Ok(Some((df, dropped)))
+}
+
+struct Appended {
+    files: Vec<manifest::ManifestFile>,
+    dropped: usize,
+    read: Vec<SourceObject>,
+}
+
+/// Ingest `new` files and merge their rows into the partitions they fall
+/// into. Other partitions are left for [`manifest::apply_partition_writes`]
+/// to carry forward.
+#[allow(clippy::too_many_arguments)]
+async fn append_mapping(
+    ctx: &JobContext,
+    prefix: &str,
+    cfg: &PipelineConfig,
+    mapping: &crate::config::Mapping,
+    new: &[SourceObject],
+    downloaded: &HashMap<String, Vec<u8>>,
+    matchers: &HashMap<String, Arc<dimension::DimensionMatcher>>,
+    publish: &TablePublish,
+) -> Result<Appended, Failure> {
+    let read: Vec<SourceObject> = new
+        .iter()
+        .filter(|o| downloaded.contains_key(&o.key))
+        .cloned()
+        .collect();
+    let files: Vec<(String, Vec<u8>)> = read
+        .iter()
+        .map(|o| (o.key.clone(), downloaded[&o.key].clone()))
+        .collect();
+    let table = table_for(cfg, mapping)?.clone();
+
+    let (cfg_c, mapping_c, matchers_c) = (cfg.clone(), mapping.clone(), matchers.clone());
+    let ingested = tokio::task::spawn_blocking(move || ingest_checked(&files, &cfg_c, &mapping_c, &matchers_c))
+        .await
+        .map_err(|e| Failure::Fallback(format!("ingest task panicked: {e}")))??;
+    let Some((mut rows, mut dropped)) = ingested else {
+        return Ok(Appended { files: Vec::new(), dropped: 0, read });
+    };
+
+    let own: Vec<&manifest::ManifestFile> =
+        publish.files.iter().filter(|f| f.mapping_id == mapping.id).collect();
+    let fetch = |key: String| async move {
+        s3mod::get_bytes(&ctx.s3_client, &ctx.warehouse_bucket, &format!("{}{key}", publish.prefix))
+            .await
+            .map_err(Failure::Fallback)
+    };
+
+    // Dedup keys need not include the partition keys, so a duplicate can be
+    // in any of the mapping's partitions.
+    if !table.dedup_keys.is_empty() && rows.height() > 0 && !own.is_empty() {
+        let mut stored = Vec::with_capacity(own.len());
+        for f in &own {
+            stored.push((f.key.clone(), fetch(f.key.clone()).await?));
+        }
+        let table_c = table.clone();
+        let (kept, d) = tokio::task::spawn_blocking(move || {
+            let keys = incremental::stored_keys(&stored, &table_c)?;
+            incremental::drop_stored_keys(&rows, &keys, &table_c.dedup_keys)
+        })
+        .await
+        .map_err(|e| Failure::Fallback(format!("dedup task panicked: {e}")))?
+        .map_err(Failure::Fallback)?;
+        rows = kept;
+        dropped += d;
+    }
+
+    if rows.height() == 0 {
+        return Ok(Appended { files: Vec::new(), dropped, read });
+    }
+
+    let frames = pipeline::partition_frames(&rows, mapping, &table)
+        .map_err(|e| Failure::Fallback(e.to_string()))?;
+    let mut merges = Vec::with_capacity(frames.len());
+    for (key, frame) in frames {
+        let path = key.split_once('/').map(|(_, rest)| rest).unwrap_or_default();
+        let existing = match own.iter().find(|f| manifest::partition_path(&f.key) == path) {
+            Some(f) => Some(fetch(f.key.clone()).await?),
+            None => None,
+        };
+        merges.push((key, frame, existing));
+    }
+    let partitions = tokio::task::spawn_blocking(move || {
+        merges
+            .into_iter()
+            .map(|(key, frame, existing)| {
+                let mut merged = match existing {
+                    Some(bytes) => incremental::merge_partition(&bytes, &frame)?,
+                    None => frame,
+                };
+                let bytes = pipeline::write_parquet_bytes(&mut merged).map_err(|e| e.to_string())?;
+                Ok(pipeline::PartitionOutput { key, bytes })
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .await
+    .map_err(|e| Failure::Fallback(format!("merge task panicked: {e}")))?
+    .map_err(Failure::Fallback)?;
+
+    let files = upload_partitions_async(ctx, prefix, publish.version, &mapping.id, &partitions)
+        .await
+        .map_err(|e| Failure::Mapping(format!("upload {}: {e}", mapping.id)))?;
+    Ok(Appended { files, dropped, read })
 }
 
 /// Upload partitions under `prefix`, into the table's staging version.

@@ -11,6 +11,7 @@ pub mod error;
 pub mod evaluator;
 pub mod http;
 pub mod job;
+pub mod incremental;
 pub mod manifest;
 pub mod json_source;
 pub mod dimension;

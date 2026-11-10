@@ -26,21 +26,45 @@ pub(crate) fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {
 }
 
 pub async fn list_keys(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<String>, String> {
-    let mut keys = Vec::new();
+    Ok(list_objects(client, bucket, prefix)
+        .await?
+        .into_iter()
+        .map(|o| o.key)
+        .collect())
+}
+
+/// Every object under `prefix` with its ETag.
+pub async fn list_objects(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<Vec<crate::incremental::SourceObject>, String> {
+    let mut objects = Vec::new();
     let mut token: Option<String> = None;
     loop {
         let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
         if let Some(t) = &token { req = req.continuation_token(t); }
         let resp = req.send().await.map_err(|e| format!("S3 ListObjects failed: {}", err_chain(&e)))?;
         for obj in resp.contents() {
-            if let Some(k) = obj.key() { keys.push(k.to_string()); }
+            if let Some(k) = obj.key() {
+                // For a store without ETags, size and mtime still change on replace.
+                let etag = match obj.e_tag() {
+                    Some(t) if !t.is_empty() => t.to_string(),
+                    _ => format!(
+                        "{}:{}",
+                        obj.size().unwrap_or(-1),
+                        obj.last_modified().map(|d| d.to_string()).unwrap_or_default()
+                    ),
+                };
+                objects.push(crate::incremental::SourceObject { key: k.to_string(), etag });
+            }
         }
         match resp.next_continuation_token() {
             Some(t) => token = Some(t.to_string()),
             None => break,
         }
     }
-    Ok(keys)
+    Ok(objects)
 }
 
 pub async fn get_bytes(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>, String> {
