@@ -292,9 +292,7 @@ pub fn produce_partitions(
         .collect()
 }
 
-/// The frames [`produce_partitions`] would encode, with their keys: one per
-/// distinct partition key tuple, key columns dropped. Incremental runs use
-/// this to merge new rows into a partition before encoding it.
+/// [`produce_partitions`] before encoding.
 pub fn partition_frames(
     df: &DataFrame,
     mapping: &Mapping,

@@ -33,9 +33,7 @@ pub async fn list_keys(client: &Client, bucket: &str, prefix: &str) -> Result<Ve
         .collect())
 }
 
-/// Every object under `prefix` with its ETag, in the order S3 lists them
-/// (ascending by key). The ETag is what an incremental run compares to tell
-/// whether a file it already ingested has been replaced.
+/// Every object under `prefix` with its ETag.
 pub async fn list_objects(
     client: &Client,
     bucket: &str,
@@ -49,8 +47,7 @@ pub async fn list_objects(
         let resp = req.send().await.map_err(|e| format!("S3 ListObjects failed: {}", err_chain(&e)))?;
         for obj in resp.contents() {
             if let Some(k) = obj.key() {
-                // Fall back to size and modification time for a store that
-                // returns no ETag, so a replaced file still looks different.
+                // For a store without ETags, size and mtime still change on replace.
                 let etag = match obj.e_tag() {
                     Some(t) if !t.is_empty() => t.to_string(),
                     _ => format!(

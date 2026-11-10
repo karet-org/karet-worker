@@ -1,29 +1,13 @@
-//! Incremental runs: ingest only the source files a mapping has not seen.
+//! Incremental runs: ingest only the source files a mapping has not read.
 //!
-//! A full run re-reads every file under a mapping's source prefix. When the
-//! only change since the last run is new files, a full run would produce the
-//! previous output plus the new files' rows, minus any new row whose dedup key
-//! is already stored. An incremental run computes that directly: it ingests the
-//! new files, drops rows whose key is already in the table, and rewrites only
-//! the partitions the remaining rows fall into.
-//!
-//! What each mapping's output was built from is stored per table version at
-//! `_sources/<version>.json`, next to the manifest: a fingerprint of the
-//! config that decides the output, and the key and ETag of every source file
-//! read. A mapping falls back to a full run when:
-//!
-//! - the run asked for one (`clean_run`);
-//! - the current version has no source record, or the record does not match
-//!   the manifest (a version written before this existed, or a restore made
-//!   by the web app);
-//! - the fingerprint changed (the mapping, its source, its table, a
-//!   dimension, or a dimension file);
-//! - a file it already read was removed or replaced;
-//! - the table has dedup keys and a new file sorts before a file already read.
-//!   Dedup keeps the first row in key order, so appending is only the same as
-//!   a full run when new files come after old ones.
+//! Each table version has a record at `_sources/<version>.json`: per mapping,
+//! a fingerprint of the config that decides its output and the key and ETag of
+//! every file read. With a matching record and only new files, a run ingests
+//! the new files, drops rows whose dedup key is already stored, and rewrites
+//! the partitions the rest fall into. That equals a full run as long as new
+//! files sort after old ones, since dedup keeps the first row in key order.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 use polars::prelude::*;
@@ -31,68 +15,106 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::{AnalyticTable, Mapping, PipelineConfig};
-use crate::manifest::ManifestFile;
+use crate::manifest::{self, ManifestFile, TableManifest};
 
-/// Change this when a worker change alters what a mapping produces from the
-/// same inputs, so the next run rebuilds rather than appending to old output.
+/// Bump when the worker changes what a mapping produces from the same inputs.
 const OUTPUT_FORMAT: u32 = 1;
 
-/// One object in a lake listing.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceObject {
     pub key: String,
     pub etag: String,
 }
 
-/// What one mapping's files in a table version were built from.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MappingSources {
     pub mapping_id: String,
     pub fingerprint: String,
-    /// Every source file read, sorted by key.
+    /// Sorted by key.
     pub files: Vec<SourceObject>,
 }
 
-/// The `_sources/<version>.json` record.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-pub struct TableSources {
-    pub version: u64,
-    /// [`files_digest`] of the manifest this record was written with. A record
-    /// whose digest does not match the live manifest is ignored.
-    pub files_digest: String,
-    pub mappings: Vec<MappingSources>,
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct TableSources {
+    version: u64,
+    /// [`files_digest`] of the manifest written with this record.
+    files_digest: String,
+    mappings: Vec<MappingSources>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Hash of a manifest's file list.
-pub fn files_digest(files: &[ManifestFile]) -> String {
+fn files_digest(files: &[ManifestFile]) -> String {
     let mut keys: Vec<&str> = files.iter().map(|f| f.key.as_str()).collect();
     keys.sort_unstable();
     sha256_hex(keys.join("\n").as_bytes())
 }
 
-/// Hash of everything other than the source files that decides `mapping`'s
+/// The record for `current`, by mapping id. Empty when it is missing or was
+/// not written with this manifest (older versions, web restores, a run that
+/// died before publishing), which makes every mapping run in full.
+pub async fn read_record(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    table_prefix: &str,
+    current: &TableManifest,
+) -> HashMap<String, MappingSources> {
+    if current.version == 0 {
+        return HashMap::new();
+    }
+    let key = format!("{table_prefix}{}", manifest::sources_key(current.version));
+    let Ok(bytes) = crate::s3::get_bytes(client, bucket, &key).await else {
+        return HashMap::new();
+    };
+    match serde_json::from_slice::<TableSources>(&bytes) {
+        Ok(r) if r.version == current.version && r.files_digest == files_digest(&current.files) => {
+            r.mappings.into_iter().map(|m| (m.mapping_id.clone(), m)).collect()
+        }
+        Ok(_) => HashMap::new(),
+        Err(e) => {
+            tracing::warn!("{key} is not a source record: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+/// Write the record for `manifest`. Call before publishing it.
+pub async fn write_record(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    table_prefix: &str,
+    manifest: &TableManifest,
+    sources: &HashMap<String, MappingSources>,
+) -> Result<(), String> {
+    let mut mappings: Vec<MappingSources> = sources.values().cloned().collect();
+    mappings.sort_by(|a, b| a.mapping_id.cmp(&b.mapping_id));
+    let record = TableSources {
+        version: manifest.version,
+        files_digest: files_digest(&manifest.files),
+        mappings,
+    };
+    let key = format!("{table_prefix}{}", manifest::sources_key(manifest.version));
+    let body = serde_json::to_vec(&record).map_err(|e| format!("serialize source record: {e}"))?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(&key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(body))
+        .content_type("application/json")
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("PutObject {key}: {}", crate::s3::err_chain(&e)))
+}
+
+/// Hash of everything besides the source files that decides `mapping`'s
 /// output. `dimension_files` must be sorted.
-pub fn fingerprint(
-    cfg: &PipelineConfig,
-    mapping: &Mapping,
-    dimension_files: &[SourceObject],
-) -> String {
-    let source = cfg
-        .source_containers
-        .iter()
-        .find(|s| s.id == mapping.source_container_id);
-    let table = cfg
-        .analytic_tables
-        .iter()
-        .find(|t| t.id == mapping.analytic_table_id);
-    // serde_json's map is sorted by key, so the encoding is stable.
+pub fn fingerprint(cfg: &PipelineConfig, mapping: &Mapping, dimension_files: &[SourceObject]) -> String {
+    let source = cfg.source_containers.iter().find(|s| s.id == mapping.source_container_id);
+    let table = cfg.analytic_tables.iter().find(|t| t.id == mapping.analytic_table_id);
+    // serde_json's map sorts keys, so the encoding is stable.
     let doc = serde_json::json!({
         "output_format": OUTPUT_FORMAT,
         "mapping": mapping,
@@ -104,7 +126,6 @@ pub fn fingerprint(
     sha256_hex(doc.to_string().as_bytes())
 }
 
-/// Why a mapping is running in full.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FullReason {
     Requested,
@@ -115,32 +136,32 @@ pub enum FullReason {
     OutOfOrder(String),
 }
 
-impl std::fmt::Display for FullReason {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plan {
+    Full(FullReason),
+    Unchanged,
+    Append(Vec<SourceObject>),
+}
+
+impl std::fmt::Display for Plan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FullReason::Requested => write!(f, "a full run was requested"),
-            FullReason::NoRecord => write!(f, "no source record for the current version"),
-            FullReason::ConfigChanged => write!(f, "the config or a dimension file changed"),
-            FullReason::Replaced(k) => write!(f, "{k} was replaced"),
-            FullReason::Removed(k) => write!(f, "{k} was removed"),
-            FullReason::OutOfOrder(k) => {
-                write!(f, "{k} sorts before a file already read and the table has dedup keys")
+            Plan::Full(FullReason::Requested) => write!(f, "full run: requested"),
+            Plan::Full(FullReason::NoRecord) => write!(f, "full run: no source record"),
+            Plan::Full(FullReason::ConfigChanged) => write!(f, "full run: config changed"),
+            Plan::Full(FullReason::Replaced(k)) => write!(f, "full run: {k} was replaced"),
+            Plan::Full(FullReason::Removed(k)) => write!(f, "full run: {k} was removed"),
+            Plan::Full(FullReason::OutOfOrder(k)) => {
+                write!(f, "full run: {k} sorts before a file already read")
             }
+            Plan::Unchanged => write!(f, "no new source files"),
+            Plan::Append(new) => write!(f, "incremental run: {} new files", new.len()),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Plan {
-    Full(FullReason),
-    /// No new files and nothing changed.
-    Unchanged,
-    /// Ingest these files and merge their rows into the existing output.
-    Append(Vec<SourceObject>),
-}
-
-/// Decide how to run one mapping. `listing` is the source prefix's current
-/// contents sorted by key; `order_matters` is whether the table has dedup keys.
+/// `listing` must be sorted by key. `order_matters` is whether the table has
+/// dedup keys.
 pub fn plan(
     previous: Option<&MappingSources>,
     fingerprint: &str,
@@ -153,31 +174,24 @@ pub fn plan(
     if previous.fingerprint != fingerprint {
         return Plan::Full(FullReason::ConfigChanged);
     }
-    let listed: std::collections::HashMap<&str, &str> = listing
-        .iter()
-        .map(|o| (o.key.as_str(), o.etag.as_str()))
-        .collect();
+    let listed: HashMap<&str, &str> =
+        listing.iter().map(|o| (o.key.as_str(), o.etag.as_str())).collect();
     for old in &previous.files {
         match listed.get(old.key.as_str()) {
             None => return Plan::Full(FullReason::Removed(old.key.clone())),
-            Some(etag) if *etag != old.etag => {
-                return Plan::Full(FullReason::Replaced(old.key.clone()))
-            }
+            Some(etag) if *etag != old.etag => return Plan::Full(FullReason::Replaced(old.key.clone())),
             Some(_) => {}
         }
     }
     let seen: HashSet<&str> = previous.files.iter().map(|o| o.key.as_str()).collect();
-    let new: Vec<SourceObject> = listing
-        .iter()
-        .filter(|o| !seen.contains(o.key.as_str()))
-        .cloned()
-        .collect();
+    let new: Vec<SourceObject> =
+        listing.iter().filter(|o| !seen.contains(o.key.as_str())).cloned().collect();
     if new.is_empty() {
         return Plan::Unchanged;
     }
     if order_matters {
-        if let Some(last) = previous.files.iter().map(|o| o.key.as_str()).max() {
-            if let Some(early) = new.iter().find(|o| o.key.as_str() < last) {
+        if let Some(last) = previous.files.last() {
+            if let Some(early) = new.iter().find(|o| o.key < last.key) {
                 return Plan::Full(FullReason::OutOfOrder(early.key.clone()));
             }
         }
@@ -185,7 +199,6 @@ pub fn plan(
     Plan::Append(new)
 }
 
-/// Merge newly read files into a mapping's file list, sorted by key.
 pub fn record_files(previous: &[SourceObject], read: Vec<SourceObject>) -> Vec<SourceObject> {
     let mut out: Vec<SourceObject> = previous.to_vec();
     out.extend(read);
@@ -194,16 +207,14 @@ pub fn record_files(previous: &[SourceObject], read: Vec<SourceObject>) -> Vec<S
     out
 }
 
-/// Inverse of the partition path encoding: `%XX` back to the byte.
+/// Inverse of the `%XX` escaping in partition paths.
 fn decode_segment(value: &str) -> Result<String, String> {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            let hex = value
-                .get(i + 1..i + 3)
-                .ok_or_else(|| format!("truncated escape in `{value}`"))?;
+            let hex = value.get(i + 1..i + 3).ok_or_else(|| format!("truncated escape in `{value}`"))?;
             out.push(u8::from_str_radix(hex, 16).map_err(|_| format!("bad escape in `{value}`"))?);
             i += 3;
         } else {
@@ -214,22 +225,13 @@ fn decode_segment(value: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| format!("`{value}` is not UTF-8 once decoded"))
 }
 
-/// The partition values encoded in a file key such as
-/// `v3/year=2026/month=9/m.parquet`, as strings.
-fn partition_values(key: &str, partition_keys: &[String]) -> Result<Vec<(String, String)>, String> {
-    let segments: Vec<&str> = crate::manifest::partition_path(key).split('/').collect();
-    let dirs = &segments[..segments.len().saturating_sub(1)];
-    partition_keys
-        .iter()
-        .map(|name| {
-            let prefix = format!("{name}=");
-            let raw = dirs
-                .iter()
-                .find_map(|s| s.strip_prefix(prefix.as_str()))
-                .ok_or_else(|| format!("{key} has no `{name}` segment"))?;
-            Ok((name.clone(), decode_segment(raw)?))
-        })
-        .collect()
+fn partition_value(key: &str, name: &str) -> Result<String, String> {
+    let prefix = format!("{name}=");
+    let raw = manifest::partition_path(key)
+        .split('/')
+        .find_map(|s| s.strip_prefix(prefix.as_str()))
+        .ok_or_else(|| format!("{key} has no `{name}` segment"))?;
+    decode_segment(raw)
 }
 
 pub fn read_parquet(bytes: &[u8]) -> Result<DataFrame, String> {
@@ -238,9 +240,8 @@ pub fn read_parquet(bytes: &[u8]) -> Result<DataFrame, String> {
         .map_err(|e| format!("read parquet: {e}"))
 }
 
-/// The dedup key columns of `df`, each cast to a string. Both sides of the
-/// comparison go through the same cast, and partition values come back from
-/// the path as strings, so comparing strings needs no type bookkeeping.
+/// Keys are compared as strings: partition values come back from the path as
+/// strings, and both sides go through the same cast.
 fn key_strings(df: &DataFrame, keys: &[String]) -> Result<DataFrame, String> {
     let columns = keys
         .iter()
@@ -253,36 +254,38 @@ fn key_strings(df: &DataFrame, keys: &[String]) -> Result<DataFrame, String> {
     DataFrame::new(df.height(), columns).map_err(|e| e.to_string())
 }
 
-/// The dedup key tuples stored in one existing Parquet file of the table, as
-/// strings. Key columns that are partition keys come from the file's path,
-/// since they are not in the payload.
-pub fn stored_keys(bytes: &[u8], key: &str, table: &AnalyticTable) -> Result<DataFrame, String> {
-    let df = read_parquet(bytes)?;
-    let from_path: Vec<(String, String)> = partition_values(key, &table.partition_keys)?
-        .into_iter()
-        .filter(|(name, _)| table.dedup_keys.contains(name))
-        .collect();
-    let columns = table
-        .dedup_keys
-        .iter()
-        .map(|k| match from_path.iter().find(|(name, _)| name == k) {
-            Some((_, value)) => Ok(Column::new(
-                k.as_str().into(),
-                vec![value.as_str(); df.height()],
-            )),
-            None => df
-                .column(k)
-                .and_then(|c| c.cast(&DataType::String))
-                .map_err(|e| format!("{key}: dedup key `{k}`: {e}")),
-        })
-        .collect::<Result<Vec<Column>, String>>()?;
-    DataFrame::new(df.height(), columns).map_err(|e| e.to_string())
+/// The dedup key tuples in stored Parquet files, given as `(key, bytes)`.
+/// Partition key columns are read from the path, since the payload omits them.
+pub fn stored_keys(files: &[(String, Vec<u8>)], table: &AnalyticTable) -> Result<DataFrame, String> {
+    let mut out: Option<DataFrame> = None;
+    for (key, bytes) in files {
+        let df = read_parquet(bytes)?;
+        let columns = table
+            .dedup_keys
+            .iter()
+            .map(|k| {
+                if table.partition_keys.contains(k) {
+                    let value = partition_value(key, k)?;
+                    Ok(Column::new(k.as_str().into(), vec![value; df.height()]))
+                } else {
+                    df.column(k)
+                        .and_then(|c| c.cast(&DataType::String))
+                        .map_err(|e| format!("{key}: dedup key `{k}`: {e}"))
+                }
+            })
+            .collect::<Result<Vec<Column>, String>>()?;
+        let keys = DataFrame::new(df.height(), columns).map_err(|e| e.to_string())?;
+        out = Some(match out {
+            None => keys,
+            Some(acc) => acc.vstack(&keys).map_err(|e| e.to_string())?,
+        });
+    }
+    Ok(out.unwrap_or_default())
 }
 
-/// Drop rows of `new_rows` whose dedup key tuple is in `stored` (string
-/// columns named by `keys`). `new_rows` must already be deduplicated among
-/// itself. Keeps the order of `new_rows`. Returns the kept rows and how many
-/// were dropped.
+/// Drop rows of `new_rows` whose key is in `stored`, keeping order.
+/// `new_rows` must already be deduplicated. Returns the rows and the number
+/// dropped.
 pub fn drop_stored_keys(
     new_rows: &DataFrame,
     stored: &DataFrame,
@@ -300,11 +303,11 @@ pub fn drop_stored_keys(
         old_columns.push(stored.column(k).map_err(|e| e.to_string())?.clone());
     }
     let old = DataFrame::new(stored.height(), old_columns).map_err(|e| e.to_string())?;
-    // Stored rows first, so a key present in both keeps the stored copy, the
-    // same row a full run keeps since old files sort first.
-    let combined = old.vstack(&fresh).map_err(|e| e.to_string())?;
-    let unique = combined
-        .unique_stable(Some(keys), UniqueKeepStrategy::First, None)
+    // Stored rows first so they win, as they do in a full run. unique_stable
+    // also treats null keys as equal, matching dedup_rows.
+    let unique = old
+        .vstack(&fresh)
+        .and_then(|all| all.unique_stable(Some(keys), UniqueKeepStrategy::First, None))
         .map_err(|e| e.to_string())?;
     let kept: Vec<IdxSize> = unique
         .column(ROW)
@@ -313,25 +316,16 @@ pub fn drop_stored_keys(
         .into_iter()
         .flatten()
         .collect();
-    let kept = IdxCa::from_vec(ROW.into(), kept);
-    let rows = new_rows.take(&kept).map_err(|e| e.to_string())?;
+    let rows = new_rows
+        .take(&IdxCa::from_vec(ROW.into(), kept))
+        .map_err(|e| e.to_string())?;
     let dropped = new_rows.height() - rows.height();
     Ok((rows, dropped))
 }
 
-/// Append `new_rows` to an existing partition file's rows. New columns are
-/// cast to the stored types; a mismatch that cannot be cast is an error, and
-/// the caller falls back to a full run.
+/// Stored rows followed by `new_rows`, cast to the stored types.
 pub fn merge_partition(existing: &[u8], new_rows: &DataFrame) -> Result<DataFrame, String> {
     let old = read_parquet(existing)?;
-    let mut columns = Vec::with_capacity(old.width());
-    for field in old.schema().iter_fields() {
-        let column = new_rows
-            .column(field.name())
-            .and_then(|c| c.cast(field.dtype()))
-            .map_err(|e| format!("column `{}`: {e}", field.name()))?;
-        columns.push(column);
-    }
     if new_rows.width() != old.width() {
         return Err(format!(
             "stored partition has {} columns, new rows have {}",
@@ -339,6 +333,16 @@ pub fn merge_partition(existing: &[u8], new_rows: &DataFrame) -> Result<DataFram
             new_rows.width()
         ));
     }
+    let columns = old
+        .schema()
+        .iter_fields()
+        .map(|field| {
+            new_rows
+                .column(field.name())
+                .and_then(|c| c.cast(field.dtype()))
+                .map_err(|e| format!("column `{}`: {e}", field.name()))
+        })
+        .collect::<Result<Vec<Column>, String>>()?;
     let aligned = DataFrame::new(new_rows.height(), columns).map_err(|e| e.to_string())?;
     old.vstack(&aligned).map_err(|e| e.to_string())
 }
@@ -470,8 +474,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Partition `df` and return each file's key with a `v1/` prefix and bytes,
-    /// as they would be stored.
+    /// `df` partitioned and encoded as stored files under `v1/`.
     fn stored_files(df: &DataFrame, t: &AnalyticTable) -> Vec<(String, Vec<u8>)> {
         partition_frames(df, &mapping(), t)
             .unwrap()
@@ -483,23 +486,11 @@ mod tests {
             .collect()
     }
 
-    fn all_stored_keys(files: &[(String, Vec<u8>)], t: &AnalyticTable) -> DataFrame {
-        let mut out: Option<DataFrame> = None;
-        for (key, bytes) in files {
-            let k = stored_keys(bytes, key, t).unwrap();
-            out = Some(match out {
-                None => k,
-                Some(acc) => acc.vstack(&k).unwrap(),
-            });
-        }
-        out.unwrap()
-    }
-
     #[test]
     fn stored_keys_reads_partition_keys_from_the_path() {
         let t = table(&["month"], &["month", "id"]);
         let files = stored_files(&frame(), &t);
-        let keys = all_stored_keys(&files, &t);
+        let keys = stored_keys(&files, &t).unwrap();
         assert_eq!(keys.height(), 3);
         let months: Vec<Option<&str>> = keys.column("month").unwrap().str().unwrap().into_iter().collect();
         assert_eq!(months, vec![Some("2026-09"), Some("2026-09"), Some("2026-10")]);
@@ -509,7 +500,7 @@ mod tests {
     fn stored_rows_win_over_new_rows_with_the_same_key() {
         let t = table(&["month"], &["id"]);
         let files = stored_files(&frame(), &t);
-        let stored = all_stored_keys(&files, &t);
+        let stored = stored_keys(&files, &t).unwrap();
         let new_rows = df![
             "month" => ["2026-10", "2026-10"],
             "id" => [3i64, 4],
@@ -524,8 +515,6 @@ mod tests {
 
     #[test]
     fn null_keys_match_like_a_full_run_dedup() {
-        // unique_stable treats nulls as equal, so a full run keeps one row per
-        // null key. The comparison against stored rows must agree.
         let t = table(&[], &["id"]);
         let stored = df!["id" => [None::<&str>]].unwrap();
         let new_rows = df!["id" => [None::<i64>, Some(5)], "v" => ["x", "y"]].unwrap();
@@ -552,9 +541,8 @@ mod tests {
         assert!(merge_partition(&files[0].1, &extra).is_err());
     }
 
-    /// The property incremental runs rest on: for files appended in key
-    /// order, storing the first batch and then merging the second gives the
-    /// same table as one full run over both.
+    /// Storing one batch and appending a second gives the same table as a
+    /// full run over both.
     #[test]
     fn appending_equals_a_full_run() {
         let t = table(&["month"], &["id"]);
@@ -581,7 +569,7 @@ mod tests {
         let stored = stored_files(&first_deduped, &t);
         let (second_deduped, _) = dedup_rows(&second, &t).unwrap();
         let (fresh, dropped) =
-            drop_stored_keys(&second_deduped, &all_stored_keys(&stored, &t), &t.dedup_keys).unwrap();
+            drop_stored_keys(&second_deduped, &stored_keys(&stored, &t).unwrap(), &t.dedup_keys).unwrap();
         assert_eq!(dropped, 1, "id 3 is already stored");
         let mut got: Vec<(String, DataFrame)> = Vec::new();
         let mut written: HashSet<String> = HashSet::new();

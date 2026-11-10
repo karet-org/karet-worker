@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 pub const CURRENT_KEY: &str = "_current.json";
 /// Directory of manifests, keyed by version.
 pub const MANIFEST_PREFIX: &str = "_manifests/";
-/// Directory of per-version source records, see [`crate::incremental`].
+/// Per-version source records, see [`crate::incremental`].
 pub const SOURCES_PREFIX: &str = "_sources/";
 /// How many versions stay readable (and rollback-able) behind the current one.
 pub const RETAINED_VERSIONS: usize = 10;
@@ -78,14 +78,11 @@ pub fn manifest_key(version: u64) -> String {
     format!("{MANIFEST_PREFIX}{version}.json")
 }
 
-/// Key of a version's source record, relative to the table prefix.
 pub fn sources_key(version: u64) -> String {
     format!("{SOURCES_PREFIX}{version}.json")
 }
 
-/// A file key without its `v<n>/` version directory: the partition path plus
-/// the mapping's file name, e.g. `year=2026/month=9/m.parquet`. Two versions of
-/// the same partition share it.
+/// `v7/year=2026/m.parquet` -> `year=2026/m.parquet`.
 pub fn partition_path(key: &str) -> &str {
     match key.split_once('/') {
         Some((dir, rest))
@@ -123,12 +120,8 @@ pub fn apply_mapping_writes(
     out
 }
 
-/// Replace only the partitions `files` rewrote in `mapping_id`'s contribution.
-///
-/// An incremental run writes just the partitions its new rows landed in, so
-/// the mapping's other partitions are carried forward from the versions that
-/// wrote them. Vacuum keeps those older objects because a retained manifest
-/// still lists them.
+/// Replace only the partitions `files` rewrote; the mapping's other files
+/// carry forward. Used by incremental runs.
 pub fn apply_partition_writes(
     previous: &[ManifestFile],
     mapping_id: &str,
@@ -274,7 +267,6 @@ pub async fn vacuum(
     let mut deleted = 0usize;
     let mut targets = unreferenced_keys(&retained, &relative);
     targets.extend(doomed.iter().map(|v| manifest_key(*v)));
-    // A version may have no source record; deleting a missing key is a no-op.
     targets.extend(doomed.iter().map(|v| sources_key(*v)));
     for key in targets {
         let full = format!("{table_prefix}{key}");
