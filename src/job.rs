@@ -615,21 +615,23 @@ async fn append_mapping(
 
     // Dedup keys need not include the partition keys, so a duplicate can be
     // in any of the mapping's partitions.
+    // Downloaded once, for the dedup check and for merging below.
+    let mut fetched: HashMap<String, Vec<u8>> = HashMap::new();
     if !table.dedup_keys.is_empty() && rows.height() > 0 && !own.is_empty() {
         let mut stored = Vec::with_capacity(own.len());
         for f in &own {
             stored.push((f.key.clone(), fetch(f.key.clone()).await?));
         }
         let table_c = table.clone();
-        let (kept, d) = tokio::task::spawn_blocking(move || {
-            let keys = incremental::stored_keys(&stored, &table_c)?;
-            incremental::drop_stored_keys(&rows, &keys, &table_c.dedup_keys)
+        let (kept, d, stored) = tokio::task::spawn_blocking(move || {
+            incremental::drop_stored_keys(&rows, &stored, &table_c).map(|(kept, d)| (kept, d, stored))
         })
         .await
         .map_err(|e| Failure::Fallback(format!("dedup task panicked: {e}")))?
         .map_err(Failure::Fallback)?;
         rows = kept;
         dropped += d;
+        fetched.extend(stored);
     }
 
     if rows.height() == 0 {
@@ -642,7 +644,10 @@ async fn append_mapping(
     for (key, frame) in frames {
         let path = key.split_once('/').map(|(_, rest)| rest).unwrap_or_default();
         let existing = match own.iter().find(|f| manifest::partition_path(&f.key) == path) {
-            Some(f) => Some(fetch(f.key.clone()).await?),
+            Some(f) => match fetched.remove(&f.key) {
+                Some(bytes) => Some(bytes),
+                None => Some(fetch(f.key.clone()).await?),
+            },
             None => None,
         };
         merges.push((key, frame, existing));

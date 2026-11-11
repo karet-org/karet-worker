@@ -254,70 +254,121 @@ fn key_strings(df: &DataFrame, keys: &[String]) -> Result<DataFrame, String> {
     DataFrame::new(df.height(), columns).map_err(|e| e.to_string())
 }
 
-/// The dedup key tuples in stored Parquet files, given as `(key, bytes)`.
-/// Partition key columns are read from the path, since the payload omits them.
-pub fn stored_keys(files: &[(String, Vec<u8>)], table: &AnalyticTable) -> Result<DataFrame, String> {
-    let mut out: Option<DataFrame> = None;
-    for (key, bytes) in files {
-        let df = read_parquet(bytes)?;
-        let columns = table
-            .dedup_keys
-            .iter()
-            .map(|k| {
-                if table.partition_keys.contains(k) {
-                    let value = partition_value(key, k)?;
-                    Ok(Column::new(k.as_str().into(), vec![value; df.height()]))
-                } else {
-                    df.column(k)
-                        .and_then(|c| c.cast(&DataType::String))
-                        .map_err(|e| format!("{key}: dedup key `{k}`: {e}"))
-                }
-            })
-            .collect::<Result<Vec<Column>, String>>()?;
-        let keys = DataFrame::new(df.height(), columns).map_err(|e| e.to_string())?;
-        out = Some(match out {
-            None => keys,
-            Some(acc) => acc.vstack(&keys).map_err(|e| e.to_string())?,
-        });
+/// One row's dedup key as a single string, so a stored row can be looked up
+/// without allocating. Each value is written as its length and its text, and
+/// a null as `~`, so no two different tuples give the same string.
+fn push_key_part(buf: &mut String, value: Option<&str>) {
+    use std::fmt::Write;
+    match value {
+        Some(v) => {
+            let _ = write!(buf, "{}:{v}", v.len());
+        }
+        None => buf.push('~'),
     }
-    Ok(out.unwrap_or_default())
 }
 
-/// Drop rows of `new_rows` whose key is in `stored`, keeping order.
-/// `new_rows` must already be deduplicated. Returns the rows and the number
-/// dropped.
+/// The dedup key of every row of `df`, which holds the key columns as strings.
+fn encoded_keys(df: &DataFrame, keys: &[String]) -> Result<Vec<String>, String> {
+    let columns = keys
+        .iter()
+        .map(|k| df.column(k).and_then(|c| c.str().cloned()).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<StringChunked>, String>>()?;
+    let mut iters: Vec<_> = columns.iter().map(|c| c.into_iter()).collect();
+    let mut out = Vec::with_capacity(df.height());
+    for _ in 0..df.height() {
+        let mut buf = String::new();
+        for it in iters.iter_mut() {
+            push_key_part(&mut buf, it.next().flatten());
+        }
+        out.push(buf);
+    }
+    Ok(out)
+}
+
+/// Drop rows of `new_rows` whose dedup key is already in one of the stored
+/// Parquet files, given as `(key, bytes)`. `new_rows` must already be
+/// deduplicated. Returns the rows kept, in order, and the number dropped.
+///
+/// Only the key columns of a stored file are read, one file at a time, and
+/// each stored row is checked against the new rows' keys. Partition key
+/// columns are read from the path, since the payload omits them. Keys are
+/// compared as strings, and null keys match each other, as in a full run.
 pub fn drop_stored_keys(
     new_rows: &DataFrame,
-    stored: &DataFrame,
-    keys: &[String],
+    files: &[(String, Vec<u8>)],
+    table: &AnalyticTable,
 ) -> Result<(DataFrame, usize), String> {
-    if keys.is_empty() || stored.height() == 0 || new_rows.height() == 0 {
+    let keys = &table.dedup_keys;
+    if keys.is_empty() || files.is_empty() || new_rows.height() == 0 {
         return Ok((new_rows.clone(), 0));
     }
-    const ROW: &str = "__karet_new_row";
-    let fresh = key_strings(new_rows, keys)?
-        .with_row_index(ROW.into(), None)
-        .map_err(|e| e.to_string())?;
-    let mut old_columns = vec![Column::full_null(ROW.into(), stored.height(), &IDX_DTYPE)];
-    for k in keys {
-        old_columns.push(stored.column(k).map_err(|e| e.to_string())?.clone());
+    let fresh = encoded_keys(&key_strings(new_rows, keys)?, keys)?;
+    let wanted: HashSet<&str> = fresh.iter().map(String::as_str).collect();
+    let mut found: HashSet<String> = HashSet::new();
+
+    for (key, bytes) in files {
+        let payload: Vec<String> = keys.iter().filter(|k| !table.partition_keys.contains(k)).cloned().collect();
+        let mut reader = ParquetReader::new(Cursor::new(bytes));
+        // With every key in the path, all rows share one key: check it once.
+        let height = if payload.is_empty() {
+            reader.num_rows().map_err(|e| format!("{key}: read parquet: {e}"))?.min(1)
+        } else {
+            0
+        };
+        let stored = if payload.is_empty() {
+            DataFrame::empty_with_height(height)
+        } else {
+            let df = reader
+                .with_columns(Some(payload.clone()))
+                .finish()
+                .map_err(|e| format!("{key}: read parquet: {e}"))?;
+            key_strings(&df, &payload).map_err(|e| format!("{key}: {e}"))?
+        };
+        let mut columns = Vec::with_capacity(keys.len());
+        for k in keys {
+            columns.push(if table.partition_keys.contains(k) {
+                Err(partition_value(key, k)?)
+            } else {
+                Ok(stored.column(k).and_then(|c| c.str().cloned()).map_err(|e| e.to_string())?)
+            });
+        }
+        let mut iters: Vec<_> = columns
+            .iter()
+            .map(|c| match c {
+                Ok(ca) => Ok(ca.into_iter()),
+                Err(value) => Err(value.as_str()),
+            })
+            .collect();
+        let mut buf = String::new();
+        for _ in 0..stored.height() {
+            buf.clear();
+            for it in iters.iter_mut() {
+                let value = match it {
+                    Ok(it) => it.next().flatten(),
+                    Err(value) => Some(*value),
+                };
+                push_key_part(&mut buf, value);
+            }
+            if wanted.contains(buf.as_str()) && !found.contains(buf.as_str()) {
+                found.insert(buf.clone());
+            }
+        }
+        if found.len() == wanted.len() {
+            break;
+        }
     }
-    let old = DataFrame::new(stored.height(), old_columns).map_err(|e| e.to_string())?;
-    // Stored rows first so they win, as they do in a full run. unique_stable
-    // also treats null keys as equal, matching dedup_rows.
-    let unique = old
-        .vstack(&fresh)
-        .and_then(|all| all.unique_stable(Some(keys), UniqueKeepStrategy::First, None))
-        .map_err(|e| e.to_string())?;
-    let kept: Vec<IdxSize> = unique
-        .column(ROW)
-        .and_then(|c| c.idx().cloned())
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .flatten()
+
+    if found.is_empty() {
+        return Ok((new_rows.clone(), 0));
+    }
+    let kept: Vec<IdxSize> = fresh
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| !found.contains(k.as_str()))
+        .map(|(i, _)| i as IdxSize)
         .collect();
     let rows = new_rows
-        .take(&IdxCa::from_vec(ROW.into(), kept))
+        .take(&IdxCa::from_vec("idx".into(), kept))
         .map_err(|e| e.to_string())?;
     let dropped = new_rows.height() - rows.height();
     Ok((rows, dropped))
@@ -487,27 +538,54 @@ mod tests {
     }
 
     #[test]
-    fn stored_keys_reads_partition_keys_from_the_path() {
+    fn partition_keys_are_read_from_the_path() {
         let t = table(&["month"], &["month", "id"]);
         let files = stored_files(&frame(), &t);
-        let keys = stored_keys(&files, &t).unwrap();
-        assert_eq!(keys.height(), 3);
-        let months: Vec<Option<&str>> = keys.column("month").unwrap().str().unwrap().into_iter().collect();
-        assert_eq!(months, vec![Some("2026-09"), Some("2026-09"), Some("2026-10")]);
+        let new_rows = df![
+            "month" => ["2026-09", "2026-10", "2026-11"],
+            "id" => [1i64, 1, 3],
+            "v" => ["same", "other month", "other month"],
+        ]
+        .unwrap();
+        let (kept, dropped) = drop_stored_keys(&new_rows, &files, &t).unwrap();
+        assert_eq!(dropped, 1, "only (2026-09, 1) is stored");
+        let v: Vec<&str> = kept.column("v").unwrap().str().unwrap().into_no_null_iter().collect();
+        assert_eq!(v, ["other month", "other month"]);
+    }
+
+    #[test]
+    fn keys_only_in_the_path_are_checked_once_per_file() {
+        let t = table(&["month"], &["month"]);
+        let files = stored_files(&frame(), &t);
+        let new_rows = df!["month" => ["2026-10", "2026-12"], "id" => [7i64, 8], "v" => ["x", "y"]].unwrap();
+        let (kept, dropped) = drop_stored_keys(&new_rows, &files, &t).unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(kept.column("v").unwrap().str().unwrap().get(0), Some("y"));
+    }
+
+    #[test]
+    fn keys_with_separators_do_not_collide() {
+        let t = table(&[], &["a", "b"]);
+        let stored = df!["a" => ["ab"], "b" => ["c"], "v" => ["s"]].unwrap();
+        let files = stored_files(&stored, &t);
+        // ("a", "bc") joins to the same text as ("ab", "c") without the lengths.
+        let new_rows = df!["a" => ["a", "ab"], "b" => ["bc", "c"], "v" => ["n1", "n2"]].unwrap();
+        let (kept, dropped) = drop_stored_keys(&new_rows, &files, &t).unwrap();
+        assert_eq!(dropped, 1);
+        assert_eq!(kept.column("v").unwrap().str().unwrap().get(0), Some("n1"));
     }
 
     #[test]
     fn stored_rows_win_over_new_rows_with_the_same_key() {
         let t = table(&["month"], &["id"]);
         let files = stored_files(&frame(), &t);
-        let stored = stored_keys(&files, &t).unwrap();
         let new_rows = df![
             "month" => ["2026-10", "2026-10"],
             "id" => [3i64, 4],
             "v" => ["dup", "d"],
         ]
         .unwrap();
-        let (kept, dropped) = drop_stored_keys(&new_rows, &stored, &t.dedup_keys).unwrap();
+        let (kept, dropped) = drop_stored_keys(&new_rows, &files, &t).unwrap();
         assert_eq!(dropped, 1);
         let ids: Vec<Option<i64>> = kept.column("id").unwrap().i64().unwrap().into_iter().collect();
         assert_eq!(ids, vec![Some(4)]);
@@ -516,9 +594,9 @@ mod tests {
     #[test]
     fn null_keys_match_like_a_full_run_dedup() {
         let t = table(&[], &["id"]);
-        let stored = df!["id" => [None::<&str>]].unwrap();
+        let files = stored_files(&df!["id" => [None::<i64>], "v" => ["s"]].unwrap(), &t);
         let new_rows = df!["id" => [None::<i64>, Some(5)], "v" => ["x", "y"]].unwrap();
-        let (kept, dropped) = drop_stored_keys(&new_rows, &stored, &t.dedup_keys).unwrap();
+        let (kept, dropped) = drop_stored_keys(&new_rows, &files, &t).unwrap();
         assert_eq!((kept.height(), dropped), (1, 1));
     }
 
@@ -569,7 +647,7 @@ mod tests {
         let stored = stored_files(&first_deduped, &t);
         let (second_deduped, _) = dedup_rows(&second, &t).unwrap();
         let (fresh, dropped) =
-            drop_stored_keys(&second_deduped, &stored_keys(&stored, &t).unwrap(), &t.dedup_keys).unwrap();
+            drop_stored_keys(&second_deduped, &stored, &t).unwrap();
         assert_eq!(dropped, 1, "id 3 is already stored");
         let mut got: Vec<(String, DataFrame)> = Vec::new();
         let mut written: HashSet<String> = HashSet::new();
