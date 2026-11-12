@@ -26,6 +26,11 @@ thiserror = "2"
 redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager"] }
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
 sha2 = "0.10"
+# Polars allocates and frees large buffers. glibc malloc keeps freed memory
+# in the process, so a full run left the worker holding gigabytes while idle.
+# jemalloc returns it to the system.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [dependencies.polars]
 version = "0.53"
