@@ -10,7 +10,8 @@ FROM rust:1.91-slim-bookworm AS chef
 WORKDIR /app
 # mold is dramatically faster than ld for crates with many symbols
 # (aws-sdk-s3 + polars together generate hundreds of thousands).
-RUN apt-get update && apt-get install -y --no-install-recommends mold clang && \
+# make builds jemalloc (tikv-jemalloc-sys).
+RUN apt-get update && apt-get install -y --no-install-recommends mold clang make && \
     rm -rf /var/lib/apt/lists/* && \
     cargo install cargo-chef --locked --version 0.1.68
 # Tell cargo to link with mold via clang. ~30-60s off the final link.
