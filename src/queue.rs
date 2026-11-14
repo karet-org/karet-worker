@@ -130,7 +130,7 @@ pub async fn connect(client: &redis::Client) -> Result<MultiplexedConnection, Re
 /// Reuse the loop's connection or establish a fresh one. Loops set their
 /// slot to `None` on any command error; multiplexed connections don't
 /// recover from socket death on their own.
-async fn ensure_conn<'a>(
+pub(crate) async fn ensure_conn<'a>(
     client: &redis::Client,
     slot: &'a mut Option<MultiplexedConnection>,
     label: &str,

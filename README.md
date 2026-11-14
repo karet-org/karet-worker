@@ -40,6 +40,7 @@ Optional:
 | `DATABASE_POOL_MAX` | `4` | Postgres connections this worker opens. |
 | `PORT` | `8080` | Port to serve on. |
 | `HOSTNAME` | `local` | Consumer name in the stream group; Docker sets it per container. |
+| `LAKE_POLL_INTERVAL_SECS` | `0` | When above 0, list every source prefix in the lake bucket this often and start a run for new or replaced objects. For S3 stores that cannot send webhooks. `0` turns it off. |
 
 ## Job queue
 
@@ -54,6 +55,11 @@ The Redis stream is the only job transport:
 - Debounces RustFS upload events (5s quiet / 30s max) and enqueues
   webhook-triggered jobs itself; point
   `RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY` at `http://worker:8080/events/s3`.
+- For stores without webhooks, set `LAKE_POLL_INTERVAL_SECS`. The worker
+  lists each source prefix on that interval, compares the keys and ETags
+  with the previous listing (saved in Redis under `karet:lake:seen:<prefix>`),
+  and debounces a run for new or replaced objects. The first scan of a
+  prefix only saves the listing.
 - Shuts down gracefully on SIGTERM: stops claiming, finishes in-flight
   jobs, then exits.
 

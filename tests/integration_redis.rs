@@ -477,3 +477,61 @@ async fn reclaimer_picks_up_dead_consumers_entry() {
     let _ = shutdown.send(true);
     reclaimer.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a running Redis/Valkey; set REDIS_TEST_URL"]
+async fn lake_poll_saves_listings_and_reports_uploads() {
+    use karet_worker::incremental::SourceObject;
+    use karet_worker::lake_poll::{self, Check, Diff};
+
+    let Some(url) = test_url() else {
+        panic!("REDIS_TEST_URL is not set");
+    };
+    let mut conn = flush(&url).await;
+    let obj = |k: &str, e: &str| SourceObject { key: k.into(), etag: e.into() };
+    let prefix = "uploads/visa/";
+
+    // First scan saves the listing and reports nothing.
+    let first = vec![obj("uploads/visa/a.csv", "1")];
+    assert_eq!(lake_poll::check(&mut conn, prefix, &first).await.unwrap(), Check::FirstScan);
+    assert_eq!(
+        lake_poll::check(&mut conn, prefix, &first).await.unwrap(),
+        Check::Changed(Diff::default()),
+    );
+
+    // A new object is reported, and stays reported until it is saved.
+    let second = vec![obj("uploads/visa/a.csv", "1"), obj("uploads/visa/b.csv", "2")];
+    let Check::Changed(diff) = lake_poll::check(&mut conn, prefix, &second).await.unwrap() else {
+        panic!("expected a change");
+    };
+    assert_eq!(diff.uploads, vec![obj("uploads/visa/b.csv", "2")]);
+    assert_eq!(
+        lake_poll::check(&mut conn, prefix, &second).await.unwrap(),
+        Check::Changed(Diff { uploads: vec![obj("uploads/visa/b.csv", "2")], removed: vec![] }),
+    );
+    lake_poll::save(&mut conn, prefix, &diff).await.unwrap();
+    assert_eq!(
+        lake_poll::check(&mut conn, prefix, &second).await.unwrap(),
+        Check::Changed(Diff::default()),
+    );
+
+    // A removal is reported as removed only, and saving it drops the key.
+    let third = vec![obj("uploads/visa/b.csv", "2")];
+    let Check::Changed(diff) = lake_poll::check(&mut conn, prefix, &third).await.unwrap() else {
+        panic!("expected a change");
+    };
+    assert!(diff.uploads.is_empty());
+    assert_eq!(diff.removed, vec!["uploads/visa/a.csv".to_string()]);
+    lake_poll::save(&mut conn, prefix, &diff).await.unwrap();
+    let saved: std::collections::HashMap<String, String> =
+        conn.hgetall(lake_poll::seen_key(prefix)).await.unwrap();
+    assert!(!saved.contains_key("uploads/visa/a.csv"), "{saved:?}");
+
+    // An empty prefix that has been scanned is not scanned for the first time again.
+    let empty_prefix = "uploads/empty/";
+    assert_eq!(lake_poll::check(&mut conn, empty_prefix, &[]).await.unwrap(), Check::FirstScan);
+    assert_eq!(
+        lake_poll::check(&mut conn, empty_prefix, &[]).await.unwrap(),
+        Check::Changed(Diff::default()),
+    );
+}
