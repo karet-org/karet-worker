@@ -12,6 +12,7 @@ pub mod evaluator;
 pub mod http;
 pub mod job;
 pub mod incremental;
+pub mod lake_poll;
 pub mod manifest;
 pub mod json_source;
 pub mod dimension;
@@ -147,6 +148,15 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop_handles.push(tokio::spawn(queue::delayed_mover_loop(queue_ctx.clone())));
     loop_handles.push(tokio::spawn(queue::reclaimer_loop(queue_ctx.clone())));
     loop_handles.push(tokio::spawn(queue::debounce_scheduler_loop(queue_ctx.clone())));
+    // Off by default: stores that send object-created webhooks do not need it.
+    let poll_secs: u64 = env_parse("LAKE_POLL_INTERVAL_SECS", 0);
+    if poll_secs > 0 {
+        tracing::info!("lake polling enabled: every {poll_secs}s");
+        loop_handles.push(tokio::spawn(lake_poll::lake_poll_loop(
+            queue_ctx.clone(),
+            std::time::Duration::from_secs(poll_secs),
+        )));
+    }
 
     let app = http::router(state);
 
