@@ -11,9 +11,18 @@ WORKDIR /app
 # mold is dramatically faster than ld for crates with many symbols
 # (aws-sdk-s3 + polars together generate hundreds of thousands).
 # make builds jemalloc (tikv-jemalloc-sys).
-RUN apt-get update && apt-get install -y --no-install-recommends mold clang make && \
+RUN apt-get update && apt-get install -y --no-install-recommends mold clang make curl unzip && \
     rm -rf /var/lib/apt/lists/* && \
     cargo install cargo-chef --locked --version 0.1.68
+# The DuckDB library the duckdb crate links against, from the DuckDB release,
+# so the build does not compile DuckDB's C++ sources. Keep the version in step
+# with the duckdb crate in Cargo.toml.
+ARG DUCKDB_VERSION=1.5.6
+RUN arch="$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')" && \
+    curl -fsSL -o /tmp/libduckdb.zip \
+      "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-linux-${arch}.zip" && \
+    mkdir -p /opt/duckdb && unzip -q /tmp/libduckdb.zip -d /opt/duckdb && rm /tmp/libduckdb.zip
+ENV DUCKDB_LIB_DIR=/opt/duckdb DUCKDB_INCLUDE_DIR=/opt/duckdb LD_LIBRARY_PATH=/opt/duckdb
 # Tell cargo to link with mold via clang. ~30-60s off the final link.
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
@@ -46,5 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/target/release/karet-worker ./karet-worker
+COPY --from=builder /opt/duckdb/libduckdb.so /usr/local/lib/libduckdb.so
+RUN ldconfig
 EXPOSE 8080
 ENTRYPOINT ["./karet-worker"]

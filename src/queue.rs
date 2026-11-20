@@ -267,7 +267,7 @@ fn fence(job_id: &str, attempt: u32) -> String {
     format!("{job_id}:{attempt}")
 }
 
-async fn try_lock(
+pub(crate) async fn try_lock(
     conn: &mut MultiplexedConnection,
     pipeline: &str,
     fence: &str,
@@ -284,7 +284,7 @@ async fn try_lock(
     Ok(result.is_some())
 }
 
-async fn release_lock(
+pub(crate) async fn release_lock(
     conn: &mut MultiplexedConnection,
     pipeline: &str,
     fence: &str,
@@ -680,7 +680,7 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
     let outcome =
         job::execute_job(
             &ctx.job_ctx,
-            &msg.prefix,
+            Some(&msg.job_id),
             &msg.pipeline,
             msg.config_version_id,
             msg.clean_run,

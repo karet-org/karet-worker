@@ -29,6 +29,15 @@ jobs:
       # it explicitly (this also warms the toolchain itself).
       - name: Install toolchain with clippy
         run: rustup component add clippy
+      # The duckdb crate links against the DuckDB release library; keep the
+      # version in step with Cargo.toml and the Dockerfile.
+      - name: Install libduckdb
+        run: |
+          curl -fsSL -o /tmp/libduckdb.zip https://github.com/duckdb/duckdb/releases/download/v1.5.6/libduckdb-linux-amd64.zip
+          mkdir -p "$HOME/libduckdb" && unzip -q /tmp/libduckdb.zip -d "$HOME/libduckdb"
+          echo "DUCKDB_LIB_DIR=$HOME/libduckdb" >> "$GITHUB_ENV"
+          echo "DUCKDB_INCLUDE_DIR=$HOME/libduckdb" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/libduckdb" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings

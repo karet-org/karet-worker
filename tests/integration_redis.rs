@@ -63,7 +63,10 @@ async fn make_ctx(url: &str) -> (Arc<QueueCtx>, tokio::sync::watch::Sender<bool>
         job_ctx: JobContext {
             s3_client: dead_s3_client().await,
             lake_bucket: "karet-lake".into(),
-            warehouse_bucket: "karet-warehouse".into(),
+            // Never opened: every config read fails before a job reaches the lake.
+            lake: Arc::new(karet_worker::lake::Lake::new(karet_worker::lake::LakeCatalog::Local(
+                std::env::temp_dir().join("karet-redis-test-lake"),
+            ))),
             // These tests exercise queue mechanics, not the database, so the pool
             // points nowhere and every config read fails. It must fail *fast*:
             // sqlx's default 30s acquire timeout is longer than the deadlines
