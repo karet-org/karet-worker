@@ -189,69 +189,11 @@ pub fn ingest_many(
 // Partitioning and Parquet output
 // ===========================================================================
 
-/// A single partition's worth of Parquet-encoded output.
-#[derive(Debug, Clone)]
-pub struct PartitionOutput {
-    /// S3 object key, e.g. `transactions/year=2024/month=01/data.parquet`.
-    pub key: String,
-    /// Parquet-encoded bytes ready to upload.
-    pub bytes: Vec<u8>,
-}
-
-/// Percent-encode a partition value for use as a hive path segment.
-/// Characters outside `[A-Za-z0-9._-]` are `%XX`-escaped.
-fn encode_segment(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// Render one partition-key cell as its path segment string.
-/// Ints plain, dates ISO, bools true/false, strings percent-encoded.
-fn segment_value(av: &AnyValue) -> Result<String, PipelineError> {
-    match av {
-        AnyValue::Int8(v) => Ok(v.to_string()),
-        AnyValue::Int16(v) => Ok(v.to_string()),
-        AnyValue::Int32(v) => Ok(v.to_string()),
-        AnyValue::Int64(v) => Ok(v.to_string()),
-        AnyValue::UInt8(v) => Ok(v.to_string()),
-        AnyValue::UInt16(v) => Ok(v.to_string()),
-        AnyValue::UInt32(v) => Ok(v.to_string()),
-        AnyValue::UInt64(v) => Ok(v.to_string()),
-        AnyValue::Boolean(v) => Ok(v.to_string()),
-        AnyValue::Date(days) => {
-            let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163)
-                .ok_or_else(|| PipelineError::Partition {
-                    message: format!("date value {days} out of range"),
-                })?;
-            Ok(date.format("%Y-%m-%d").to_string())
-        }
-        AnyValue::String(v) => Ok(encode_segment(v)),
-        AnyValue::StringOwned(v) => Ok(encode_segment(v)),
-        other => Err(PipelineError::Partition {
-            message: format!("unsupported partition key value: {other:?}"),
-        }),
-    }
-}
-
 /// Serialize a [`DataFrame`] to Parquet-encoded bytes.
 pub fn write_parquet_bytes(df: &mut DataFrame) -> Result<Vec<u8>, PolarsError> {
     let mut buf = Cursor::new(Vec::new());
     ParquetWriter::new(&mut buf).finish(df)?;
     Ok(buf.into_inner())
-}
-
-/// Build the S3 object key for an unpartitioned output.
-/// Format: `<analytic_table_id>/<mapping_id>.parquet`.
-fn unpartitioned_key(analytic_table_id: &str, mapping_id: &str) -> String {
-    format!("{analytic_table_id}/{mapping_id}.parquet")
 }
 
 /// Deduplicate `df` on the table's `dedup_keys`, keeping the first row in
@@ -271,44 +213,16 @@ pub fn dedup_rows(
     Ok((deduped, dropped))
 }
 
-/// One [`PartitionOutput`] per distinct tuple of the table's
-/// `partition_keys` at `<table_id>/<k>=<v>/../<mapping_id>.parquet`; no
-/// keys means one whole-frame output. Key columns live in the path only
-/// (hive reading restores them); null keys fail the mapping (`coalesce`
-/// is the escape hatch). The mapping id in the filename keeps mappings
-/// sharing a table from overwriting each other.
-pub fn produce_partitions(
-    df: &DataFrame,
-    mapping: &Mapping,
-    table: &AnalyticTable,
-) -> Result<Vec<PartitionOutput>, PipelineError> {
-    partition_frames(df, mapping, table)?
-        .into_iter()
-        .map(|(key, mut frame)| {
-            let bytes = write_parquet_bytes(&mut frame)
-                .map_err(|e| PipelineError::polars("<partition>", e))?;
-            Ok(PartitionOutput { key, bytes })
-        })
-        .collect()
-}
-
-/// [`produce_partitions`] before encoding.
-pub fn partition_frames(
-    df: &DataFrame,
-    mapping: &Mapping,
-    table: &AnalyticTable,
-) -> Result<Vec<(String, DataFrame)>, PipelineError> {
-    debug_assert_eq!(
-        mapping.analytic_table_id, table.id,
-        "partition_frames: mapping.analytic_table_id (`{}`) must equal table.id (`{}`)",
-        mapping.analytic_table_id, table.id
-    );
-
-    if table.partition_keys.is_empty() {
-        return Ok(vec![(unpartitioned_key(&table.id, &mapping.id), df.clone())]);
+/// The number of distinct partition-key tuples in `df`, which is how many
+/// partitions it writes; one for an unpartitioned table with rows. Null key
+/// values fail the mapping (`coalesce` is the escape hatch).
+pub fn count_partitions(df: &DataFrame, table: &AnalyticTable) -> Result<usize, PipelineError> {
+    if df.height() == 0 {
+        return Ok(0);
     }
-
-    // Fail fast on null key values, naming the column and row count.
+    if table.partition_keys.is_empty() {
+        return Ok(1);
+    }
     for key in &table.partition_keys {
         let column = df
             .column(key)
@@ -323,65 +237,11 @@ pub fn partition_frames(
             });
         }
     }
-
-    let keys: Vec<PlSmallStr> = table
-        .partition_keys
-        .iter()
-        .map(|k| PlSmallStr::from_str(k))
-        .collect();
-    let groups = df
-        .partition_by_stable(keys.clone(), true)
-        .map_err(|e| PipelineError::polars("<partition>", e))?;
-
-    let mut out: Vec<(String, DataFrame)> = Vec::with_capacity(groups.len());
-    for group in groups {
-        let mut segments: Vec<String> = Vec::with_capacity(table.partition_keys.len());
-        for key in &table.partition_keys {
-            let av = group
-                .column(key)
-                .and_then(|c| c.get(0))
-                .map_err(|e| PipelineError::polars("<partition>", e))?;
-            segments.push(format!("{key}={}", segment_value(&av)?));
-        }
-        let sub = group.drop_many(keys.iter().cloned());
-        out.push((
-            format!("{}/{}/{}.parquet", table.id, segments.join("/"), mapping.id),
-            sub,
-        ));
-    }
-    Ok(out)
-}
-
-// ===========================================================================
-// Partition upload
-// ===========================================================================
-
-/// Upload seam: production is async in `job.rs`; this sync trait lets
-/// tests run the pipeline against in-memory uploaders.
-pub trait PartitionUploader {
-    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), String>;
-}
-
-/// Upload a list of [`PartitionOutput`]s via the given uploader.
-///
-/// Short-circuits on the **first** per-partition failure so the caller
-/// gets an unambiguous pointer to the partition that needs attention.
-/// Successful uploads are returned in input order.
-pub fn upload_partitions(
-    uploader: &dyn PartitionUploader,
-    partitions: &[PartitionOutput],
-) -> Result<Vec<String>, PipelineError> {
-    let mut uploaded = Vec::with_capacity(partitions.len());
-    for p in partitions {
-        uploader
-            .put(&p.key, &p.bytes)
-            .map_err(|message| PipelineError::PartitionUploadFailed {
-                key: p.key.clone(),
-                message,
-            })?;
-        uploaded.push(p.key.clone());
-    }
-    Ok(uploaded)
+    let keys: Vec<PlSmallStr> = table.partition_keys.iter().map(|k| PlSmallStr::from_str(k)).collect();
+    df.select(keys)
+        .and_then(|k| k.unique_stable(None, UniqueKeepStrategy::First, None))
+        .map(|u| u.height())
+        .map_err(|e| PipelineError::polars("<partition>", e))
 }
 
 #[cfg(test)]
@@ -891,7 +751,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // produce_partitions
+    // count_partitions and dedup_rows
     // -----------------------------------------------------------------------
 
     /// Build a minimal AnalyticTable for tests.
@@ -905,19 +765,6 @@ mod tests {
         }
     }
 
-    /// Build a mapping targeting `table_id`. The columns list is empty
-    /// because these tests operate on DataFrames built by hand.
-    fn test_mapping(table_id: &str) -> Mapping {
-        Mapping {
-            id: "m".into(),
-            name: String::new(),
-            source_container_id: "src".into(),
-            where_: None,
-            analytic_table_id: table_id.into(),
-            columns: vec![],
-        }
-    }
-
     /// DataFrame with int64 `year`/`month` key columns plus a `v` payload.
     fn df_with_keys(rows: &[(i64, i64, &str)]) -> DataFrame {
         let years: Vec<i64> = rows.iter().map(|r| r.0).collect();
@@ -927,94 +774,24 @@ mod tests {
     }
 
     #[test]
-    fn produce_partitions_no_partitioning() {
-        let df = df_with_keys(&[(2024, 1, "a"), (2024, 2, "b")]);
-        let table = test_table("orders", &[], &[]);
-        let mapping = test_mapping("orders");
-
-        let outs = produce_partitions(&df, &mapping, &table).unwrap();
-        assert_eq!(outs.len(), 1);
-        assert_eq!(outs[0].key, "orders/m.parquet");
-        assert_eq!(&outs[0].bytes[..4], b"PAR1");
-    }
-
-    #[test]
-    fn produce_partitions_groups_by_key_tuple_and_drops_key_columns() {
+    fn count_partitions_counts_distinct_key_tuples() {
         let df = df_with_keys(&[(2024, 1, "a"), (2024, 2, "b"), (2024, 2, "c")]);
-        let table = test_table("transactions", &["year", "month"], &[]);
-        let mapping = test_mapping("transactions");
-
-        let outs = produce_partitions(&df, &mapping, &table).unwrap();
-        assert_eq!(outs.len(), 2, "expected 2 partitions, got {}", outs.len());
-
-        let keys: Vec<&String> = outs.iter().map(|o| &o.key).collect();
-        assert!(keys.iter().any(|k| *k == "transactions/year=2024/month=1/m.parquet"), "{keys:?}");
-        assert!(keys.iter().any(|k| *k == "transactions/year=2024/month=2/m.parquet"), "{keys:?}");
-
-        // Key columns must not be inside the parquet payload; hive
-        // re-materializes them from the path on read.
-        for out in &outs {
-            let cursor = std::io::Cursor::new(out.bytes.clone());
-            let read = ParquetReader::new(cursor).finish().unwrap();
-            let names: Vec<String> = read
-                .get_column_names()
-                .iter()
-                .map(|n| n.to_string())
-                .collect();
-            assert_eq!(names, vec!["v".to_string()], "key columns leaked into {names:?}");
-        }
+        assert_eq!(count_partitions(&df, &test_table("t", &["year", "month"], &[])).unwrap(), 2);
+        assert_eq!(count_partitions(&df, &test_table("t", &["year"], &[])).unwrap(), 1);
+        assert_eq!(count_partitions(&df, &test_table("t", &[], &[])).unwrap(), 1);
+        assert_eq!(count_partitions(&df.head(Some(0)), &test_table("t", &[], &[])).unwrap(), 0);
     }
 
     #[test]
-    fn produce_partitions_encodes_values_per_type() {
-        // string keys percent-encode; bools render true/false.
-        let df = df![
-            "account" => ["visa gold", "chequing"],
-            "flag" => [true, false],
-            "v" => ["a", "b"]
-        ]
-        .unwrap();
-        let table = test_table("t", &["account", "flag"], &[]);
-        let outs = produce_partitions(&df, &test_mapping("t"), &table).unwrap();
-        let keys: Vec<&String> = outs.iter().map(|o| &o.key).collect();
-        assert!(
-            keys.iter().any(|k| *k == "t/account=visa%20gold/flag=true/m.parquet"),
-            "{keys:?}"
-        );
-        assert!(
-            keys.iter().any(|k| *k == "t/account=chequing/flag=false/m.parquet"),
-            "{keys:?}"
-        );
-    }
-
-    #[test]
-    fn produce_partitions_null_key_fails_with_column_and_count() {
+    fn count_partitions_null_key_fails_with_column_and_count() {
         let df = df![
             "year" => [Some(2024i64), None, None],
             "v" => ["a", "b", "c"]
         ]
         .unwrap();
-        let table = test_table("t", &["year"], &[]);
-        let err = produce_partitions(&df, &test_mapping("t"), &table).unwrap_err();
+        let err = count_partitions(&df, &test_table("t", &["year"], &[])).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("`year`") && msg.contains("2 null"), "{msg}");
-    }
-
-    #[test]
-    fn produce_partitions_distinct_keys_per_mapping() {
-        // Two mappings writing the same table at the same tuple must
-        // produce different keys, otherwise the second overwrites the first.
-        let df = df_with_keys(&[(2024, 1, "a")]);
-        let table = test_table("transactions", &["year", "month"], &[]);
-
-        let mut visa = test_mapping("transactions");
-        visa.id = "scotia_visa_mapping".into();
-        let mut chq = test_mapping("transactions");
-        chq.id = "scotia_chq_mapping".into();
-
-        let visa_key = produce_partitions(&df, &visa, &table).unwrap()[0].key.clone();
-        let chq_key = produce_partitions(&df, &chq, &table).unwrap()[0].key.clone();
-        assert_ne!(visa_key, chq_key);
     }
 
     #[test]
@@ -1044,104 +821,17 @@ mod tests {
     }
 
     proptest! {
-        // Output partitions cover exactly the distinct key tuples of the
-        // input frame, whatever the values are.
+        // The count equals the number of distinct key tuples, whatever the values are.
         #[test]
-        fn partitions_cover_distinct_tuples(
+        fn partition_count_matches_distinct_tuples(
             rows in proptest::collection::vec((2022i64..=2025, 1i64..=12), 1..=20),
         ) {
             let data: Vec<(i64, i64, &str)> =
                 rows.iter().map(|(y, m)| (*y, *m, "x")).collect();
             let df = df_with_keys(&data);
             let table = test_table("t", &["year", "month"], &[]);
-            let outs = produce_partitions(&df, &test_mapping("t"), &table).unwrap();
-
-            let mut got: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for out in &outs {
-                got.insert(out.key.clone());
-            }
-            let expected: std::collections::HashSet<String> = rows.iter()
-                .map(|(y, m)| format!("t/year={y}/month={m}/m.parquet"))
-                .collect();
-            prop_assert_eq!(got, expected);
+            let expected: std::collections::HashSet<(i64, i64)> = rows.iter().copied().collect();
+            prop_assert_eq!(count_partitions(&df, &table).unwrap(), expected.len());
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // upload_partitions, partition upload failures identify the bad key.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn upload_failure_identifies_partition() {
-        // Mock uploader that fails on one specific key.
-        struct MockUploader {
-            fail_on: String,
-        }
-        impl PartitionUploader for MockUploader {
-            fn put(&self, key: &str, _bytes: &[u8]) -> Result<(), String> {
-                if key == self.fail_on {
-                    Err("simulated S3 failure".to_string())
-                } else {
-                    Ok(())
-                }
-            }
-        }
-
-        let partitions = vec![
-            PartitionOutput {
-                key: "t/year=2024/month=01/a.parquet".into(),
-                bytes: vec![0u8],
-            },
-            PartitionOutput {
-                key: "t/year=2024/month=02/b.parquet".into(),
-                bytes: vec![0u8],
-            },
-            PartitionOutput {
-                key: "t/year=2024/month=03/c.parquet".into(),
-                bytes: vec![0u8],
-            },
-        ];
-        let uploader = MockUploader {
-            fail_on: "t/year=2024/month=02/b.parquet".into(),
-        };
-
-        let err = upload_partitions(&uploader, &partitions).unwrap_err();
-        match err {
-            PipelineError::PartitionUploadFailed { key, message } => {
-                assert_eq!(key, "t/year=2024/month=02/b.parquet");
-                assert!(
-                    message.contains("simulated"),
-                    "expected failure message to carry uploader's text; got `{message}`"
-                );
-            }
-            other => panic!("expected PartitionUploadFailed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn upload_success_returns_all_keys() {
-        // Happy path: every put succeeds → returned Vec lists every input
-        // key in declaration order. Guards against accidentally swallowing
-        // or reordering keys during the loop.
-        struct OkUploader;
-        impl PartitionUploader for OkUploader {
-            fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), String> {
-                Ok(())
-            }
-        }
-
-        let partitions = vec![
-            PartitionOutput {
-                key: "a.parquet".into(),
-                bytes: vec![0u8],
-            },
-            PartitionOutput {
-                key: "b.parquet".into(),
-                bytes: vec![0u8],
-            },
-        ];
-
-        let keys = upload_partitions(&OkUploader, &partitions).unwrap();
-        assert_eq!(keys, vec!["a.parquet".to_string(), "b.parquet".to_string()]);
     }
 }

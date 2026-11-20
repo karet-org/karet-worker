@@ -21,8 +21,6 @@ use crate::config::{self, ConfigError, PipelineConfig};
 pub struct AppState {
     /// Bucket for raw ingested CSV data.
     pub lake_bucket: String,
-    /// Bucket for query-ready partitioned Parquet output.
-    pub warehouse_bucket: String,
     pub s3_client: Option<aws_sdk_s3::Client>,
     /// Shared bearer token (`KARET_WORKER_TOKEN`) required on every
     /// mutating route. `/health` stays open for liveness probes.
@@ -106,6 +104,7 @@ pub fn router(state: AppState) -> Router {
     // unknown path, which broke RustFS's HEAD health probe of `/`.
     let protected = Router::new()
         .route("/config/validate", post(post_config_validate))
+        .route("/tables/restore", post(post_table_restore))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -497,6 +496,72 @@ fn error_response(
         .into_response()
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RestoreRequest {
+    pipeline: String,
+    table: String,
+    version: i64,
+}
+
+/// `POST /tables/restore`: make an earlier version of a table current. Holds
+/// the pipeline's run lock so it cannot interleave with a run; answers 409
+/// while a run holds it.
+async fn post_table_restore(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RestoreRequest>,
+) -> axum::response::Response {
+    let Some(queue) = state.queue.clone() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "no queue configured", Vec::new());
+    };
+    let mut conn = match crate::queue::connect(&queue.client).await {
+        Ok(c) => c,
+        Err(e) => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", &format!("redis: {e}"), Vec::new())
+        }
+    };
+    let fence = format!("restore-{}:0", uuid::Uuid::new_v4());
+    match crate::queue::try_lock(&mut conn, &req.pipeline, &fence, queue.settings.lock_ttl_ms).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "pipeline_busy",
+                "the pipeline is running; restore once the run finishes",
+                Vec::new(),
+            )
+        }
+        Err(e) => {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", &format!("redis: {e}"), Vec::new())
+        }
+    }
+    let lake = queue.job_ctx.lake.clone();
+    let (pipeline, table, version) = (req.pipeline.clone(), req.table.clone(), req.version);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = lake.connection().map_err(crate::lake::RestoreError::Failed)?;
+        crate::lake::restore(&conn, &pipeline, &table, version)
+    })
+    .await;
+    if let Err(e) = crate::queue::release_lock(&mut conn, &req.pipeline, &fence).await {
+        tracing::warn!(pipeline = %req.pipeline, "restore lock release failed: {e}");
+    }
+    match result {
+        Ok(Ok(snapshot)) => {
+            tracing::info!(pipeline = %req.pipeline, table = %req.table, from = req.version, snapshot, "restored table version");
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true, "version": snapshot }))).into_response()
+        }
+        Ok(Err(crate::lake::RestoreError::NotFound(v))) => error_response(
+            StatusCode::NOT_FOUND,
+            "version_not_found",
+            &format!("version {v} of this table is not retained"),
+            Vec::new(),
+        ),
+        Ok(Err(crate::lake::RestoreError::Failed(e))) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "restore_failed", &e, Vec::new())
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "restore_failed", &e.to_string(), Vec::new()),
+    }
+}
+
 /// Convert a [`ConfigError`] into the `/config/validate` error shape.
 fn error_to_json(err: &ConfigError) -> serde_json::Value {
     let (kind, path) = match err {
@@ -535,7 +600,6 @@ mod tests {
         AppState {
             routing: Arc::new(tokio::sync::RwLock::new(RoutingCache::default())),
             lake_bucket: "karet-lake".into(),
-            warehouse_bucket: "karet-warehouse".into(),
             s3_client: None,
             auth_token: TEST_TOKEN.into(),
             queue: None,
