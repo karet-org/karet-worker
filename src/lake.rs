@@ -35,9 +35,11 @@ pub const RECORDS_TABLE: &str = "_karet_sources";
 const METADATA: &str = "\"__ducklake_metadata_lake\".\"ducklake\"";
 /// Data-changing snapshots kept per table, for time travel and restore.
 pub const RETAINED_VERSIONS: usize = 10;
-/// Files at or above this size are left alone by the merge after each run, so a
-/// large table is not rewritten to absorb a few new rows.
-const MERGE_MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
+/// Files at or above this size are left alone by the merge after each run.
+/// It must stay well below the size of a table's main file: at 8 MB, a 7 MB
+/// partition was rewritten by every 10-minute append. Small appends still
+/// merge with each other until their file reaches this size.
+const MERGE_MAX_FILE_SIZE: u64 = 1024 * 1024;
 /// Keys of a snapshot's `changes` map that mean a table's rows changed.
 const DATA_CHANGES: &[&str] = &["tables_inserted_into", "tables_deleted_from", "inlined_insert", "inlined_delete"];
 

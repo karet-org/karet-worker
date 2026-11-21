@@ -297,3 +297,41 @@ fn dropping_a_pipeline_removes_its_tables_and_releases_its_files() {
     // Dropping a pipeline that never ran is not an error.
     lake::drop_pipeline(&f.conn, "never-ran").unwrap();
 }
+
+#[test]
+fn the_merge_after_an_append_leaves_a_large_file_alone() {
+    // An append writes a small file; merging it into a multi-megabyte file
+    // would rewrite the whole table on every run.
+    let f = Fixture::new();
+    let flat = AnalyticTable { partition_keys: vec![], dedup_keys: vec![], ..table() };
+    let commit = |file: &Path, replace: bool| {
+        lake::commit_table(
+            &f.conn,
+            &Commit {
+                pipeline: "p-1",
+                table: &flat,
+                writes: &[write("m", file, replace)],
+                records: &HashMap::new(),
+                clean: false,
+                job_id: None,
+            },
+        )
+        .unwrap()
+    };
+    let big = f.stage("big", "SELECT md5(i::VARCHAR) || md5((i + 1)::VARCHAR) AS k, md5(i::VARCHAR) AS v FROM range(60000) r(i)");
+    commit(&big, true);
+    let files = || f.rows("SELECT data_file FROM ducklake_list_files('lake', 't', schema => 'p-1')");
+    let before = files();
+    let size = f.rows("SELECT max(data_file_size_bytes)::VARCHAR FROM ducklake_list_files('lake', 't', schema => 'p-1')");
+    assert!(size[0].parse::<u64>().unwrap() > 2 * 1024 * 1024, "fixture file is only {} bytes", size[0]);
+    for i in 0..3 {
+        let small = f.stage(&format!("s{i}"), &format!("SELECT 'n{i}-' || j AS k, 'v' AS v FROM range(50) r(j)"));
+        commit(&small, false);
+        lake::maintain(&f.conn, "p-1", "t").unwrap();
+    }
+    let after = files();
+    for file in &before {
+        assert!(after.contains(file), "{file} was rewritten by the merge");
+    }
+    assert_eq!(after.len(), before.len() + 1, "the small appends were merged into one file: {after:?}");
+}

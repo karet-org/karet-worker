@@ -75,7 +75,7 @@ each mapping's incremental-run record, written in the same transaction as the
 rows. It is per pipeline so that runs of different pipelines, which do not
 share a lock, never write the same table.
 
-After each commit the worker merges the table's files under 8 MB, expires
+After each commit the worker merges the table's files under 1 MB, expires
 snapshots outside the last 10 that changed each existing table's rows, and deletes data
 files no retained snapshot reads once they are an hour old.
 
