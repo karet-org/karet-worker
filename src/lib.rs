@@ -106,7 +106,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &std::env::var("AWS_SECRET_ACCESS_KEY").expect("checked above"),
         &std::env::var("AWS_REGION").expect("checked above"),
     )?;
-    let lake = std::sync::Arc::new(lake::Lake::new(lake::LakeCatalog::Postgres(lake_settings)));
+    let lake = std::sync::Arc::new(lake::Lake::with_resources(
+        lake::LakeCatalog::Postgres(lake_settings),
+        lake::Resources::from_env(),
+    ));
     let db_pool = db::connect(&database_url).await.map_err(|e| {
         tracing::error!("cannot reach the database at startup: {e}");
         e

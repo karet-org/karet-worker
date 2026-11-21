@@ -40,6 +40,50 @@ pub const RETAINED_VERSIONS: usize = 10;
 /// partition was rewritten by every 10-minute append. Small appends still
 /// merge with each other until their file reaches this size.
 const MERGE_MAX_FILE_SIZE: u64 = 1024 * 1024;
+/// Inserts of 10 rows or fewer are stored in the catalog rather than in a
+/// Parquet file. Once a table has this many such rows, maintenance writes
+/// them out, so they do not pile up in Postgres.
+pub const FLUSH_INLINED_ROWS: usize = 1000;
+
+/// What the worker's DuckDB may use, beside Polars in the same process.
+#[derive(Debug, Clone)]
+pub struct Resources {
+    pub memory_limit: String,
+    pub threads: usize,
+    /// Where extensions are installed. The image sets this to the copies it
+    /// ships, so a job never downloads an extension.
+    pub extension_directory: Option<String>,
+}
+
+impl Default for Resources {
+    fn default() -> Self {
+        Self { memory_limit: "1GB".into(), threads: 2, extension_directory: None }
+    }
+}
+
+impl Resources {
+    /// `DUCKDB_MEMORY_LIMIT`, `DUCKDB_THREADS` and `DUCKDB_EXTENSION_DIRECTORY`.
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        Self {
+            memory_limit: var("DUCKDB_MEMORY_LIMIT").unwrap_or(default.memory_limit),
+            threads: var("DUCKDB_THREADS").and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(default.threads),
+            extension_directory: var("DUCKDB_EXTENSION_DIRECTORY"),
+        }
+    }
+
+    fn setup_sql(&self) -> Vec<String> {
+        let mut out = vec![
+            format!("SET memory_limit = {}", lit(&self.memory_limit)),
+            format!("SET threads = {}", self.threads),
+        ];
+        if let Some(dir) = &self.extension_directory {
+            out.push(format!("SET extension_directory = {}", lit(dir)));
+        }
+        out
+    }
+}
 /// Keys of a snapshot's `changes` map that mean a table's rows changed.
 const DATA_CHANGES: &[&str] = &["tables_inserted_into", "tables_deleted_from", "inlined_insert", "inlined_delete"];
 
@@ -173,19 +217,24 @@ fn percent_decode(s: &str) -> Result<String, String> {
 /// connection from it.
 pub struct Lake {
     catalog: LakeCatalog,
+    resources: Resources,
     base: Mutex<Option<Connection>>,
 }
 
 impl Lake {
     pub fn new(catalog: LakeCatalog) -> Self {
-        Self { catalog, base: Mutex::new(None) }
+        Self::with_resources(catalog, Resources::default())
+    }
+
+    pub fn with_resources(catalog: LakeCatalog, resources: Resources) -> Self {
+        Self { catalog, resources, base: Mutex::new(None) }
     }
 
     pub fn connection(&self) -> Result<Connection, String> {
         let mut base = self.base.lock().map_err(|_| "lake connection poisoned".to_string())?;
         if base.is_none() {
             let conn = Connection::open_in_memory().map_err(|e| format!("open DuckDB: {e}"))?;
-            for stmt in self.catalog.setup_sql() {
+            for stmt in self.resources.setup_sql().into_iter().chain(self.catalog.setup_sql()) {
                 conn.execute_batch(&stmt).map_err(|e| format!("lake setup: {e}"))?;
             }
             *base = Some(conn);
@@ -588,8 +637,47 @@ pub fn snapshots_to_expire(snapshots: &[(i64, BTreeSet<i64>)], live: &BTreeSet<i
     snapshots.iter().map(|(id, _)| *id).filter(|id| !kept.contains(id)).collect()
 }
 
-/// Merge the table's small files, then [`expire`].
+/// Rows of the table stored in the catalog that no later snapshot deleted.
+fn inlined_rows(conn: &Connection, pipeline: &str, table_id: &str) -> Result<usize, String> {
+    let Some(id) = table_id_in_catalog(conn, pipeline, table_id)? else {
+        return Ok(0);
+    };
+    let mut stmt = conn
+        .prepare(&format!("SELECT table_name FROM {METADATA}.ducklake_inlined_data_tables WHERE table_id = ?"))
+        .map_err(err("list inlined tables"))?;
+    let names = stmt
+        .query_map([id], |r| r.get::<_, String>(0))
+        .map_err(err("list inlined tables"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err("list inlined tables"))?;
+    let mut total = 0;
+    for name in names {
+        total += count(conn, &format!("SELECT count(*) FROM {METADATA}.{} WHERE end_snapshot IS NULL", ident(&name)))?;
+    }
+    Ok(total)
+}
+
+/// Write the table's catalog-stored rows to Parquet once there are at least
+/// `min_rows`. Returns the rows written.
+pub fn flush_inlined(conn: &Connection, pipeline: &str, table_id: &str, min_rows: usize) -> Result<usize, String> {
+    let rows = inlined_rows(conn, pipeline, table_id)?;
+    if rows == 0 || rows < min_rows {
+        return Ok(0);
+    }
+    conn.execute_batch(&format!(
+        "CALL ducklake_flush_inlined_data({}, schema_name => {}, table_name => {})",
+        lit(CATALOG),
+        lit(pipeline),
+        lit(table_id),
+    ))
+    .map_err(err("flush inlined rows"))?;
+    Ok(rows)
+}
+
+/// Write out piled-up catalog-stored rows, merge the table's small files,
+/// then [`expire`].
 pub fn maintain(conn: &Connection, pipeline: &str, table_id: &str) -> Result<usize, String> {
+    flush_inlined(conn, pipeline, table_id, FLUSH_INLINED_ROWS)?;
     conn.execute_batch(&format!(
         "CALL ducklake_merge_adjacent_files({}, {}, schema => {}, max_file_size => {MERGE_MAX_FILE_SIZE})",
         lit(CATALOG),

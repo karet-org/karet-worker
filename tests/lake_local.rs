@@ -335,3 +335,38 @@ fn the_merge_after_an_append_leaves_a_large_file_alone() {
     }
     assert_eq!(after.len(), before.len() + 1, "the small appends were merged into one file: {after:?}");
 }
+
+#[test]
+fn rows_stored_in_the_catalog_are_written_out_once_they_pile_up() {
+    // Inserts of 10 rows or fewer go into the catalog, not a Parquet file.
+    let f = Fixture::new();
+    for i in 0..3 {
+        let file = f.stage(&format!("r{i}"), &format!("SELECT 'k{i}-' || j AS k, 'v' AS v FROM range(2) r(j)"));
+        f.commit(&[write("m", &file, false)], &HashMap::new(), false).unwrap();
+    }
+    let files = || f.rows("SELECT count(*)::VARCHAR FROM ducklake_list_files('lake', 't', schema => 'p-1')");
+    assert_eq!(files(), vec!["0"]);
+    assert_eq!(lake::flush_inlined(&f.conn, "p-1", "t", 100).unwrap(), 0, "below the threshold");
+    assert_eq!(files(), vec!["0"]);
+    assert_eq!(lake::flush_inlined(&f.conn, "p-1", "t", 5).unwrap(), 6);
+    assert_ne!(files(), vec!["0"]);
+    assert_eq!(f.table_rows().len(), 6);
+    assert_eq!(lake::flush_inlined(&f.conn, "p-1", "t", 1).unwrap(), 0, "nothing left in the catalog");
+}
+
+#[test]
+fn the_resource_limits_apply_to_the_lake_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("lake")).unwrap();
+    let resources = lake::Resources { memory_limit: "512MB".into(), threads: 3, extension_directory: None };
+    let lake = Lake::with_resources(LakeCatalog::Local(dir.path().join("lake")), resources);
+    let conn = lake.connection().unwrap();
+    let get = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap();
+    let expected = {
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch("SET memory_limit = '512MB'").unwrap();
+        fresh.query_row("SELECT current_setting('memory_limit')", [], |r| r.get::<_, String>(0)).unwrap()
+    };
+    assert_eq!(get("SELECT current_setting('memory_limit')"), expected);
+    assert_eq!(get("SELECT current_setting('threads')::VARCHAR"), "3");
+}
