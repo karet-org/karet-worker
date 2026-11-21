@@ -105,6 +105,7 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/config/validate", post(post_config_validate))
         .route("/tables/restore", post(post_table_restore))
+        .route("/pipelines/drop", post(post_pipeline_drop))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -503,62 +504,95 @@ struct RestoreRequest {
     version: i64,
 }
 
-/// `POST /tables/restore`: make an earlier version of a table current. Holds
-/// the pipeline's run lock so it cannot interleave with a run; answers 409
-/// while a run holds it.
+#[derive(Debug, serde::Deserialize)]
+struct DropRequest {
+    pipeline: String,
+}
+
+/// Run `f` on the blocking pool with a lake connection, holding the
+/// pipeline's run lock so it cannot interleave with a run. Answers 409 while a
+/// run holds the lock.
+async fn with_run_lock<T: Send + 'static>(
+    state: &AppState,
+    pipeline: &str,
+    f: impl FnOnce(&duckdb::Connection) -> T + Send + 'static,
+) -> Result<T, axum::response::Response> {
+    let unavailable =
+        |msg: String| error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", &msg, Vec::new());
+    let Some(queue) = state.queue.clone() else {
+        return Err(unavailable("no queue configured".into()));
+    };
+    let mut conn = crate::queue::connect(&queue.client).await.map_err(|e| unavailable(format!("redis: {e}")))?;
+    let fence = format!("admin-{}:0", uuid::Uuid::new_v4());
+    match crate::queue::try_lock(&mut conn, pipeline, &fence, queue.settings.lock_ttl_ms).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "pipeline_busy",
+                "the pipeline is running; try again once the run finishes",
+                Vec::new(),
+            ))
+        }
+        Err(e) => return Err(unavailable(format!("redis: {e}"))),
+    }
+    let lake = queue.job_ctx.lake.clone();
+    let result = tokio::task::spawn_blocking(move || lake.connection().map(|c| f(&c))).await;
+    if let Err(e) = crate::queue::release_lock(&mut conn, pipeline, &fence).await {
+        tracing::warn!(pipeline, "run lock release failed: {e}");
+    }
+    let internal = |msg: String| error_response(StatusCode::INTERNAL_SERVER_ERROR, "lake_error", &msg, Vec::new());
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(internal(e)),
+        Err(e) => Err(internal(e.to_string())),
+    }
+}
+
+/// `POST /tables/restore`: make an earlier version of a table current.
 async fn post_table_restore(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RestoreRequest>,
 ) -> axum::response::Response {
-    let Some(queue) = state.queue.clone() else {
-        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "no queue configured", Vec::new());
-    };
-    let mut conn = match crate::queue::connect(&queue.client).await {
-        Ok(c) => c,
-        Err(e) => {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", &format!("redis: {e}"), Vec::new())
-        }
-    };
-    let fence = format!("restore-{}:0", uuid::Uuid::new_v4());
-    match crate::queue::try_lock(&mut conn, &req.pipeline, &fence, queue.settings.lock_ttl_ms).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return error_response(
-                StatusCode::CONFLICT,
-                "pipeline_busy",
-                "the pipeline is running; restore once the run finishes",
-                Vec::new(),
-            )
-        }
-        Err(e) => {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", &format!("redis: {e}"), Vec::new())
-        }
-    }
-    let lake = queue.job_ctx.lake.clone();
     let (pipeline, table, version) = (req.pipeline.clone(), req.table.clone(), req.version);
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = lake.connection().map_err(crate::lake::RestoreError::Failed)?;
-        crate::lake::restore(&conn, &pipeline, &table, version)
+    let result = match with_run_lock(&state, &req.pipeline, move |c| {
+        crate::lake::restore(c, &pipeline, &table, version)
     })
-    .await;
-    if let Err(e) = crate::queue::release_lock(&mut conn, &req.pipeline, &fence).await {
-        tracing::warn!(pipeline = %req.pipeline, "restore lock release failed: {e}");
-    }
+    .await
+    {
+        Ok(r) => r,
+        Err(response) => return response,
+    };
     match result {
-        Ok(Ok(snapshot)) => {
+        Ok(snapshot) => {
             tracing::info!(pipeline = %req.pipeline, table = %req.table, from = req.version, snapshot, "restored table version");
             (StatusCode::OK, Json(serde_json::json!({ "ok": true, "version": snapshot }))).into_response()
         }
-        Ok(Err(crate::lake::RestoreError::NotFound(v))) => error_response(
+        Err(crate::lake::RestoreError::NotFound(v)) => error_response(
             StatusCode::NOT_FOUND,
             "version_not_found",
             &format!("version {v} of this table is not retained"),
             Vec::new(),
         ),
-        Ok(Err(crate::lake::RestoreError::Failed(e))) => {
+        Err(crate::lake::RestoreError::Failed(e)) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "restore_failed", &e, Vec::new())
         }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "restore_failed", &e.to_string(), Vec::new()),
+    }
+}
+
+/// `POST /pipelines/drop`: remove a deleted pipeline's tables from the lake.
+async fn post_pipeline_drop(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DropRequest>,
+) -> axum::response::Response {
+    let pipeline = req.pipeline.clone();
+    match with_run_lock(&state, &req.pipeline, move |c| crate::lake::drop_pipeline(c, &pipeline)).await {
+        Ok(Ok(())) => {
+            tracing::info!(pipeline = %req.pipeline, "dropped pipeline tables");
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "drop_failed", &e, Vec::new()),
+        Err(response) => response,
     }
 }
 
