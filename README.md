@@ -70,16 +70,18 @@ The Redis stream is the only job transport:
 Each pipeline is a DuckLake schema named after its slug, and each analytic
 table a DuckLake table. The `_karet_mapping` column names the mapping that
 wrote a row and is the first partition key, so a mapping's full run replaces
-only its own files. The `_karet.table_sources` table holds each mapping's
-incremental-run record, written in the same transaction as the rows.
+only its own files. The `_karet_sources` table in each pipeline schema holds
+each mapping's incremental-run record, written in the same transaction as the
+rows. It is per pipeline so that runs of different pipelines, which do not
+share a lock, never write the same table.
 
 After each commit the worker merges the table's files under 8 MB, expires
-snapshots outside the last 10 that changed each table's rows, and deletes data
+snapshots outside the last 10 that changed each existing table's rows, and deletes data
 files no retained snapshot reads once they are an hour old.
 
 ## HTTP API
 
-`POST /config/validate` and `POST /tables/restore` require an
+`POST /config/validate`, `POST /tables/restore` and `POST /pipelines/drop` require an
 `Authorization: Bearer $KARET_WORKER_TOKEN` header; `POST /events/s3`
 enforces the webhook secret; `GET /health` is open for liveness probes.
 
@@ -88,6 +90,7 @@ enforces the webhook secret; `GET /health` is open for liveness probes.
 | `GET` | `/health` | Liveness/readiness: Redis status, queue depth, in-flight count |
 | `POST` | `/config/validate` | Validate a candidate `Pipeline_Config` body |
 | `POST` | `/tables/restore` | `{pipeline, table, version}`: make a retained version current, as a new snapshot. 409 while the pipeline runs. |
+| `POST` | `/pipelines/drop` | `{pipeline}`: drop a deleted pipeline's schema and release its files. 409 while the pipeline runs. |
 | `POST` | `/events/s3` | RustFS object-created notifications (debounced into job runs) |
 
 ## Development

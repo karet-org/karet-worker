@@ -211,3 +211,66 @@ async fn runs_write_ducklake_and_append_only_new_files() {
     assert_eq!(after.files_processed, 3);
     assert_eq!(stack.rows().len(), 4);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run with `cargo test --test integration_lake -- --ignored`"]
+async fn pipelines_commit_at_the_same_time_with_a_postgres_catalog() {
+    let stack = start().await;
+    let lake = stack.ctx.lake.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let table = karet_worker::config::AnalyticTable {
+        id: "t".into(),
+        name: "t".into(),
+        schema: vec![],
+        partition_keys: vec![],
+        dedup_keys: vec!["k".into()],
+    };
+    let setup = lake.connection().unwrap();
+    let mut files = Vec::new();
+    for i in 0..4 {
+        let path = dir.path().join(format!("{i}.parquet"));
+        setup
+            .execute_batch(&format!("COPY (SELECT 'a' AS k, {i} AS v) TO '{}' (FORMAT parquet)", path.display()))
+            .unwrap();
+        files.push(path);
+    }
+    for round in 0..5 {
+        let barrier = Arc::new(std::sync::Barrier::new(files.len()));
+        let handles: Vec<_> = files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| {
+                let (lake, barrier, file, table) = (lake.clone(), barrier.clone(), file.clone(), table.clone());
+                std::thread::spawn(move || {
+                    let conn = lake.connection().unwrap();
+                    let pipeline = format!("p-{i}");
+                    let records = std::collections::HashMap::from([(
+                        "m".to_string(),
+                        karet_worker::incremental::MappingSources {
+                            mapping_id: "m".into(),
+                            fingerprint: "fp".into(),
+                            files: vec![],
+                        },
+                    )]);
+                    barrier.wait();
+                    lake::commit_table(
+                        &conn,
+                        &lake::Commit {
+                            pipeline: &pipeline,
+                            table: &table,
+                            writes: &[lake::Write { mapping_id: "m", file: &file, replace: true }],
+                            records: &records,
+                            clean: false,
+                            job_id: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Err(e) = h.join().unwrap() {
+                panic!("round {round}: {e}");
+            }
+        }
+    }
+}

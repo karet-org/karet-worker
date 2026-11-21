@@ -208,3 +208,92 @@ fn maintenance_keeps_the_current_rows() {
     lake::maintain(&f.conn, "p-1", "t").unwrap();
     assert_eq!(f.table_rows(), vec!["m|k0|v", "m|k1|v", "m|k2|v"]);
 }
+
+#[test]
+fn runs_of_different_pipelines_can_commit_at_the_same_time() {
+    // Only runs of the same pipeline share the run lock, so two pipelines'
+    // commits must not conflict with each other.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("lake")).unwrap();
+    let lake = std::sync::Arc::new(Lake::new(LakeCatalog::Local(dir.path().join("lake"))));
+    let setup = lake.connection().unwrap();
+    let stage = |name: &str| {
+        let path = dir.path().join(format!("{name}.parquet"));
+        setup.execute_batch(&format!("COPY ({AB}) TO '{}' (FORMAT parquet)", path.display())).unwrap();
+        path
+    };
+    let files: Vec<PathBuf> = (0..4).map(|i| stage(&format!("p{i}"))).collect();
+    for round in 0..5 {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(files.len()));
+        let handles: Vec<_> = files
+            .iter()
+            .enumerate()
+            .map(|(i, file)| {
+                let (lake, barrier, file) = (lake.clone(), barrier.clone(), file.clone());
+                std::thread::spawn(move || {
+                    let conn = lake.connection().unwrap();
+                    let pipeline = format!("p-{i}");
+                    barrier.wait();
+                    lake::commit_table(
+                        &conn,
+                        &Commit {
+                            pipeline: &pipeline,
+                            table: &table(),
+                            writes: &[write("m", &file, true)],
+                            records: &record("m", &["one.csv"]),
+                            clean: false,
+                            job_id: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Err(e) = h.join().unwrap() {
+                panic!("round {round}: {e}");
+            }
+        }
+    }
+    for i in 0..files.len() {
+        let records = lake::read_records(&setup, &format!("p-{i}"), "t").unwrap();
+        assert_eq!(records.len(), 1);
+    }
+}
+
+#[test]
+fn the_files_of_a_recreated_table_are_released() {
+    // A clean run with changed columns recreates the table under a new
+    // DuckLake id; the old table's snapshots must still be expired so its
+    // files can be deleted. 100 rows, so they are written to Parquet rather
+    // than stored in the catalog.
+    let f = Fixture::new();
+    let a = f.stage("a", "SELECT 'k' || i AS k, 'v' AS v FROM range(100) r(i)");
+    f.commit(&[write("m", &a, true)], &HashMap::new(), false).unwrap();
+    let b = f.stage("b", "SELECT 'k' || i AS k, i AS v FROM range(100) r(i)");
+    f.commit(&[write("m", &b, true)], &HashMap::new(), true).unwrap();
+    lake::maintain(&f.conn, "p-1", "t").unwrap();
+    let scheduled = f.rows(
+        "SELECT count(*)::VARCHAR FROM \"__ducklake_metadata_lake\".\"ducklake\".ducklake_files_scheduled_for_deletion",
+    );
+    assert_ne!(scheduled, vec!["0"], "the dropped table's files are still held by a snapshot");
+    assert_eq!(f.rows("SELECT count(*)::VARCHAR FROM lake.\"p-1\".t"), vec!["100"]);
+}
+
+#[test]
+fn dropping_a_pipeline_removes_its_tables_and_releases_its_files() {
+    let f = Fixture::new();
+    let a = f.stage("a", "SELECT 'k' || i AS k, 'v' AS v FROM range(100) r(i)");
+    f.commit(&[write("m", &a, true)], &record("m", &["one.csv"]), false).unwrap();
+    lake::drop_pipeline(&f.conn, "p-1").unwrap();
+    assert_eq!(
+        f.rows("SELECT count(*)::VARCHAR FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 'p-1'"),
+        vec!["0"]
+    );
+    assert!(lake::read_records(&f.conn, "p-1", "t").unwrap().is_empty());
+    let scheduled = f.rows(
+        "SELECT count(*)::VARCHAR FROM \"__ducklake_metadata_lake\".\"ducklake\".ducklake_files_scheduled_for_deletion",
+    );
+    assert_ne!(scheduled, vec!["0"]);
+    // Dropping a pipeline that never ran is not an error.
+    lake::drop_pipeline(&f.conn, "never-ran").unwrap();
+}

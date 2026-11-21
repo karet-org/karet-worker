@@ -8,6 +8,11 @@
 //! key, which keeps every Parquet file to one mapping, so replacing a mapping
 //! drops whole files instead of writing delete files.
 //!
+//! Each pipeline schema also holds [`RECORDS_TABLE`], the incremental-run
+//! records of its tables. It is per pipeline because only runs of the same
+//! pipeline share a run lock: two pipelines writing one shared table would
+//! conflict and one commit would be lost.
+//!
 //! A run commits one DuckLake transaction per table. A table version shown in
 //! the web app is the id of a snapshot that changed the table's rows.
 //!
@@ -24,8 +29,9 @@ use crate::incremental::MappingSources;
 
 pub const CATALOG: &str = "lake";
 pub const MAPPING_COLUMN: &str = "_karet_mapping";
-/// Holds the incremental-run records, see [`read_records`].
-const INTERNAL_SCHEMA: &str = "_karet";
+/// Table in each pipeline schema holding the incremental-run records, see
+/// [`read_records`]. The prefix keeps it apart from analytic table ids.
+pub const RECORDS_TABLE: &str = "_karet_sources";
 const METADATA: &str = "\"__ducklake_metadata_lake\".\"ducklake\"";
 /// Data-changing snapshots kept per table, for time travel and restore.
 pub const RETAINED_VERSIONS: usize = 10;
@@ -90,7 +96,7 @@ impl LakeSettings {
 
     /// The statements that load the extensions and attach the catalog.
     fn setup_sql(&self) -> Vec<String> {
-        let mut out = vec![
+        vec![
             "INSTALL ducklake; LOAD ducklake; INSTALL postgres; LOAD postgres; INSTALL httpfs; LOAD httpfs".into(),
             "SET allow_persistent_secrets = false".into(),
             format!(
@@ -113,9 +119,7 @@ impl LakeSettings {
                 "ATTACH 'ducklake:postgres:' AS {CATALOG} (DATA_PATH {}, METADATA_SCHEMA 'ducklake', META_SECRET 'karet_lake_pg')",
                 lit(&format!("s3://{}/lake/", self.warehouse_bucket)),
             ),
-        ];
-        out.extend(internal_sql());
-        out
+        ]
     }
 }
 
@@ -132,29 +136,17 @@ impl LakeCatalog {
         match self {
             LakeCatalog::Postgres(settings) => settings.setup_sql(),
             LakeCatalog::Local(dir) => {
-                let mut out = vec![
+                vec![
                     "INSTALL ducklake; LOAD ducklake".to_string(),
                     format!(
                         "ATTACH {} AS {CATALOG} (DATA_PATH {}, METADATA_SCHEMA 'ducklake')",
                         lit(&format!("ducklake:{}", dir.join("catalog.ducklake").display())),
                         lit(&format!("{}/", dir.join("data").display())),
                     ),
-                ];
-                out.extend(internal_sql());
-                out
+                ]
             }
         }
     }
-}
-
-fn internal_sql() -> Vec<String> {
-    vec![
-        format!("CREATE SCHEMA IF NOT EXISTS {CATALOG}.{}", ident(INTERNAL_SCHEMA)),
-        format!(
-            "CREATE TABLE IF NOT EXISTS {} (pipeline VARCHAR, table_id VARCHAR, mapping_id VARCHAR, fingerprint VARCHAR, files VARCHAR)",
-            records_table(),
-        ),
-    ]
 }
 
 fn percent_decode(s: &str) -> Result<String, String> {
@@ -214,8 +206,8 @@ fn table_ref(pipeline: &str, table_id: &str) -> String {
     format!("{CATALOG}.{}.{}", ident(pipeline), ident(table_id))
 }
 
-fn records_table() -> String {
-    format!("{CATALOG}.{}.\"table_sources\"", ident(INTERNAL_SCHEMA))
+fn records_table(pipeline: &str) -> String {
+    table_ref(pipeline, RECORDS_TABLE)
 }
 
 fn file_ref(path: &Path) -> String {
@@ -264,14 +256,17 @@ fn count(conn: &Connection, sql: &str) -> Result<usize, String> {
 /// Written in the same transaction as the table's rows, so a record always
 /// describes the rows that are stored.
 pub fn read_records(conn: &Connection, pipeline: &str, table_id: &str) -> Result<HashMap<String, MappingSources>, String> {
+    if table_columns(conn, pipeline, RECORDS_TABLE)?.is_none() {
+        return Ok(HashMap::new());
+    }
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT mapping_id, fingerprint, files FROM {} WHERE pipeline = ? AND table_id = ?",
-            records_table()
+            "SELECT mapping_id, fingerprint, files FROM {} WHERE table_id = ?",
+            records_table(pipeline)
         ))
         .map_err(err("read source records"))?;
     let rows = stmt
-        .query_map([pipeline, table_id], |r| {
+        .query_map([table_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
         })
         .map_err(err("read source records"))?
@@ -361,8 +356,13 @@ pub struct Commit<'a> {
 /// snapshot id that holds them.
 pub fn commit_table(conn: &Connection, commit: &Commit) -> Result<i64, String> {
     let wanted = wanted_columns(conn, commit.writes)?;
-    conn.execute_batch(&format!("CREATE SCHEMA IF NOT EXISTS {CATALOG}.{}", ident(commit.pipeline)))
-        .map_err(err("create schema"))?;
+    conn.execute_batch(&format!(
+        "CREATE SCHEMA IF NOT EXISTS {CATALOG}.{}; \
+         CREATE TABLE IF NOT EXISTS {} (table_id VARCHAR, mapping_id VARCHAR, fingerprint VARCHAR, files VARCHAR)",
+        ident(commit.pipeline),
+        records_table(commit.pipeline),
+    ))
+    .map_err(err("create schema"))?;
     let existing = table_columns(conn, commit.pipeline, &commit.table.id)?;
     conn.execute_batch("BEGIN TRANSACTION").map_err(err("begin"))?;
     match write_table(conn, commit, &wanted, existing) {
@@ -466,9 +466,8 @@ fn write_table(
     }
 
     exec(format!(
-        "DELETE FROM {} WHERE pipeline = {} AND table_id = {}",
-        records_table(),
-        lit(commit.pipeline),
+        "DELETE FROM {} WHERE table_id = {}",
+        records_table(commit.pipeline),
         lit(&commit.table.id),
     ))?;
     let mut records: Vec<&MappingSources> = commit.records.values().collect();
@@ -476,9 +475,8 @@ fn write_table(
     for r in records {
         let files = serde_json::to_string(&r.files).map_err(|e| format!("serialize source record: {e}"))?;
         exec(format!(
-            "INSERT INTO {} VALUES ({}, {}, {}, {}, {})",
-            records_table(),
-            lit(commit.pipeline),
+            "INSERT INTO {} VALUES ({}, {}, {}, {})",
+            records_table(commit.pipeline),
             lit(&commit.table.id),
             lit(&r.mapping_id),
             lit(&r.fingerprint),
@@ -554,16 +552,30 @@ pub fn table_versions(conn: &Connection, pipeline: &str, table_id: &str) -> Resu
     Ok(data_snapshots(conn)?.into_iter().filter(|(_, t)| t.contains(&id)).map(|(s, _)| s).collect())
 }
 
+/// DuckLake ids of the tables that exist now.
+fn live_table_ids(conn: &Connection) -> Result<BTreeSet<i64>, String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT table_id FROM {METADATA}.ducklake_table WHERE end_snapshot IS NULL"))
+        .map_err(err("list tables"))?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, i64>(0))
+        .map_err(err("list tables"))?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(err("list tables"))?;
+    Ok(ids)
+}
+
 /// Snapshots to expire: all but the latest, and the last `keep` that changed
-/// each table's rows.
-pub fn snapshots_to_expire(snapshots: &[(i64, BTreeSet<i64>)], keep: usize) -> Vec<i64> {
+/// the rows of each table in `live`. A dropped or recreated table keeps no
+/// snapshots, so its files can be deleted.
+pub fn snapshots_to_expire(snapshots: &[(i64, BTreeSet<i64>)], live: &BTreeSet<i64>, keep: usize) -> Vec<i64> {
     let mut kept: BTreeSet<i64> = BTreeSet::new();
     if let Some((latest, _)) = snapshots.iter().max_by_key(|(id, _)| *id) {
         kept.insert(*latest);
     }
     let mut per_table: HashMap<i64, Vec<i64>> = HashMap::new();
     for (id, tables) in snapshots {
-        for t in tables {
+        for t in tables.intersection(live) {
             per_table.entry(*t).or_default().push(*id);
         }
     }
@@ -574,9 +586,7 @@ pub fn snapshots_to_expire(snapshots: &[(i64, BTreeSet<i64>)], keep: usize) -> V
     snapshots.iter().map(|(id, _)| *id).filter(|id| !kept.contains(id)).collect()
 }
 
-/// Merge the table's small files, expire old snapshots and delete the files no
-/// retained snapshot reads. Files are deleted an hour after they stop being
-/// read, so a query that started on an older snapshot can finish.
+/// Merge the table's small files, then [`expire`].
 pub fn maintain(conn: &Connection, pipeline: &str, table_id: &str) -> Result<usize, String> {
     conn.execute_batch(&format!(
         "CALL ducklake_merge_adjacent_files({}, {}, schema => {}, max_file_size => {MERGE_MAX_FILE_SIZE})",
@@ -585,7 +595,14 @@ pub fn maintain(conn: &Connection, pipeline: &str, table_id: &str) -> Result<usi
         lit(pipeline),
     ))
     .map_err(err("merge files"))?;
-    let expire = snapshots_to_expire(&data_snapshots(conn)?, RETAINED_VERSIONS);
+    expire(conn)
+}
+
+/// Expire old snapshots and delete the files no retained snapshot reads.
+/// Files are deleted an hour after they stop being read, so a query that
+/// started on an older snapshot can finish. Returns the snapshots expired.
+pub fn expire(conn: &Connection) -> Result<usize, String> {
+    let expire = snapshots_to_expire(&data_snapshots(conn)?, &live_table_ids(conn)?, RETAINED_VERSIONS);
     if !expire.is_empty() {
         let list = expire.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
         conn.execute_batch(&format!("CALL ducklake_expire_snapshots({}, versions => [{list}])", lit(CATALOG)))
@@ -597,6 +614,24 @@ pub fn maintain(conn: &Connection, pipeline: &str, table_id: &str) -> Result<usi
     ))
     .map_err(err("delete old files"))?;
     Ok(expire.len())
+}
+
+/// Drop a deleted pipeline's schema with its tables and records, then
+/// expire the snapshots that read them so their files are deleted.
+pub fn drop_pipeline(conn: &Connection, pipeline: &str) -> Result<(), String> {
+    let exists = conn
+        .query_row(
+            "SELECT count(*) FROM duckdb_schemas() WHERE database_name = ? AND schema_name = ?",
+            [CATALOG, pipeline],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(err("find schema"))?;
+    if exists == 0 {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("DROP SCHEMA {CATALOG}.{} CASCADE", ident(pipeline)))
+        .map_err(err("drop schema"))?;
+    expire(conn).map(|_| ())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -628,12 +663,7 @@ pub fn restore(conn: &Connection, pipeline: &str, table_id: &str, version: i64) 
         let exec = |sql: String| conn.execute_batch(&sql).map_err(|e| format!("{sql}: {e}"));
         exec(format!("DELETE FROM {table}"))?;
         exec(format!("INSERT INTO {table} BY NAME SELECT * FROM {}", file_ref(&rows)))?;
-        exec(format!(
-            "DELETE FROM {} WHERE pipeline = {} AND table_id = {}",
-            records_table(),
-            lit(pipeline),
-            lit(table_id)
-        ))?;
+        exec(format!("DELETE FROM {} WHERE table_id = {}", records_table(pipeline), lit(table_id)))?;
         exec(format!("CALL {CATALOG}.set_commit_message('karet-worker', {})", lit(&format!("restore {version}"))))
     };
     conn.execute_batch("BEGIN TRANSACTION").map_err(|e| RestoreError::Failed(e.to_string()))?;
@@ -661,14 +691,21 @@ mod tests {
     fn keeps_the_latest_snapshots_of_each_table() {
         // Table 1 changes often, table 2 rarely: table 2's old versions stay.
         let s = snaps(&[(1, &[]), (2, &[2]), (3, &[1]), (4, &[1]), (5, &[1]), (6, &[])]);
-        assert_eq!(snapshots_to_expire(&s, 2), vec![1, 3]);
+        assert_eq!(snapshots_to_expire(&s, &BTreeSet::from([1, 2]), 2), vec![1, 3]);
+    }
+
+    #[test]
+    fn keeps_nothing_for_a_dropped_table() {
+        let s = snaps(&[(1, &[7]), (2, &[7]), (3, &[8])]);
+        assert_eq!(snapshots_to_expire(&s, &BTreeSet::from([8]), 10), vec![1, 2]);
     }
 
     #[test]
     fn always_keeps_the_latest_snapshot() {
         let s = snaps(&[(1, &[1]), (2, &[])]);
-        assert_eq!(snapshots_to_expire(&s, 1), Vec::<i64>::new());
-        assert_eq!(snapshots_to_expire(&s, 0), vec![1]);
+        let live = BTreeSet::from([1]);
+        assert_eq!(snapshots_to_expire(&s, &live, 1), Vec::<i64>::new());
+        assert_eq!(snapshots_to_expire(&s, &live, 0), vec![1]);
     }
 
     #[test]
