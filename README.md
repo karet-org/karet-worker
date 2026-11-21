@@ -39,6 +39,9 @@ Optional:
 | `JOB_LOCK_TTL_MS` | `90000` | Per-pipeline lock TTL. |
 | `HEARTBEAT_MS` | `30000` | How often a running job renews its lock. |
 | `DATABASE_POOL_MAX` | `4` | Postgres connections this worker opens. |
+| `DUCKDB_MEMORY_LIMIT` | `1GB` | Memory the worker's DuckDB may use, beside Polars. |
+| `DUCKDB_THREADS` | `2` | Threads the worker's DuckDB may use. |
+| `DUCKDB_EXTENSION_DIRECTORY` | DuckDB's default | Where the DuckDB extensions are installed. The image sets it to the copies it ships. |
 | `LAKE_DATABASE` | `karet_lake` | Postgres database holding the DuckLake catalog. The web app's setup creates it. |
 | `PORT` | `8080` | Port to serve on. |
 | `HOSTNAME` | `local` | Consumer name in the stream group; Docker sets it per container. |
@@ -75,7 +78,7 @@ each mapping's incremental-run record, written in the same transaction as the
 rows. It is per pipeline so that runs of different pipelines, which do not
 share a lock, never write the same table.
 
-After each commit the worker merges the table's files under 1 MB, expires
+After each commit the worker writes out a table's catalog-stored rows once there are 1,000 of them, merges the table's files under 1 MB, expires
 snapshots outside the last 10 that changed each existing table's rows, and deletes data
 files no retained snapshot reads once they are an hour old.
 
