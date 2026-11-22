@@ -1,7 +1,9 @@
 //! `karet-worker`, data pipeline worker for the Karet analytics platform.
 //!
-//! Reads `Pipeline_Config` from S3, ingests CSVs with Polars, evaluates
-//! AST-JSON mapping expressions, and writes partitioned Parquet to S3.
+//! Reads pipeline configs from Postgres, ingests source files from the lake
+//! bucket with Polars, evaluates AST-JSON mapping expressions, and writes the
+//! analytic tables to DuckLake: a catalog in Postgres, Parquet in the
+//! warehouse bucket.
 
 pub mod ast;
 pub mod assertions;
@@ -12,8 +14,8 @@ pub mod evaluator;
 pub mod http;
 pub mod job;
 pub mod incremental;
+pub mod lake;
 pub mod lake_poll;
-pub mod manifest;
 pub mod json_source;
 pub mod dimension;
 pub mod pipeline;
@@ -95,6 +97,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // DATABASE_URL fails at startup with a clear message instead of at the first
     // job, and the schema the web owns is expected to exist already.
     let database_url = std::env::var("DATABASE_URL").expect("checked above");
+    let lake_settings = lake::LakeSettings::from_urls(
+        &database_url,
+        &std::env::var("LAKE_DATABASE").unwrap_or_else(|_| "karet_lake".into()),
+        &std::env::var("AWS_ENDPOINT_URL").expect("checked above"),
+        &warehouse_bucket,
+        &std::env::var("AWS_ACCESS_KEY_ID").expect("checked above"),
+        &std::env::var("AWS_SECRET_ACCESS_KEY").expect("checked above"),
+        &std::env::var("AWS_REGION").expect("checked above"),
+    )?;
+    let lake = std::sync::Arc::new(lake::Lake::with_resources(
+        lake::LakeCatalog::Postgres(lake_settings),
+        lake::Resources::from_env(),
+    ));
     let db_pool = db::connect(&database_url).await.map_err(|e| {
         tracing::error!("cannot reach the database at startup: {e}");
         e
@@ -116,8 +131,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         job_ctx: job::JobContext {
             s3_client: s3_client.clone(),
             lake_bucket: lake_bucket.clone(),
-            warehouse_bucket: warehouse_bucket.clone(),
             db: db_pool.clone(),
+            lake: lake.clone(),
         },
         consumer_name,
         settings,
@@ -128,7 +143,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let state = http::AppState {
         lake_bucket,
-        warehouse_bucket,
         s3_client: Some(s3_client),
         auth_token,
         queue: Some(queue_ctx.clone()),

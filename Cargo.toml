@@ -26,6 +26,12 @@ thiserror = "2"
 redis = { version = "1.6.0", features = ["tokio-comp", "connection-manager"] }
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
 sha2 = "0.10"
+# DuckDB runs the DuckLake catalog. Linked against the prebuilt libduckdb
+# release (DUCKDB_LIB_DIR), so builds do not compile DuckDB's C++ sources.
+duckdb = "=1.10506.1"
+tempfile = "3"
+url = "2"
+percent-encoding = "2"
 # Polars allocates and frees large buffers. glibc malloc keeps freed memory
 # in the process, so a full run left the worker holding gigabytes while idle.
 # jemalloc returns it to the system.

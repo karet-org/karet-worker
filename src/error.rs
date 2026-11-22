@@ -33,9 +33,6 @@ pub enum PipelineError {
 
     #[error("partitioning failed: {message}")]
     Partition { message: String },
-
-    #[error("partition upload failed for key `{key}`: {message}")]
-    PartitionUploadFailed { key: String, message: String },
 }
 
 impl PipelineError {

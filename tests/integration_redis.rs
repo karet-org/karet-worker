@@ -63,7 +63,10 @@ async fn make_ctx(url: &str) -> (Arc<QueueCtx>, tokio::sync::watch::Sender<bool>
         job_ctx: JobContext {
             s3_client: dead_s3_client().await,
             lake_bucket: "karet-lake".into(),
-            warehouse_bucket: "karet-warehouse".into(),
+            // Never opened: every config read fails before a job reaches the lake.
+            lake: Arc::new(karet_worker::lake::Lake::new(karet_worker::lake::LakeCatalog::Local(
+                std::env::temp_dir().join("karet-redis-test-lake"),
+            ))),
             // These tests exercise queue mechanics, not the database, so the pool
             // points nowhere and every config read fails. It must fail *fast*:
             // sqlx's default 30s acquire timeout is longer than the deadlines
@@ -128,7 +131,6 @@ fn msg(job_id: &str, pipeline: &str) -> JobMessage {
     JobMessage {
         job_id: job_id.into(),
         pipeline: pipeline.into(),
-        prefix: format!("pipelines/{pipeline}/"),
         config_version_id: None,
         clean_run: false,
         trigger: "manual".into(),
@@ -308,7 +310,7 @@ async fn debounce_extends_quiet_window_and_fires_once() {
     assert!(remaining.is_empty());
     let first: Option<String> = conn.get("karet:debounce:first:gamma").await.unwrap();
     assert_eq!(first, None);
-    // The enqueued message is a webhook-trigger job for the right prefix.
+    // The enqueued message is a webhook-trigger job.
     let live_trigger = hget(&mut conn, &job_ids[0], "trigger").await;
     assert_eq!(live_trigger.as_deref(), Some("webhook"));
 

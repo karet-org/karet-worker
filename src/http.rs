@@ -21,8 +21,6 @@ use crate::config::{self, ConfigError, PipelineConfig};
 pub struct AppState {
     /// Bucket for raw ingested CSV data.
     pub lake_bucket: String,
-    /// Bucket for query-ready partitioned Parquet output.
-    pub warehouse_bucket: String,
     pub s3_client: Option<aws_sdk_s3::Client>,
     /// Shared bearer token (`KARET_WORKER_TOKEN`) required on every
     /// mutating route. `/health` stays open for liveness probes.
@@ -106,6 +104,8 @@ pub fn router(state: AppState) -> Router {
     // unknown path, which broke RustFS's HEAD health probe of `/`.
     let protected = Router::new()
         .route("/config/validate", post(post_config_validate))
+        .route("/tables/restore", post(post_table_restore))
+        .route("/pipelines/drop", post(post_pipeline_drop))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token,
@@ -163,52 +163,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
-}
-
-/// Maximum accepted `pipeline_prefix` length. Generous for
-/// `pipelines/<slug>/` shapes while still bounding pathological input.
-const MAX_PREFIX_LEN: usize = 512;
-
-/// Validate a caller-supplied pipeline prefix before it is interpolated
-/// into S3 keys for reads, writes, and (with `clean_run`) deletes.
-///
-/// Accepts only `segment/segment/.../` shapes: a trailing slash, no
-/// leading slash, non-empty segments of `[A-Za-z0-9._-]`, and no `.` /
-/// `..` segments. The web app sends `pipelines/<slug>/` where the slug is
-/// already `[a-z0-9-]`, so this is a superset of legitimate traffic.
-pub fn validate_pipeline_prefix(prefix: &str) -> Result<(), String> {
-    if prefix.is_empty() {
-        return Err("pipeline_prefix must not be empty".into());
-    }
-    if prefix.len() > MAX_PREFIX_LEN {
-        return Err(format!(
-            "pipeline_prefix is too long ({} bytes, max {MAX_PREFIX_LEN})",
-            prefix.len()
-        ));
-    }
-    if prefix.starts_with('/') {
-        return Err("pipeline_prefix must not start with '/'".into());
-    }
-    if !prefix.ends_with('/') {
-        return Err("pipeline_prefix must end with '/'".into());
-    }
-    for segment in prefix[..prefix.len() - 1].split('/') {
-        if segment.is_empty() {
-            return Err("pipeline_prefix must not contain empty path segments".into());
-        }
-        if segment == "." || segment == ".." {
-            return Err("pipeline_prefix must not contain '.' or '..' segments".into());
-        }
-        if !segment
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        {
-            return Err(format!(
-                "pipeline_prefix segment '{segment}' contains characters outside [A-Za-z0-9._-]"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// `GET /health`. Liveness plus, when the queue is enabled, a readiness
@@ -497,6 +451,105 @@ fn error_response(
         .into_response()
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RestoreRequest {
+    pipeline: String,
+    table: String,
+    version: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DropRequest {
+    pipeline: String,
+}
+
+/// Run `f` on the blocking pool with a lake connection, holding the
+/// pipeline's run lock so it cannot interleave with a run. Answers 409 while a
+/// run holds the lock.
+async fn with_run_lock<T: Send + 'static>(
+    state: &AppState,
+    pipeline: &str,
+    f: impl FnOnce(&duckdb::Connection) -> T + Send + 'static,
+) -> Result<T, axum::response::Response> {
+    let unavailable =
+        |msg: String| error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable", &msg, Vec::new());
+    let Some(queue) = state.queue.clone() else {
+        return Err(unavailable("no queue configured".into()));
+    };
+    let mut conn = crate::queue::connect(&queue.client).await.map_err(|e| unavailable(format!("redis: {e}")))?;
+    let fence = format!("admin-{}:0", uuid::Uuid::new_v4());
+    match crate::queue::try_lock(&mut conn, pipeline, &fence, queue.settings.lock_ttl_ms).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "pipeline_busy",
+                "the pipeline is running; try again once the run finishes",
+                Vec::new(),
+            ))
+        }
+        Err(e) => return Err(unavailable(format!("redis: {e}"))),
+    }
+    let lake = queue.job_ctx.lake.clone();
+    let result = tokio::task::spawn_blocking(move || lake.connection().map(|c| f(&c))).await;
+    if let Err(e) = crate::queue::release_lock(&mut conn, pipeline, &fence).await {
+        tracing::warn!(pipeline, "run lock release failed: {e}");
+    }
+    let internal = |msg: String| error_response(StatusCode::INTERNAL_SERVER_ERROR, "lake_error", &msg, Vec::new());
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(internal(e)),
+        Err(e) => Err(internal(e.to_string())),
+    }
+}
+
+/// `POST /tables/restore`: make an earlier version of a table current.
+async fn post_table_restore(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RestoreRequest>,
+) -> axum::response::Response {
+    let (pipeline, table, version) = (req.pipeline.clone(), req.table.clone(), req.version);
+    let result = match with_run_lock(&state, &req.pipeline, move |c| {
+        crate::lake::restore(c, &pipeline, &table, version)
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(response) => return response,
+    };
+    match result {
+        Ok(snapshot) => {
+            tracing::info!(pipeline = %req.pipeline, table = %req.table, from = req.version, snapshot, "restored table version");
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true, "version": snapshot }))).into_response()
+        }
+        Err(crate::lake::RestoreError::NotFound(v)) => error_response(
+            StatusCode::NOT_FOUND,
+            "version_not_found",
+            &format!("version {v} of this table is not retained"),
+            Vec::new(),
+        ),
+        Err(crate::lake::RestoreError::Failed(e)) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "restore_failed", &e, Vec::new())
+        }
+    }
+}
+
+/// `POST /pipelines/drop`: remove a deleted pipeline's tables from the lake.
+async fn post_pipeline_drop(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DropRequest>,
+) -> axum::response::Response {
+    let pipeline = req.pipeline.clone();
+    match with_run_lock(&state, &req.pipeline, move |c| crate::lake::drop_pipeline(c, &pipeline)).await {
+        Ok(Ok(())) => {
+            tracing::info!(pipeline = %req.pipeline, "dropped pipeline tables");
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "drop_failed", &e, Vec::new()),
+        Err(response) => response,
+    }
+}
+
 /// Convert a [`ConfigError`] into the `/config/validate` error shape.
 fn error_to_json(err: &ConfigError) -> serde_json::Value {
     let (kind, path) = match err {
@@ -535,7 +588,6 @@ mod tests {
         AppState {
             routing: Arc::new(tokio::sync::RwLock::new(RoutingCache::default())),
             lake_bucket: "karet-lake".into(),
-            warehouse_bucket: "karet-warehouse".into(),
             s3_client: None,
             auth_token: TEST_TOKEN.into(),
             queue: None,
@@ -690,47 +742,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    // ---- pipeline_prefix validation ----------------------------------------
-    // (enforced at claim time in queue.rs; the shape rules live here)
-
-    #[test]
-    fn validate_pipeline_prefix_accepts_legitimate_shapes() {
-        for prefix in [
-            "pipelines/demo/",
-            "pipelines/my-pipeline-2/",
-            "a/b.c/d_e/",
-            "single/",
-        ] {
-            assert!(
-                validate_pipeline_prefix(prefix).is_ok(),
-                "expected Ok for {prefix:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_pipeline_prefix_rejects_malformed_shapes() {
-        let cases = [
-            "",
-            "no-trailing-slash",
-            "/leading/slash/",
-            "double//slash/",
-            "pipelines/../other/",
-            "./relative/",
-            "pipelines/sp ace/",
-            "pipelines/semi;colon/",
-            "pipelines/quo'te/",
-        ];
-        for prefix in cases {
-            assert!(
-                validate_pipeline_prefix(prefix).is_err(),
-                "expected Err for {prefix:?}"
-            );
-        }
-        let too_long = format!("{}/", "a".repeat(600));
-        assert!(validate_pipeline_prefix(&too_long).is_err());
     }
 
     // ---- /events/s3 webhook ------------------------------------------------

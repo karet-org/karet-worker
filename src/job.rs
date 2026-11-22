@@ -2,7 +2,7 @@
 //!
 //! Both entry points — the legacy `POST /jobs/run` HTTP handler and the
 //! Redis stream consumer — run jobs through [`execute_job`], so behavior
-//! (clean_run semantics, per-mapping error containment, partition upload)
+//! (clean_run semantics, per-mapping error containment, the lake commit)
 //! is identical regardless of transport.
 
 use std::collections::{HashMap, HashSet};
@@ -14,7 +14,7 @@ use crate::assertions::validate_assertions;
 use crate::config::{self, PipelineConfig};
 use crate::dimension;
 use crate::incremental::{self, SourceObject};
-use crate::manifest;
+use crate::lake::{self, Lake};
 use crate::pipeline;
 use crate::s3 as s3mod;
 
@@ -85,20 +85,33 @@ pub enum JobError {
 pub struct JobContext {
     pub s3_client: aws_sdk_s3::Client,
     pub lake_bucket: String,
-    pub warehouse_bucket: String,
     /// The control-plane database: where configs and job rows live.
     pub db: sqlx::PgPool,
+    /// The DuckLake catalog the analytic tables are written to.
+    pub lake: Arc<Lake>,
 }
 
-/// Execute one pipeline run for `prefix` (validated by the caller).
+/// Run `f` with a lake connection on the blocking pool.
+async fn with_lake<T: Send + 'static>(
+    lake: &Arc<Lake>,
+    f: impl FnOnce(&duckdb::Connection) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let lake = lake.clone();
+    tokio::task::spawn_blocking(move || f(&lake.connection()?))
+        .await
+        .map_err(|e| format!("lake task panicked: {e}"))?
+}
+
+/// Execute one pipeline run.
 ///
 /// Error containment matches the original handler: a failure in one
 /// mapping is recorded in `errors` and the remaining mappings still run.
 /// Unlike the original handler, the config is validated before execution;
 /// a config that fails [`config::validate`] is rejected up front.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_job(
     ctx: &JobContext,
-    prefix: &str,
+    job_id: Option<&str>,
     pipeline: &str,
     config_version_id: Option<i64>,
     clean_run: bool,
@@ -132,34 +145,23 @@ pub async fn execute_job(
         return Err(JobError::ConfigInvalid(joined));
     }
 
-    // Writes land under `v<next>/` and become visible only when the manifest
-    // and pointer are written after every mapping has run, so a reader never
-    // sees one mapping's half of a union table.
-    //
-    // clean_run starts from an empty file list instead of deleting anything:
-    // the old objects stay readable under their own version until vacuum
-    // retires them, which is what makes a bad run recoverable.
+    // Each mapping's rows are staged in local Parquet files and written to the
+    // lake in one transaction per table after every mapping has run, so a
+    // reader never sees one mapping's half of a union table.
+    let staging = tempfile::tempdir().map_err(|e| JobError::ConfigRead(format!("staging folder: {e}")))?;
     let mut publishes: HashMap<String, TablePublish> = HashMap::new();
     for table in &cfg.analytic_tables {
-        let table_prefix = format!("{prefix}{}/", table.id);
-        let current = manifest::read_current(&ctx.s3_client, &ctx.warehouse_bucket, &table_prefix)
-            .await
-            .map_err(JobError::ConfigRead)?;
         let sources = if clean_run {
             HashMap::new()
         } else {
-            incremental::read_record(&ctx.s3_client, &ctx.warehouse_bucket, &table_prefix, &current)
+            let (p, t) = (pipeline.to_string(), table.id.clone());
+            with_lake(&ctx.lake, move |c| lake::read_records(c, &p, &t))
                 .await
+                .map_err(JobError::ConfigRead)?
         };
         publishes.insert(
             table.id.clone(),
-            TablePublish {
-                prefix: table_prefix,
-                version: current.version + 1,
-                files: if clean_run { Vec::new() } else { current.files },
-                sources,
-                touched: false,
-            },
+            TablePublish { sources, writes: Vec::new(), touched: false },
         );
     }
 
@@ -315,17 +317,16 @@ pub async fn execute_job(
             incremental::Plan::Unchanged => continue,
             incremental::Plan::Full(_) => {}
             incremental::Plan::Append(new) => {
-                match append_mapping(ctx, prefix, &cfg, mapping, new, &downloaded, &matchers, publish)
+                let staged = staging.path().join(format!("{mapping_idx}"));
+                match append_mapping(ctx, pipeline, &cfg, mapping, new, &downloaded, &matchers, &staged)
                     .await
                 {
                     Ok(appended) => {
-                        total_partitions += appended.files.len();
+                        total_partitions += appended.partitions;
                         total_deduped += appended.dropped;
-                        publish.files = manifest::apply_partition_writes(
-                            &publish.files,
-                            &mapping.id,
-                            appended.files,
-                        );
+                        if let Some(file) = appended.file {
+                            publish.writes.push(lake::Write { mapping_id: mapping.id.clone(), file, replace: false });
+                        }
                         let previous =
                             publish.sources.get(&mapping.id).map(|s| s.files.as_slice()).unwrap_or(&[]);
                         let files = incremental::record_files(previous, appended.read);
@@ -362,11 +363,12 @@ pub async fn execute_job(
             .collect();
 
         // Polars work is CPU-bound: run it on the blocking pool so
-        // heartbeats and health checks stay responsive. Uploads happen
-        // back on the async runtime.
+        // heartbeats and health checks stay responsive.
         let (cfg_c, mapping_c, matchers_c) = (cfg.clone(), mapping.clone(), matchers.clone());
-        let partitions_result = tokio::task::spawn_blocking(move || {
-            let (df, dropped) = ingest_checked(&mapping_files, &cfg_c, &mapping_c, &matchers_c)?
+        let file = staging.path().join(format!("{mapping_idx}.parquet"));
+        let file_c = file.clone();
+        let staged = tokio::task::spawn_blocking(move || {
+            let (mut df, dropped) = ingest_checked(&mapping_files, &cfg_c, &mapping_c, &matchers_c)?
                 .ok_or_else(|| {
                     Failure::Mapping(format!(
                         "ingest {}: {}",
@@ -375,87 +377,60 @@ pub async fn execute_job(
                     ))
                 })?;
             let table = table_for(&cfg_c, &mapping_c)?;
-            pipeline::produce_partitions(&df, &mapping_c, table)
-                .map_err(|e| Failure::Mapping(format!("partition {}: {e}", mapping_c.id)))
-                .map(|parts| (parts, dropped))
+            let partitions = pipeline::count_partitions(&df, table)
+                .map_err(|e| Failure::Mapping(format!("partition {}: {e}", mapping_c.id)))?;
+            stage(&mut df, &file_c).map_err(|e| Failure::Mapping(format!("stage {}: {e}", mapping_c.id)))?;
+            Ok::<_, Failure>((partitions, dropped))
         })
         .await;
 
-        let (partitions, dropped) = match partitions_result {
-            Ok(Ok(p)) => p,
-            Ok(Err(Failure::Mapping(msg) | Failure::Fallback(msg))) => {
-                errors.push(msg);
-                continue;
-            }
-            Err(join_err) => {
-                errors.push(format!("mapping {} task panicked: {join_err}", mapping.id));
-                continue;
-            }
-        };
-
-        total_deduped += dropped;
-        match upload_partitions_async(ctx, prefix, publish.version, &mapping.id, &partitions).await {
-            Ok(written) => {
-                total_partitions += written.len();
-                publish.files =
-                    manifest::apply_mapping_writes(&publish.files, &mapping.id, written);
+        match staged {
+            Ok(Ok((partitions, dropped))) => {
+                total_partitions += partitions;
+                total_deduped += dropped;
+                publish.writes.push(lake::Write { mapping_id: mapping.id.clone(), file, replace: true });
                 publish.record(&mapping.id, fingerprint, read);
             }
-            Err(e) => errors.push(format!("upload {}: {e}", mapping.id)),
+            Ok(Err(Failure::Mapping(msg) | Failure::Fallback(msg))) => errors.push(msg),
+            Err(join_err) => errors.push(format!("mapping {} task panicked: {join_err}", mapping.id)),
         }
     }
     let files_processed = downloaded.len();
 
-    // Publish each table that got new output, then collect what no retained
-    // version references. A table whose every mapping failed is left on its
-    // previous version.
-    for (table_id, publish) in publishes.iter() {
+    // Commit each table that got new output, then tidy it. A table whose
+    // every mapping failed is left as it was.
+    for table in &cfg.analytic_tables {
+        let Some(publish) = publishes.remove(&table.id) else { continue };
         if !publish.touched {
             continue;
         }
-        let manifest = manifest::TableManifest {
-            version: publish.version,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            job_id: None,
-            files: publish.files.clone(),
-        };
-        // A failed write only costs a full run next time: the record will not
-        // match the manifest.
-        if let Err(e) = incremental::write_record(
-            &ctx.s3_client,
-            &ctx.warehouse_bucket,
-            &publish.prefix,
-            &manifest,
-            &publish.sources,
-        )
-        .await
-        {
-            tracing::warn!(table = %table_id, "source record not written: {e}");
+        let (p, t, job) = (pipeline.to_string(), table.clone(), job_id.map(str::to_string));
+        let committed = with_lake(&ctx.lake, move |c| {
+            lake::commit_table(
+                c,
+                &lake::Commit {
+                    pipeline: &p,
+                    table: &t,
+                    writes: &publish.writes,
+                    records: &publish.sources,
+                    clean: clean_run,
+                    job_id: job.as_deref(),
+                },
+            )
+        })
+        .await;
+        match committed {
+            Ok(snapshot) => tracing::info!(table = %table.id, snapshot, "published table version"),
+            Err(e) => {
+                errors.push(format!("publish {}: {e}", table.id));
+                continue;
+            }
         }
-        if let Err(e) =
-            manifest::publish(&ctx.s3_client, &ctx.warehouse_bucket, &publish.prefix, &manifest)
-                .await
-        {
-            errors.push(format!("publish {table_id}: {e}"));
-            continue;
-        }
-        tracing::info!(
-            table = %table_id,
-            version = manifest.version,
-            files = manifest.files.len(),
-            "published table version",
-        );
-        match manifest::vacuum(
-            &ctx.s3_client,
-            &ctx.warehouse_bucket,
-            &publish.prefix,
-            manifest.version,
-        )
-        .await
-        {
+        let (p, t) = (pipeline.to_string(), table.id.clone());
+        match with_lake(&ctx.lake, move |c| lake::maintain(c, &p, &t)).await {
             Ok(0) => {}
-            Ok(n) => tracing::info!(table = %table_id, deleted = n, "vacuumed unreferenced objects"),
-            Err(e) => tracing::warn!(table = %table_id, "vacuum skipped: {e}"),
+            Ok(n) => tracing::info!(table = %table.id, expired = n, "expired old snapshots"),
+            Err(e) => tracing::warn!(table = %table.id, "maintenance skipped: {e}"),
         }
     }
 
@@ -475,12 +450,15 @@ pub async fn execute_job(
 
 /// One table's next version, built up while the mappings run.
 struct TablePublish {
-    prefix: String,
-    version: u64,
-    files: Vec<manifest::ManifestFile>,
-    /// What each mapping's files were built from, by mapping id.
+    /// What each mapping's rows were built from, by mapping id.
     sources: HashMap<String, incremental::MappingSources>,
+    writes: Vec<lake::Write>,
     touched: bool,
+}
+
+fn stage(df: &mut DataFrame, path: &std::path::Path) -> Result<(), String> {
+    let bytes = pipeline::write_parquet_bytes(df).map_err(|e| e.to_string())?;
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 impl TablePublish {
@@ -567,24 +545,25 @@ fn ingest_checked(
 }
 
 struct Appended {
-    files: Vec<manifest::ManifestFile>,
+    /// The staged new rows; `None` when none are left after dedup.
+    file: Option<std::path::PathBuf>,
+    partitions: usize,
     dropped: usize,
     read: Vec<SourceObject>,
 }
 
-/// Ingest `new` files and merge their rows into the partitions they fall
-/// into. Other partitions are left for [`manifest::apply_partition_writes`]
-/// to carry forward.
+/// Ingest `new` files and stage the rows whose dedup key is not stored yet.
+/// Staged files are named `<staged>.new.parquet` and `<staged>.kept.parquet`.
 #[allow(clippy::too_many_arguments)]
 async fn append_mapping(
     ctx: &JobContext,
-    prefix: &str,
+    pipeline: &str,
     cfg: &PipelineConfig,
     mapping: &crate::config::Mapping,
     new: &[SourceObject],
     downloaded: &HashMap<String, Vec<u8>>,
     matchers: &HashMap<String, Arc<dimension::DimensionMatcher>>,
-    publish: &TablePublish,
+    staged: &std::path::Path,
 ) -> Result<Appended, Failure> {
     let read: Vec<SourceObject> = new
         .iter()
@@ -597,118 +576,38 @@ async fn append_mapping(
         .collect();
     let table = table_for(cfg, mapping)?.clone();
 
-    let (cfg_c, mapping_c, matchers_c) = (cfg.clone(), mapping.clone(), matchers.clone());
-    let ingested = tokio::task::spawn_blocking(move || ingest_checked(&files, &cfg_c, &mapping_c, &matchers_c))
-        .await
-        .map_err(|e| Failure::Fallback(format!("ingest task panicked: {e}")))??;
-    let Some((mut rows, mut dropped)) = ingested else {
-        return Ok(Appended { files: Vec::new(), dropped: 0, read });
-    };
-
-    let own: Vec<&manifest::ManifestFile> =
-        publish.files.iter().filter(|f| f.mapping_id == mapping.id).collect();
-    let fetch = |key: String| async move {
-        s3mod::get_bytes(&ctx.s3_client, &ctx.warehouse_bucket, &format!("{}{key}", publish.prefix))
-            .await
-            .map_err(Failure::Fallback)
-    };
-
-    // Dedup keys need not include the partition keys, so a duplicate can be
-    // in any of the mapping's partitions.
-    // Downloaded once, for the dedup check and for merging below.
-    let mut fetched: HashMap<String, Vec<u8>> = HashMap::new();
-    if !table.dedup_keys.is_empty() && rows.height() > 0 && !own.is_empty() {
-        let mut stored = Vec::with_capacity(own.len());
-        for f in &own {
-            stored.push((f.key.clone(), fetch(f.key.clone()).await?));
-        }
-        let table_c = table.clone();
-        let (kept, d, stored) = tokio::task::spawn_blocking(move || {
-            incremental::drop_stored_keys(&rows, &stored, &table_c).map(|(kept, d)| (kept, d, stored))
-        })
-        .await
-        .map_err(|e| Failure::Fallback(format!("dedup task panicked: {e}")))?
-        .map_err(Failure::Fallback)?;
-        rows = kept;
-        dropped += d;
-        fetched.extend(stored);
-    }
-
-    if rows.height() == 0 {
-        return Ok(Appended { files: Vec::new(), dropped, read });
-    }
-
-    let frames = pipeline::partition_frames(&rows, mapping, &table)
-        .map_err(|e| Failure::Fallback(e.to_string()))?;
-    let mut merges = Vec::with_capacity(frames.len());
-    for (key, frame) in frames {
-        let path = key.split_once('/').map(|(_, rest)| rest).unwrap_or_default();
-        let existing = match own.iter().find(|f| manifest::partition_path(&f.key) == path) {
-            Some(f) => match fetched.remove(&f.key) {
-                Some(bytes) => Some(bytes),
-                None => Some(fetch(f.key.clone()).await?),
-            },
-            None => None,
+    let ingested_path = staged.with_extension("new.parquet");
+    let kept_path = staged.with_extension("kept.parquet");
+    let (cfg_c, mapping_c, matchers_c, table_c, ingested_c) =
+        (cfg.clone(), mapping.clone(), matchers.clone(), table.clone(), ingested_path.clone());
+    // The rows dropped by dedup within the new files, and whether any are left.
+    let (dropped, any) = tokio::task::spawn_blocking(move || {
+        let Some((mut rows, dropped)) = ingest_checked(&files, &cfg_c, &mapping_c, &matchers_c)? else {
+            return Ok((0, false));
         };
-        merges.push((key, frame, existing));
-    }
-    let partitions = tokio::task::spawn_blocking(move || {
-        merges
-            .into_iter()
-            .map(|(key, frame, existing)| {
-                let mut merged = match existing {
-                    Some(bytes) => incremental::merge_partition(&bytes, &frame)?,
-                    None => frame,
-                };
-                let bytes = pipeline::write_parquet_bytes(&mut merged).map_err(|e| e.to_string())?;
-                Ok(pipeline::PartitionOutput { key, bytes })
-            })
-            .collect::<Result<Vec<_>, String>>()
+        // Fails the mapping on a null partition key, as a full run does.
+        pipeline::count_partitions(&rows, &table_c)
+            .map_err(|e| Failure::Mapping(format!("partition {}: {e}", mapping_c.id)))?;
+        if rows.height() > 0 {
+            stage(&mut rows, &ingested_c).map_err(Failure::Fallback)?;
+        }
+        Ok((dropped, rows.height() > 0))
     })
     .await
-    .map_err(|e| Failure::Fallback(format!("merge task panicked: {e}")))?
-    .map_err(Failure::Fallback)?;
-
-    let files = upload_partitions_async(ctx, prefix, publish.version, &mapping.id, &partitions)
-        .await
-        .map_err(|e| Failure::Mapping(format!("upload {}: {e}", mapping.id)))?;
-    Ok(Appended { files, dropped, read })
-}
-
-/// Upload partitions under `prefix`, into the table's staging version.
-///
-/// `PartitionOutput::key` is `<table>/<hive segments>/<mapping>.parquet`; the
-/// version is spliced in after the table so the hive segments stay in the path
-/// for readers to re-materialize partition columns from.
-async fn upload_partitions_async(
-    ctx: &JobContext,
-    prefix: &str,
-    version: u64,
-    mapping_id: &str,
-    partitions: &[pipeline::PartitionOutput],
-) -> Result<Vec<manifest::ManifestFile>, String> {
-    let mut written = Vec::with_capacity(partitions.len());
-    for p in partitions {
-        let (table_id, rest) = p
-            .key
-            .split_once('/')
-            .ok_or_else(|| format!("partition key {} has no table segment", p.key))?;
-        let relative = format!("{}{rest}", manifest::version_prefix(version));
-        let full_key = format!("{prefix}{table_id}/{relative}");
-        ctx.s3_client
-            .put_object()
-            .bucket(&ctx.warehouse_bucket)
-            .key(&full_key)
-            .body(aws_sdk_s3::primitives::ByteStream::from(p.bytes.clone()))
-            .content_type("application/octet-stream")
-            .send()
-            .await
-            .map_err(|e| format!("S3 PutObject failed for {full_key}: {}", s3mod::err_chain(&e)))?;
-        written.push(manifest::ManifestFile {
-            key: relative,
-            mapping_id: mapping_id.to_string(),
-            bytes: p.bytes.len() as u64,
-        });
+    .map_err(|e| Failure::Fallback(format!("ingest task panicked: {e}")))??;
+    if !any {
+        return Ok(Appended { file: None, partitions: 0, dropped, read });
     }
-    Ok(written)
+
+    let (p, m, k) = (pipeline.to_string(), mapping.id.clone(), kept_path.clone());
+    let (stored_dupes, partitions) =
+        with_lake(&ctx.lake, move |c| lake::drop_stored_keys(c, &p, &table, &m, &ingested_path, &k))
+            .await
+            .map_err(Failure::Fallback)?;
+    Ok(Appended {
+        file: (partitions > 0).then_some(kept_path),
+        partitions,
+        dropped: dropped + stored_dupes,
+        read,
+    })
 }
