@@ -82,6 +82,20 @@ After each commit the worker writes out a table's catalog-stored rows once there
 snapshots outside the last 10 that changed each existing table's rows, and deletes data
 files no retained snapshot reads once they are an hour old.
 
+## Retention
+
+A source container's `retention_days` deletes its raw files from the lake that
+many days after upload. A file is deleted only once every mapping that reads
+the source has loaded it under its current config, and its rows stay in the
+tables. The record's `expired` column lists deleted files so that a re-upload
+of the same file is not loaded twice; an entry is dropped once its key is gone
+from the lake.
+
+An analytic table's `retention: { column, days }` deletes rows whose `date`
+column is more than `days` days old, each time the table is committed.
+
+Changing either setting does not cause a full run.
+
 ## HTTP API
 
 `POST /config/validate`, `POST /tables/restore` and `POST /pipelines/drop` require an

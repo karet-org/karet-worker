@@ -67,6 +67,7 @@ async fn make_ctx(url: &str) -> (Arc<QueueCtx>, tokio::sync::watch::Sender<bool>
             lake: Arc::new(karet_worker::lake::Lake::new(karet_worker::lake::LakeCatalog::Local(
                 std::env::temp_dir().join("karet-redis-test-lake"),
             ))),
+            now: karet_worker::job::system_now,
             // These tests exercise queue mechanics, not the database, so the pool
             // points nowhere and every config read fails. It must fail *fast*:
             // sqlx's default 30s acquire timeout is longer than the deadlines

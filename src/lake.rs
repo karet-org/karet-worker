@@ -319,18 +319,26 @@ pub fn read_records(conn: &Connection, pipeline: &str, table_id: &str) -> Result
     if table_columns(conn, pipeline, RECORDS_TABLE)?.is_none() {
         return Ok(HashMap::new());
     }
+    let has_expired = table_columns(conn, pipeline, RECORDS_TABLE)?
+        .is_some_and(|cols| cols.iter().any(|(c, _)| c == "expired"));
+    let expired = if has_expired { "coalesce(expired, '[]')" } else { "'[]'" };
     let records = rows(
         conn,
         "read source records",
-        &format!("SELECT mapping_id, fingerprint, files FROM {} WHERE table_id = ?", records_table(pipeline)),
+        &format!(
+            "SELECT mapping_id, fingerprint, files, {expired} FROM {} WHERE table_id = ?",
+            records_table(pipeline)
+        ),
         [table_id],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)),
     )?;
     records
         .into_iter()
-        .map(|(mapping_id, fingerprint, files)| {
-            let files = serde_json::from_str(&files).map_err(|e| format!("source record {mapping_id}: {e}"))?;
-            Ok((mapping_id.clone(), MappingSources { mapping_id, fingerprint, files }))
+        .map(|(mapping_id, fingerprint, files, expired)| {
+            let parse = |e: serde_json::Error| format!("source record {mapping_id}: {e}");
+            let files = serde_json::from_str(&files).map_err(parse)?;
+            let expired = serde_json::from_str(&expired).map_err(parse)?;
+            Ok((mapping_id.clone(), MappingSources { mapping_id, fingerprint, files, expired }))
         })
         .collect()
 }
@@ -413,7 +421,8 @@ pub fn commit_table(conn: &Connection, commit: &Commit) -> Result<i64, String> {
     let wanted = wanted_columns(conn, commit.writes)?;
     conn.execute_batch(&format!(
         "CREATE SCHEMA IF NOT EXISTS {CATALOG}.{}; \
-         CREATE TABLE IF NOT EXISTS {} (table_id VARCHAR, mapping_id VARCHAR, fingerprint VARCHAR, files VARCHAR)",
+         CREATE TABLE IF NOT EXISTS {1} (table_id VARCHAR, mapping_id VARCHAR, fingerprint VARCHAR, files VARCHAR); \
+         ALTER TABLE {1} ADD COLUMN IF NOT EXISTS expired VARCHAR",
         ident(commit.pipeline),
         records_table(commit.pipeline),
     ))
@@ -510,6 +519,17 @@ fn write_table(
         ))?;
     }
 
+    if let Some(retention) = &commit.table.retention {
+        let present = wanted.iter().chain(existing.iter().flatten()).any(|(n, _)| *n == retention.column);
+        if present {
+            exec(format!(
+                "DELETE FROM {table} WHERE {} < CAST(current_date - INTERVAL {} DAY AS DATE)",
+                ident(&retention.column),
+                retention.days,
+            ))?;
+        }
+    }
+
     exec(format!(
         "DELETE FROM {} WHERE table_id = {}",
         records_table(commit.pipeline),
@@ -519,13 +539,15 @@ fn write_table(
     records.sort_by(|a, b| a.mapping_id.cmp(&b.mapping_id));
     for r in records {
         let files = serde_json::to_string(&r.files).map_err(|e| format!("serialize source record: {e}"))?;
+        let expired = serde_json::to_string(&r.expired).map_err(|e| format!("serialize source record: {e}"))?;
         exec(format!(
-            "INSERT INTO {} VALUES ({}, {}, {}, {})",
+            "INSERT INTO {} (table_id, mapping_id, fingerprint, files, expired) VALUES ({}, {}, {}, {}, {})",
             records_table(commit.pipeline),
             lit(&commit.table.id),
             lit(&r.mapping_id),
             lit(&r.fingerprint),
             lit(&files),
+            lit(&expired),
         ))?;
     }
     let message = commit.job_id.map_or_else(|| "run".to_string(), |id| format!("job {id}"));

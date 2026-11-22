@@ -122,6 +122,7 @@ mod tests {
 
     fn table_with(name: &str, type_: &str, a: ColumnAssertions) -> AnalyticTable {
         AnalyticTable {
+            retention: None,
             id: "t".into(),
             name: "T".into(),
             schema: vec![ColumnSchema {
@@ -140,6 +141,7 @@ mod tests {
     fn no_assertions_produces_no_violations() {
         let df = df!["a" => [1, 2, 3]].unwrap();
         let table = AnalyticTable {
+            retention: None,
             id: "t".into(),
             name: "T".into(),
             schema: vec![ColumnSchema {

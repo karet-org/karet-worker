@@ -31,6 +31,10 @@ pub struct SourceContainer {
     /// path extraction. Lets one log stream carry unrelated entries.
     #[serde(default)]
     pub record_filter: Option<AstNode>,
+    /// Delete raw files this many days after they were uploaded, once every
+    /// mapping that reads them has loaded them. Unset keeps them forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
 }
 
 /// Source wire format.
@@ -197,6 +201,18 @@ pub struct AnalyticTable {
     /// write time (first in ingest order survives). Empty = no dedup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dedup_keys: Vec<String>,
+    /// Delete rows whose `column` is more than `days` days old, on every run
+    /// that writes the table. Unset keeps rows forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RowRetention>,
+}
+
+/// How long a table keeps its rows.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RowRetention {
+    /// A `date` column of the table.
+    pub column: String,
+    pub days: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -461,6 +477,25 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
             }
         }
 
+        if let Some(retention) = &table.retention {
+            let path = format!("/analytic_tables/{i}/retention");
+            match schema_cols.get(retention.column.as_str()) {
+                None => errors.push(ConfigError::DanglingReference {
+                    path: path.clone(),
+                    kind: "schema_column".to_string(),
+                    target: retention.column.clone(),
+                }),
+                Some(&"date") => {}
+                Some(other) => errors.push(ConfigError::Schema {
+                    path: path.clone(),
+                    message: format!("retention column `{}` is {other}; it must be a date", retention.column),
+                }),
+            }
+            if retention.days == 0 {
+                errors.push(ConfigError::Schema { path, message: "retention must keep at least 1 day".into() });
+            }
+        }
+
         let mut seen: HashSet<&str> = HashSet::new();
         for key in &table.dedup_keys {
             if !seen.insert(key.as_str()) {
@@ -484,6 +519,12 @@ pub fn validate(cfg: &PipelineConfig) -> Result<(), Vec<ConfigError>> {
     // source's prefix may be a prefix of another's (ingest resolves a
     // file's source by prefix match; nesting makes that ambiguous).
     for (i, sc) in cfg.source_containers.iter().enumerate() {
+        if sc.retention_days == Some(0) {
+            errors.push(ConfigError::Schema {
+                path: format!("/source_containers/{i}/retention_days"),
+                message: "raw files must be kept at least 1 day".into(),
+            });
+        }
         let path = format!("/source_containers/{i}/path_prefix");
         let p = sc.path_prefix.as_str();
         if p.is_empty() {
@@ -644,6 +685,7 @@ mod tests {
         PipelineConfig {
             version: 1,
             source_containers: vec![SourceContainer {
+                retention_days: None,
                 id: "src".to_string(),
                 name: "Src".to_string(),
                 path_prefix: "raw/src/".to_string(),
@@ -719,6 +761,7 @@ mod tests {
                 ],
             }],
             analytic_tables: vec![AnalyticTable {
+                retention: None,
                 id: "t".to_string(),
                 name: "T".to_string(),
                 schema: vec![
@@ -862,6 +905,7 @@ mod tests {
         let cfg = PipelineConfig {
             version: 1,
             source_containers: vec![SourceContainer {
+                retention_days: None,
                 id: "src".to_string(),
                 name: "Src".to_string(),
                 path_prefix: "raw/src/".to_string(),
@@ -890,6 +934,7 @@ mod tests {
                 }],
             }],
             analytic_tables: vec![AnalyticTable {
+                retention: None,
                 id: "t".to_string(),
                 name: "T".to_string(),
                 schema: vec![ColumnSchema {
@@ -941,6 +986,36 @@ mod tests {
             )),
             "expected schema_column error, got {errs:?}"
         );
+    }
+
+    #[test]
+    fn retention_needs_a_date_column_and_at_least_one_day() {
+        let mut cfg = minimal_valid_config();
+        cfg.analytic_tables[0].schema.push(ColumnSchema {
+            name: "day".to_string(),
+            type_: "date".to_string(),
+            nullable: Some(true),
+            assertions: None,
+            path: None,
+        });
+        cfg.mappings[0].columns.push(MappingColumn {
+            name: "day".to_string(),
+            expr: AstNode::Null,
+        });
+        cfg.analytic_tables[0].retention = Some(RowRetention { column: "day".into(), days: 30 });
+        cfg.source_containers[0].retention_days = Some(7);
+        assert!(validate(&cfg).is_ok(), "{:?}", validate(&cfg));
+
+        cfg.analytic_tables[0].retention = Some(RowRetention { column: "cat".into(), days: 0 });
+        cfg.source_containers[0].retention_days = Some(0);
+        let msgs: Vec<String> = validate(&cfg).unwrap_err().iter().map(|e| e.to_string()).collect();
+        assert!(msgs.iter().any(|m| m.contains("must be a date")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("at least 1 day")), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m.contains("raw files must be kept")), "{msgs:?}");
+
+        cfg.analytic_tables[0].retention = Some(RowRetention { column: "ghost".into(), days: 1 });
+        let msgs: Vec<String> = validate(&cfg).unwrap_err().iter().map(|e| e.to_string()).collect();
+        assert!(msgs.iter().any(|m| m.contains("ghost")), "{msgs:?}");
     }
 
     #[test]
@@ -1126,6 +1201,7 @@ mod tests {
                     .prop_map(move |(src_idxs, tbl_idxs, tags, lk_idxs)| {
                         let source_containers: Vec<SourceContainer> = (0..n_sources)
                             .map(|i| SourceContainer {
+                                retention_days: None,
                                 id: format!("s{i}"),
                                 name: format!("S{i}"),
                                 path_prefix: format!("raw/s{i}/"),
@@ -1161,6 +1237,7 @@ mod tests {
 
                         let analytic_tables: Vec<AnalyticTable> = (0..n_tables)
                             .map(|i| AnalyticTable {
+                                retention: None,
                                 id: format!("t{i}"),
                                 name: format!("T{i}"),
                                 schema: vec![ColumnSchema {
