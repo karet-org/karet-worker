@@ -101,10 +101,8 @@ pub struct QueueCtx {
 pub struct JobMessage {
     pub job_id: String,
     pub pipeline: String,
-    pub prefix: String,
     /// Which config version this run must use. Absent for runs enqueued by
-    /// something that only knows a prefix (an upload webhook), which resolve the
-    /// live version at execution time.
+    /// an upload, which resolve the live version at execution time.
     #[serde(default)]
     pub config_version_id: Option<i64>,
     #[serde(default)]
@@ -515,24 +513,6 @@ async fn handle_claimed(ctx: &Arc<QueueCtx>, stream_id: String, payload: String)
         }
     };
 
-    // Prefix shape gate (same rule as the HTTP path).
-    if let Err(reason) = crate::http::validate_pipeline_prefix(&msg.prefix) {
-        let started = now_iso();
-        let _ = finish_job(
-            ctx, &mut conn, &msg, &stream_id, &started, 1,
-            Terminal {
-                status: "failed",
-                error: Some(format!("invalid pipeline_prefix: {reason}")),
-                errors: Vec::new(),
-                partitions_written: None,
-                files_processed: None,
-                rows_deduped: None,
-            },
-        )
-        .await
-        .map_err(|e| tracing::error!("{e}"));
-        return;
-    }
 
     // Redelivery guard: a job that already reached a terminal state
     // (dropped XACK, reclaim edge) must not re-run.
@@ -1138,8 +1118,7 @@ pub async fn debounce_scheduler_loop(ctx: Arc<QueueCtx>) {
                     let msg = JobMessage {
                         job_id: new_job_id(),
                         pipeline: slug.clone(),
-                        prefix: format!("pipelines/{slug}/"),
-                        // An upload knows a prefix, not a version: the executor
+                        // An upload knows a folder, not a version: the executor
                         // resolves whichever config is live when it starts.
                         config_version_id: None,
                         clean_run: false,
@@ -1169,7 +1148,6 @@ mod tests {
         let msg = JobMessage {
             job_id: "job-123-abc".into(),
             pipeline: "demo".into(),
-            prefix: "pipelines/demo/".into(),
             config_version_id: Some(7),
             clean_run: true,
             trigger: "manual".into(),

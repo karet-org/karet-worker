@@ -27,14 +27,14 @@ use duckdb::Connection;
 use crate::config::AnalyticTable;
 use crate::incremental::MappingSources;
 
-pub const CATALOG: &str = "lake";
-pub const MAPPING_COLUMN: &str = "_karet_mapping";
+const CATALOG: &str = "lake";
+const MAPPING_COLUMN: &str = "_karet_mapping";
 /// Table in each pipeline schema holding the incremental-run records, see
 /// [`read_records`]. The prefix keeps it apart from analytic table ids.
-pub const RECORDS_TABLE: &str = "_karet_sources";
+const RECORDS_TABLE: &str = "_karet_sources";
 const METADATA: &str = "\"__ducklake_metadata_lake\".\"ducklake\"";
 /// Data-changing snapshots kept per table, for time travel and restore.
-pub const RETAINED_VERSIONS: usize = 10;
+const RETAINED_VERSIONS: usize = 10;
 /// Files at or above this size are left alone by the merge after each run.
 /// It must stay well below the size of a table's main file: at 8 MB, a 7 MB
 /// partition was rewritten by every 10-minute append. Small appends still
@@ -43,7 +43,7 @@ const MERGE_MAX_FILE_SIZE: u64 = 1024 * 1024;
 /// Inserts of 10 rows or fewer are stored in the catalog rather than in a
 /// Parquet file. Once a table has this many such rows, maintenance writes
 /// them out, so they do not pile up in Postgres.
-pub const FLUSH_INLINED_ROWS: usize = 1000;
+const FLUSH_INLINED_ROWS: usize = 1000;
 
 /// What the worker's DuckDB may use, beside Polars in the same process.
 #[derive(Debug, Clone)]
@@ -84,6 +84,7 @@ impl Resources {
         out
     }
 }
+
 /// Keys of a snapshot's `changes` map that mean a table's rows changed.
 const DATA_CHANGES: &[&str] = &["tables_inserted_into", "tables_deleted_from", "inlined_insert", "inlined_delete"];
 
@@ -117,7 +118,10 @@ impl LakeSettings {
     ) -> Result<Self, String> {
         let db = url::Url::parse(database_url).map_err(|e| format!("DATABASE_URL: {e}"))?;
         let decode = |s: &str| {
-            percent_decode(s).map_err(|e| format!("DATABASE_URL: {e}"))
+            percent_encoding::percent_decode_str(s)
+                .decode_utf8()
+                .map(|v| v.into_owned())
+                .map_err(|e| format!("DATABASE_URL: {e}"))
         };
         let endpoint = url::Url::parse(endpoint_url).map_err(|e| format!("AWS_ENDPOINT_URL: {e}"))?;
         let host = endpoint.host_str().ok_or("AWS_ENDPOINT_URL has no host")?;
@@ -181,35 +185,16 @@ impl LakeCatalog {
     fn setup_sql(&self) -> Vec<String> {
         match self {
             LakeCatalog::Postgres(settings) => settings.setup_sql(),
-            LakeCatalog::Local(dir) => {
-                vec![
-                    "INSTALL ducklake; LOAD ducklake".to_string(),
-                    format!(
-                        "ATTACH {} AS {CATALOG} (DATA_PATH {}, METADATA_SCHEMA 'ducklake')",
-                        lit(&format!("ducklake:{}", dir.join("catalog.ducklake").display())),
-                        lit(&format!("{}/", dir.join("data").display())),
-                    ),
-                ]
-            }
+            LakeCatalog::Local(dir) => vec![
+                "INSTALL ducklake; LOAD ducklake".to_string(),
+                format!(
+                    "ATTACH {} AS {CATALOG} (DATA_PATH {}, METADATA_SCHEMA 'ducklake')",
+                    lit(&format!("ducklake:{}", dir.join("catalog.ducklake").display())),
+                    lit(&format!("{}/", dir.join("data").display())),
+                ),
+            ],
         }
     }
-}
-
-fn percent_decode(s: &str) -> Result<String, String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = s.get(i + 1..i + 3).ok_or("truncated percent escape")?;
-            out.push(u8::from_str_radix(hex, 16).map_err(|_| "bad percent escape")?);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).map_err(|_| "not UTF-8 once decoded".into())
 }
 
 /// One DuckDB database with the catalog attached, opened on first use so a
@@ -269,32 +254,56 @@ fn err(context: &str) -> impl Fn(duckdb::Error) -> String + '_ {
     move |e| format!("{context}: {e}")
 }
 
+/// Every row of `sql`, mapped by `row`. `context` names the query in errors.
+fn rows<T>(
+    conn: &Connection,
+    context: &str,
+    sql: &str,
+    params: impl duckdb::Params,
+    row: impl FnMut(&duckdb::Row) -> duckdb::Result<T>,
+) -> Result<Vec<T>, String> {
+    let mut stmt = conn.prepare(sql).map_err(err(context))?;
+    let out = stmt.query_map(params, row).map_err(err(context))?.collect::<Result<_, _>>().map_err(err(context))?;
+    Ok(out)
+}
+
+/// The two string columns of every row of `sql`.
+fn string_pairs(conn: &Connection, context: &str, sql: &str, params: impl duckdb::Params) -> Result<Vec<(String, String)>, String> {
+    rows(conn, context, sql, params, |r| Ok((r.get(0)?, r.get(1)?)))
+}
+
+/// Run `f` in a transaction, rolled back if it fails. Returns the snapshot
+/// that holds the commit.
+fn in_transaction(conn: &Connection, f: impl FnOnce() -> Result<(), String>) -> Result<i64, String> {
+    conn.execute_batch("BEGIN TRANSACTION").map_err(err("begin"))?;
+    if let Err(e) = f() {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
+    conn.execute_batch("COMMIT").map_err(err("commit"))?;
+    conn.query_row(&format!("SELECT id FROM {CATALOG}.current_snapshot()"), [], |r| r.get(0))
+        .map_err(err("current snapshot"))
+}
+
+/// Run `sql`, naming it in the error.
+fn exec(conn: &Connection, sql: String) -> Result<(), String> {
+    conn.execute_batch(&sql).map_err(|e| format!("{sql}: {e}"))
+}
+
 /// Column names and DuckDB types of the table, or `None` when it does not exist.
 pub fn table_columns(conn: &Connection, pipeline: &str, table_id: &str) -> Result<Option<Vec<(String, String)>>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT column_name, data_type FROM duckdb_columns() \
-             WHERE database_name = ? AND schema_name = ? AND table_name = ? ORDER BY column_index",
-        )
-        .map_err(err("list columns"))?;
-    let cols = stmt
-        .query_map([CATALOG, pipeline, table_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map_err(err("list columns"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err("list columns"))?;
-    Ok(if cols.is_empty() { None } else { Some(cols) })
+    let cols = string_pairs(
+        conn,
+        "list columns",
+        "SELECT column_name, data_type FROM duckdb_columns() \
+         WHERE database_name = ? AND schema_name = ? AND table_name = ? ORDER BY column_index",
+        [CATALOG, pipeline, table_id],
+    )?;
+    Ok((!cols.is_empty()).then_some(cols))
 }
 
 fn file_columns(conn: &Connection, path: &Path) -> Result<Vec<(String, String)>, String> {
-    let mut stmt = conn
-        .prepare(&format!("DESCRIBE SELECT * FROM {}", file_ref(path)))
-        .map_err(err("describe staged rows"))?;
-    let cols = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map_err(err("describe staged rows"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err("describe staged rows"))?;
-    Ok(cols)
+    string_pairs(conn, "describe staged rows", &format!("DESCRIBE SELECT * FROM {}", file_ref(path)), [])
 }
 
 fn count(conn: &Connection, sql: &str) -> Result<usize, String> {
@@ -310,25 +319,20 @@ pub fn read_records(conn: &Connection, pipeline: &str, table_id: &str) -> Result
     if table_columns(conn, pipeline, RECORDS_TABLE)?.is_none() {
         return Ok(HashMap::new());
     }
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT mapping_id, fingerprint, files FROM {} WHERE table_id = ?",
-            records_table(pipeline)
-        ))
-        .map_err(err("read source records"))?;
-    let rows = stmt
-        .query_map([table_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    let records = rows(
+        conn,
+        "read source records",
+        &format!("SELECT mapping_id, fingerprint, files FROM {} WHERE table_id = ?", records_table(pipeline)),
+        [table_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+    )?;
+    records
+        .into_iter()
+        .map(|(mapping_id, fingerprint, files)| {
+            let files = serde_json::from_str(&files).map_err(|e| format!("source record {mapping_id}: {e}"))?;
+            Ok((mapping_id.clone(), MappingSources { mapping_id, fingerprint, files }))
         })
-        .map_err(err("read source records"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err("read source records"))?;
-    let mut out = HashMap::new();
-    for (mapping_id, fingerprint, files) in rows {
-        let files = serde_json::from_str(&files).map_err(|e| format!("source record {mapping_id}: {e}"))?;
-        out.insert(mapping_id.clone(), MappingSources { mapping_id, fingerprint, files });
-    }
-    Ok(out)
+        .collect()
 }
 
 /// Copy the rows of `staged` whose dedup key is not already stored for
@@ -383,9 +387,9 @@ pub fn drop_stored_keys(
 
 /// One mapping's staged rows for a table.
 #[derive(Debug)]
-pub struct Write<'a> {
-    pub mapping_id: &'a str,
-    pub file: &'a Path,
+pub struct Write {
+    pub mapping_id: String,
+    pub file: std::path::PathBuf,
     /// Replace the mapping's stored rows, or add to them.
     pub replace: bool,
 }
@@ -394,7 +398,7 @@ pub struct Write<'a> {
 pub struct Commit<'a> {
     pub pipeline: &'a str,
     pub table: &'a AnalyticTable,
-    pub writes: &'a [Write<'a>],
+    pub writes: &'a [Write],
     /// Every mapping's record after this run; replaces the stored ones.
     pub records: &'a HashMap<String, MappingSources>,
     /// Remove every stored row first, including rows of mappings that no
@@ -415,24 +419,14 @@ pub fn commit_table(conn: &Connection, commit: &Commit) -> Result<i64, String> {
     ))
     .map_err(err("create schema"))?;
     let existing = table_columns(conn, commit.pipeline, &commit.table.id)?;
-    conn.execute_batch("BEGIN TRANSACTION").map_err(err("begin"))?;
-    match write_table(conn, commit, &wanted, existing) {
-        Ok(()) => {
-            conn.execute_batch("COMMIT").map_err(err("commit"))?;
-            current_snapshot(conn)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(e)
-        }
-    }
+    in_transaction(conn, || write_table(conn, commit, &wanted, existing))
 }
 
 /// Union of the staged files' columns, in first-seen order.
 fn wanted_columns(conn: &Connection, writes: &[Write]) -> Result<Vec<(String, String)>, String> {
     let mut out: Vec<(String, String)> = Vec::new();
     for w in writes {
-        for (name, ty) in file_columns(conn, w.file)? {
+        for (name, ty) in file_columns(conn, &w.file)? {
             match out.iter().find(|(n, _)| *n == name) {
                 Some((_, t)) if *t != ty => {
                     return Err(format!("column `{name}` is {t} in one mapping and {ty} in another"));
@@ -462,7 +456,7 @@ fn write_table(
     let table = table_ref(commit.pipeline, &commit.table.id);
     let mut wanted_all: Vec<(String, String)> = wanted.to_vec();
     wanted_all.push((MAPPING_COLUMN.to_string(), "VARCHAR".to_string()));
-    let exec = |sql: String| conn.execute_batch(&sql).map_err(|e| format!("{sql}: {e}"));
+    let exec = |sql: String| exec(conn, sql);
 
     let create = match &existing {
         None => true,
@@ -506,13 +500,13 @@ fn write_table(
 
     for w in commit.writes {
         if w.replace && !commit.clean {
-            exec(format!("DELETE FROM {table} WHERE {} = {}", ident(MAPPING_COLUMN), lit(w.mapping_id)))?;
+            exec(format!("DELETE FROM {table} WHERE {} = {}", ident(MAPPING_COLUMN), lit(&w.mapping_id)))?;
         }
         exec(format!(
             "INSERT INTO {table} BY NAME SELECT *, {} AS {} FROM {}",
-            lit(w.mapping_id),
+            lit(&w.mapping_id),
             ident(MAPPING_COLUMN),
-            file_ref(w.file),
+            file_ref(&w.file),
         ))?;
     }
 
@@ -534,16 +528,12 @@ fn write_table(
             lit(&files),
         ))?;
     }
-    let message = match commit.job_id {
-        Some(id) => format!("job {id}"),
-        None => "run".to_string(),
-    };
-    exec(format!("CALL {CATALOG}.set_commit_message('karet-worker', {})", lit(&message)))
+    let message = commit.job_id.map_or_else(|| "run".to_string(), |id| format!("job {id}"));
+    set_commit_message(conn, &message)
 }
 
-fn current_snapshot(conn: &Connection) -> Result<i64, String> {
-    conn.query_row(&format!("SELECT id FROM {CATALOG}.current_snapshot()"), [], |r| r.get(0))
-        .map_err(err("current snapshot"))
+fn set_commit_message(conn: &Connection, message: &str) -> Result<(), String> {
+    exec(conn, format!("CALL {CATALOG}.set_commit_message('karet-worker', {})", lit(message)))
 }
 
 /// The DuckLake id of a table, or `None` when it does not exist.
@@ -552,47 +542,28 @@ fn table_id_in_catalog(conn: &Connection, pipeline: &str, table_id: &str) -> Res
         "SELECT t.table_id FROM {METADATA}.ducklake_table t JOIN {METADATA}.ducklake_schema s USING (schema_id) \
          WHERE s.schema_name = ? AND t.table_name = ? AND t.end_snapshot IS NULL AND s.end_snapshot IS NULL"
     );
-    let mut stmt = conn.prepare(&sql).map_err(err("find table"))?;
-    let mut rows = stmt.query([pipeline, table_id]).map_err(err("find table"))?;
-    match rows.next().map_err(err("find table"))? {
-        Some(r) => Ok(Some(r.get(0).map_err(err("find table"))?)),
-        None => Ok(None),
-    }
+    Ok(rows(conn, "find table", &sql, [pipeline, table_id], |r| r.get(0))?.into_iter().next())
 }
 
 /// Every snapshot id with the ids of the tables whose rows it changed.
 fn data_snapshots(conn: &Connection) -> Result<Vec<(i64, BTreeSet<i64>)>, String> {
     let keys = DATA_CHANGES.iter().map(|k| lit(k)).collect::<Vec<_>>().join(", ");
+    // One row per changed table, and a row with no table for a snapshot that
+    // changed none, so every snapshot is listed.
     let sql = format!(
-        "SELECT snapshot_id, list_distinct(flatten(list_transform([{keys}], k -> coalesce(changes[k], [])))) \
-         FROM {CATALOG}.snapshots() ORDER BY snapshot_id"
+        "SELECT snapshot_id, unnest(CASE WHEN len(t) = 0 THEN [NULL] ELSE t END)::BIGINT FROM ( \
+           SELECT snapshot_id, list_distinct(flatten(list_transform([{keys}], k -> coalesce(changes[k], [])))) AS t \
+           FROM {CATALOG}.snapshots()) ORDER BY snapshot_id"
     );
-    let mut stmt = conn.prepare(&sql).map_err(err("list snapshots"))?;
-    let rows = stmt
-        .query_map([], |r| {
-            let id: i64 = r.get(0)?;
-            let tables: duckdb::types::Value = r.get(1)?;
-            Ok((id, tables))
-        })
-        .map_err(err("list snapshots"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err("list snapshots"))?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, value)| {
-            let tables = match value {
-                duckdb::types::Value::List(items) => items
-                    .into_iter()
-                    .filter_map(|v| match v {
-                        duckdb::types::Value::Text(s) => s.parse().ok(),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => BTreeSet::new(),
-            };
-            (id, tables)
-        })
-        .collect())
+    let pairs = rows(conn, "list snapshots", &sql, [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))?;
+    let mut out: Vec<(i64, BTreeSet<i64>)> = Vec::new();
+    for (id, table) in pairs {
+        if out.last().map(|(last, _)| *last) != Some(id) {
+            out.push((id, BTreeSet::new()));
+        }
+        out.last_mut().expect("pushed above").1.extend(table);
+    }
+    Ok(out)
 }
 
 /// The snapshots that changed this table's rows, oldest first.
@@ -605,15 +576,8 @@ pub fn table_versions(conn: &Connection, pipeline: &str, table_id: &str) -> Resu
 
 /// DuckLake ids of the tables that exist now.
 fn live_table_ids(conn: &Connection) -> Result<BTreeSet<i64>, String> {
-    let mut stmt = conn
-        .prepare(&format!("SELECT table_id FROM {METADATA}.ducklake_table WHERE end_snapshot IS NULL"))
-        .map_err(err("list tables"))?;
-    let ids = stmt
-        .query_map([], |r| r.get::<_, i64>(0))
-        .map_err(err("list tables"))?
-        .collect::<Result<BTreeSet<_>, _>>()
-        .map_err(err("list tables"))?;
-    Ok(ids)
+    let sql = format!("SELECT table_id FROM {METADATA}.ducklake_table WHERE end_snapshot IS NULL");
+    Ok(rows(conn, "list tables", &sql, [], |r| r.get(0))?.into_iter().collect())
 }
 
 /// Snapshots to expire: all but the latest, and the last `keep` that changed
@@ -642,26 +606,19 @@ fn inlined_rows(conn: &Connection, pipeline: &str, table_id: &str) -> Result<usi
     let Some(id) = table_id_in_catalog(conn, pipeline, table_id)? else {
         return Ok(0);
     };
-    let mut stmt = conn
-        .prepare(&format!("SELECT table_name FROM {METADATA}.ducklake_inlined_data_tables WHERE table_id = ?"))
-        .map_err(err("list inlined tables"))?;
-    let names = stmt
-        .query_map([id], |r| r.get::<_, String>(0))
-        .map_err(err("list inlined tables"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(err("list inlined tables"))?;
-    let mut total = 0;
-    for name in names {
-        total += count(conn, &format!("SELECT count(*) FROM {METADATA}.{} WHERE end_snapshot IS NULL", ident(&name)))?;
-    }
-    Ok(total)
+    let sql = format!("SELECT table_name FROM {METADATA}.ducklake_inlined_data_tables WHERE table_id = ?");
+    let names: Vec<String> = rows(conn, "list inlined tables", &sql, [id], |r| r.get(0))?;
+    names
+        .iter()
+        .map(|name| count(conn, &format!("SELECT count(*) FROM {METADATA}.{} WHERE end_snapshot IS NULL", ident(name))))
+        .sum()
 }
 
 /// Write the table's catalog-stored rows to Parquet once there are at least
 /// `min_rows`. Returns the rows written.
 pub fn flush_inlined(conn: &Connection, pipeline: &str, table_id: &str, min_rows: usize) -> Result<usize, String> {
     let rows = inlined_rows(conn, pipeline, table_id)?;
-    if rows == 0 || rows < min_rows {
+    if rows < min_rows.max(1) {
         return Ok(0);
     }
     conn.execute_batch(&format!(
@@ -743,30 +700,19 @@ pub fn restore(conn: &Connection, pipeline: &str, table_id: &str, version: i64) 
     // Copied out first: inside the transaction, the delete below also hides
     // the rows of any file the old version shares with the live one.
     let staging = tempfile::tempdir().map_err(|e| RestoreError::Failed(format!("staging folder: {e}")))?;
-    let rows = staging.path().join("restore.parquet");
+    let copy = staging.path().join("restore.parquet");
     conn.execute_batch(&format!(
         "COPY (SELECT * FROM {table} AT (VERSION => {version})) TO {} (FORMAT parquet)",
-        lit(&rows.to_string_lossy())
+        lit(&copy.to_string_lossy())
     ))
     .map_err(|e| RestoreError::Failed(format!("read version {version}: {e}")))?;
-    let run = || -> Result<(), String> {
-        let exec = |sql: String| conn.execute_batch(&sql).map_err(|e| format!("{sql}: {e}"));
-        exec(format!("DELETE FROM {table}"))?;
-        exec(format!("INSERT INTO {table} BY NAME SELECT * FROM {}", file_ref(&rows)))?;
-        exec(format!("DELETE FROM {} WHERE table_id = {}", records_table(pipeline), lit(table_id)))?;
-        exec(format!("CALL {CATALOG}.set_commit_message('karet-worker', {})", lit(&format!("restore {version}"))))
-    };
-    conn.execute_batch("BEGIN TRANSACTION").map_err(|e| RestoreError::Failed(e.to_string()))?;
-    match run() {
-        Ok(()) => {
-            conn.execute_batch("COMMIT").map_err(|e| RestoreError::Failed(format!("commit: {e}")))?;
-            current_snapshot(conn).map_err(RestoreError::Failed)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(RestoreError::Failed(e))
-        }
-    }
+    in_transaction(conn, || {
+        exec(conn, format!("DELETE FROM {table}"))?;
+        exec(conn, format!("INSERT INTO {table} BY NAME SELECT * FROM {}", file_ref(&copy)))?;
+        exec(conn, format!("DELETE FROM {} WHERE table_id = {}", records_table(pipeline), lit(table_id)))?;
+        set_commit_message(conn, &format!("restore {version}"))
+    })
+    .map_err(RestoreError::Failed)
 }
 
 #[cfg(test)]

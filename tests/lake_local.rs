@@ -62,8 +62,8 @@ fn table() -> AnalyticTable {
     }
 }
 
-fn write<'a>(mapping_id: &'a str, file: &'a Path, replace: bool) -> Write<'a> {
-    Write { mapping_id, file, replace }
+fn write(mapping_id: &str, file: &Path, replace: bool) -> Write {
+    Write { mapping_id: mapping_id.into(), file: file.into(), replace }
 }
 
 fn record(mapping_id: &str, keys: &[&str]) -> HashMap<String, MappingSources> {

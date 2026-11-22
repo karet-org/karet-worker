@@ -165,52 +165,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Maximum accepted `pipeline_prefix` length. Generous for
-/// `pipelines/<slug>/` shapes while still bounding pathological input.
-const MAX_PREFIX_LEN: usize = 512;
-
-/// Validate a caller-supplied pipeline prefix before it is interpolated
-/// into S3 keys for reads, writes, and (with `clean_run`) deletes.
-///
-/// Accepts only `segment/segment/.../` shapes: a trailing slash, no
-/// leading slash, non-empty segments of `[A-Za-z0-9._-]`, and no `.` /
-/// `..` segments. The web app sends `pipelines/<slug>/` where the slug is
-/// already `[a-z0-9-]`, so this is a superset of legitimate traffic.
-pub fn validate_pipeline_prefix(prefix: &str) -> Result<(), String> {
-    if prefix.is_empty() {
-        return Err("pipeline_prefix must not be empty".into());
-    }
-    if prefix.len() > MAX_PREFIX_LEN {
-        return Err(format!(
-            "pipeline_prefix is too long ({} bytes, max {MAX_PREFIX_LEN})",
-            prefix.len()
-        ));
-    }
-    if prefix.starts_with('/') {
-        return Err("pipeline_prefix must not start with '/'".into());
-    }
-    if !prefix.ends_with('/') {
-        return Err("pipeline_prefix must end with '/'".into());
-    }
-    for segment in prefix[..prefix.len() - 1].split('/') {
-        if segment.is_empty() {
-            return Err("pipeline_prefix must not contain empty path segments".into());
-        }
-        if segment == "." || segment == ".." {
-            return Err("pipeline_prefix must not contain '.' or '..' segments".into());
-        }
-        if !segment
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        {
-            return Err(format!(
-                "pipeline_prefix segment '{segment}' contains characters outside [A-Za-z0-9._-]"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// `GET /health`. Liveness plus, when the queue is enabled, a readiness
 /// signal: Redis reachability, queue depth, and in-flight count. Returns
 /// 503 when the queue is enabled but Redis is unreachable.
@@ -788,47 +742,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    // ---- pipeline_prefix validation ----------------------------------------
-    // (enforced at claim time in queue.rs; the shape rules live here)
-
-    #[test]
-    fn validate_pipeline_prefix_accepts_legitimate_shapes() {
-        for prefix in [
-            "pipelines/demo/",
-            "pipelines/my-pipeline-2/",
-            "a/b.c/d_e/",
-            "single/",
-        ] {
-            assert!(
-                validate_pipeline_prefix(prefix).is_ok(),
-                "expected Ok for {prefix:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_pipeline_prefix_rejects_malformed_shapes() {
-        let cases = [
-            "",
-            "no-trailing-slash",
-            "/leading/slash/",
-            "double//slash/",
-            "pipelines/../other/",
-            "./relative/",
-            "pipelines/sp ace/",
-            "pipelines/semi;colon/",
-            "pipelines/quo'te/",
-        ];
-        for prefix in cases {
-            assert!(
-                validate_pipeline_prefix(prefix).is_err(),
-                "expected Err for {prefix:?}"
-            );
-        }
-        let too_long = format!("{}/", "a".repeat(600));
-        assert!(validate_pipeline_prefix(&too_long).is_err());
     }
 
     // ---- /events/s3 webhook ------------------------------------------------

@@ -258,7 +258,7 @@ async fn pipelines_commit_at_the_same_time_with_a_postgres_catalog() {
                         &lake::Commit {
                             pipeline: &pipeline,
                             table: &table,
-                            writes: &[lake::Write { mapping_id: "m", file: &file, replace: true }],
+                            writes: &[lake::Write { mapping_id: "m".into(), file: file.clone(), replace: true }],
                             records: &records,
                             clean: false,
                             job_id: None,

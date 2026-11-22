@@ -31,6 +31,7 @@ sha2 = "0.10"
 duckdb = "=1.10506.1"
 tempfile = "3"
 url = "2"
+percent-encoding = "2"
 # Polars allocates and frees large buffers. glibc malloc keeps freed memory
 # in the process, so a full run left the worker holding gigabytes while idle.
 # jemalloc returns it to the system.

@@ -2,7 +2,7 @@
 //!
 //! Both entry points — the legacy `POST /jobs/run` HTTP handler and the
 //! Redis stream consumer — run jobs through [`execute_job`], so behavior
-//! (clean_run semantics, per-mapping error containment, partition upload)
+//! (clean_run semantics, per-mapping error containment, the lake commit)
 //! is identical regardless of transport.
 
 use std::collections::{HashMap, HashSet};
@@ -317,14 +317,15 @@ pub async fn execute_job(
             incremental::Plan::Unchanged => continue,
             incremental::Plan::Full(_) => {}
             incremental::Plan::Append(new) => {
-                match append_mapping(ctx, pipeline, &cfg, mapping, new, &downloaded, &matchers, staging.path())
+                let staged = staging.path().join(format!("{mapping_idx}"));
+                match append_mapping(ctx, pipeline, &cfg, mapping, new, &downloaded, &matchers, &staged)
                     .await
                 {
                     Ok(appended) => {
                         total_partitions += appended.partitions;
                         total_deduped += appended.dropped;
                         if let Some(file) = appended.file {
-                            publish.writes.push(StagedWrite { mapping_id: mapping.id.clone(), file, replace: false });
+                            publish.writes.push(lake::Write { mapping_id: mapping.id.clone(), file, replace: false });
                         }
                         let previous =
                             publish.sources.get(&mapping.id).map(|s| s.files.as_slice()).unwrap_or(&[]);
@@ -387,7 +388,7 @@ pub async fn execute_job(
             Ok(Ok((partitions, dropped))) => {
                 total_partitions += partitions;
                 total_deduped += dropped;
-                publish.writes.push(StagedWrite { mapping_id: mapping.id.clone(), file, replace: true });
+                publish.writes.push(lake::Write { mapping_id: mapping.id.clone(), file, replace: true });
                 publish.record(&mapping.id, fingerprint, read);
             }
             Ok(Err(Failure::Mapping(msg) | Failure::Fallback(msg))) => errors.push(msg),
@@ -405,17 +406,12 @@ pub async fn execute_job(
         }
         let (p, t, job) = (pipeline.to_string(), table.clone(), job_id.map(str::to_string));
         let committed = with_lake(&ctx.lake, move |c| {
-            let writes: Vec<lake::Write> = publish
-                .writes
-                .iter()
-                .map(|w| lake::Write { mapping_id: &w.mapping_id, file: &w.file, replace: w.replace })
-                .collect();
             lake::commit_table(
                 c,
                 &lake::Commit {
                     pipeline: &p,
                     table: &t,
-                    writes: &writes,
+                    writes: &publish.writes,
                     records: &publish.sources,
                     clean: clean_run,
                     job_id: job.as_deref(),
@@ -456,16 +452,8 @@ pub async fn execute_job(
 struct TablePublish {
     /// What each mapping's rows were built from, by mapping id.
     sources: HashMap<String, incremental::MappingSources>,
-    writes: Vec<StagedWrite>,
+    writes: Vec<lake::Write>,
     touched: bool,
-}
-
-/// One mapping's rows, staged in a local Parquet file.
-struct StagedWrite {
-    mapping_id: String,
-    file: std::path::PathBuf,
-    /// Replace the mapping's stored rows, or add to them.
-    replace: bool,
 }
 
 fn stage(df: &mut DataFrame, path: &std::path::Path) -> Result<(), String> {
@@ -565,6 +553,7 @@ struct Appended {
 }
 
 /// Ingest `new` files and stage the rows whose dedup key is not stored yet.
+/// Staged files are named `<staged>.new.parquet` and `<staged>.kept.parquet`.
 #[allow(clippy::too_many_arguments)]
 async fn append_mapping(
     ctx: &JobContext,
@@ -574,7 +563,7 @@ async fn append_mapping(
     new: &[SourceObject],
     downloaded: &HashMap<String, Vec<u8>>,
     matchers: &HashMap<String, Arc<dimension::DimensionMatcher>>,
-    staging: &std::path::Path,
+    staged: &std::path::Path,
 ) -> Result<Appended, Failure> {
     let read: Vec<SourceObject> = new
         .iter()
@@ -587,44 +576,38 @@ async fn append_mapping(
         .collect();
     let table = table_for(cfg, mapping)?.clone();
 
-    let ingested_path = staging.join(format!("{}.new.parquet", sanitize(&mapping.id)));
-    let kept_path = staging.join(format!("{}.kept.parquet", sanitize(&mapping.id)));
+    let ingested_path = staged.with_extension("new.parquet");
+    let kept_path = staged.with_extension("kept.parquet");
     let (cfg_c, mapping_c, matchers_c, table_c, ingested_c) =
         (cfg.clone(), mapping.clone(), matchers.clone(), table.clone(), ingested_path.clone());
-    let ingested = tokio::task::spawn_blocking(move || {
+    // The rows dropped by dedup within the new files, and whether any are left.
+    let (dropped, any) = tokio::task::spawn_blocking(move || {
         let Some((mut rows, dropped)) = ingest_checked(&files, &cfg_c, &mapping_c, &matchers_c)? else {
-            return Ok(None);
+            return Ok((0, false));
         };
+        // Fails the mapping on a null partition key, as a full run does.
         pipeline::count_partitions(&rows, &table_c)
             .map_err(|e| Failure::Mapping(format!("partition {}: {e}", mapping_c.id)))?;
-        if rows.height() == 0 {
-            return Ok(Some(dropped));
+        if rows.height() > 0 {
+            stage(&mut rows, &ingested_c).map_err(Failure::Fallback)?;
         }
-        stage(&mut rows, &ingested_c).map_err(Failure::Fallback)?;
-        Ok(Some(dropped))
+        Ok((dropped, rows.height() > 0))
     })
     .await
     .map_err(|e| Failure::Fallback(format!("ingest task panicked: {e}")))??;
-    let Some(dropped) = ingested else {
-        return Ok(Appended { file: None, partitions: 0, dropped: 0, read });
-    };
-    if !ingested_path.exists() {
+    if !any {
         return Ok(Appended { file: None, partitions: 0, dropped, read });
     }
 
-    let (p, m, t, i, k) = (pipeline.to_string(), mapping.id.clone(), table.clone(), ingested_path, kept_path.clone());
-    let (stored_dupes, partitions) = with_lake(&ctx.lake, move |c| lake::drop_stored_keys(c, &p, &t, &m, &i, &k))
-        .await
-        .map_err(Failure::Fallback)?;
+    let (p, m, k) = (pipeline.to_string(), mapping.id.clone(), kept_path.clone());
+    let (stored_dupes, partitions) =
+        with_lake(&ctx.lake, move |c| lake::drop_stored_keys(c, &p, &table, &m, &ingested_path, &k))
+            .await
+            .map_err(Failure::Fallback)?;
     Ok(Appended {
         file: (partitions > 0).then_some(kept_path),
         partitions,
         dropped: dropped + stored_dupes,
         read,
     })
-}
-
-/// A mapping id as a file name.
-fn sanitize(id: &str) -> String {
-    id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
 }

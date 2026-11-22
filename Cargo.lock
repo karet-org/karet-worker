@@ -2671,6 +2671,7 @@ dependencies = [
  "duckdb",
  "futures-util",
  "http-body-util",
+ "percent-encoding",
  "polars",
  "proptest",
  "redis",

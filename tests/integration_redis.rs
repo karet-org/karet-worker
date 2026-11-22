@@ -131,7 +131,6 @@ fn msg(job_id: &str, pipeline: &str) -> JobMessage {
     JobMessage {
         job_id: job_id.into(),
         pipeline: pipeline.into(),
-        prefix: format!("pipelines/{pipeline}/"),
         config_version_id: None,
         clean_run: false,
         trigger: "manual".into(),
@@ -311,7 +310,7 @@ async fn debounce_extends_quiet_window_and_fires_once() {
     assert!(remaining.is_empty());
     let first: Option<String> = conn.get("karet:debounce:first:gamma").await.unwrap();
     assert_eq!(first, None);
-    // The enqueued message is a webhook-trigger job for the right prefix.
+    // The enqueued message is a webhook-trigger job.
     let live_trigger = hget(&mut conn, &job_ids[0], "trigger").await;
     assert_eq!(live_trigger.as_deref(), Some("webhook"));
 
