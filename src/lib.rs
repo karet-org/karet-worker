@@ -133,6 +133,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             lake_bucket: lake_bucket.clone(),
             db: db_pool.clone(),
             lake: lake.clone(),
+            now: job::system_now,
         },
         consumer_name,
         settings,

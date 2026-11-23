@@ -39,6 +39,16 @@ pub async fn list_objects(
     bucket: &str,
     prefix: &str,
 ) -> Result<Vec<crate::incremental::SourceObject>, String> {
+    Ok(list_objects_modified(client, bucket, prefix).await?.into_iter().map(|(o, _)| o).collect())
+}
+
+/// [`list_objects`], with each object's upload time in Unix seconds, if the
+/// store reports one.
+pub async fn list_objects_modified(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<Vec<(crate::incremental::SourceObject, Option<i64>)>, String> {
     let mut objects = Vec::new();
     let mut token: Option<String> = None;
     loop {
@@ -56,7 +66,8 @@ pub async fn list_objects(
                         obj.last_modified().map(|d| d.to_string()).unwrap_or_default()
                     ),
                 };
-                objects.push(crate::incremental::SourceObject { key: k.to_string(), etag });
+                let modified = obj.last_modified().map(|d| d.secs());
+                objects.push((crate::incremental::SourceObject { key: k.to_string(), etag }, modified));
             }
         }
         match resp.next_continuation_token() {
@@ -65,6 +76,31 @@ pub async fn list_objects(
         }
     }
     Ok(objects)
+}
+
+/// Delete `keys`, up to 1,000 per request. Returns how many were deleted.
+pub async fn delete_keys(client: &Client, bucket: &str, keys: &[String]) -> Result<usize, String> {
+    use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+    let mut deleted = 0;
+    for chunk in keys.chunks(1000) {
+        let objects = chunk
+            .iter()
+            .map(|k| ObjectIdentifier::builder().key(k).build().map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let delete = Delete::builder().set_objects(Some(objects)).quiet(true).build().map_err(|e| e.to_string())?;
+        let resp = client
+            .delete_objects()
+            .bucket(bucket)
+            .delete(delete)
+            .send()
+            .await
+            .map_err(|e| format!("S3 DeleteObjects failed: {}", err_chain(&e)))?;
+        if let Some(e) = resp.errors().first() {
+            return Err(format!("S3 DeleteObjects failed for {}: {}", e.key().unwrap_or("?"), e.message().unwrap_or("?")));
+        }
+        deleted += chunk.len();
+    }
+    Ok(deleted)
 }
 
 pub async fn get_bytes(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>, String> {

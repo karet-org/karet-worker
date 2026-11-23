@@ -89,6 +89,13 @@ pub struct JobContext {
     pub db: sqlx::PgPool,
     /// The DuckLake catalog the analytic tables are written to.
     pub lake: Arc<Lake>,
+    /// The time retention measures from, in Unix seconds. Tests move it.
+    pub now: fn() -> i64,
+}
+
+/// [`JobContext::now`] outside tests.
+pub fn system_now() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 /// Run `f` with a lake connection on the blocking pool.
@@ -167,19 +174,24 @@ pub async fn execute_job(
 
     progress.update(Progress::Downloading { done: 0, total: 0 });
     let mut listings: HashMap<String, Vec<SourceObject>> = HashMap::new();
+    // Upload times, for sources with retention.
+    let mut uploaded: HashMap<String, Vec<(SourceObject, Option<i64>)>> = HashMap::new();
     let mut seen = HashSet::new();
     for sc in &cfg.source_containers {
         // path_prefix is an absolute lake key prefix; sources may point at
         // any folder in the lake, not just this pipeline's.
-        match s3mod::list_objects(&ctx.s3_client, &ctx.lake_bucket, &sc.path_prefix).await {
+        match s3mod::list_objects_modified(&ctx.s3_client, &ctx.lake_bucket, &sc.path_prefix).await {
             Ok(objects) => {
                 let exts = sc.format.extensions();
-                let mut listing: Vec<SourceObject> = objects
+                let mut objects: Vec<(SourceObject, Option<i64>)> = objects
                     .into_iter()
-                    .filter(|o| exts.iter().any(|e| o.key.ends_with(e)) && seen.insert(o.key.clone()))
+                    .filter(|(o, _)| exts.iter().any(|e| o.key.ends_with(e)) && seen.insert(o.key.clone()))
                     .collect();
-                listing.sort();
-                listings.insert(sc.id.clone(), listing);
+                objects.sort();
+                listings.insert(sc.id.clone(), objects.iter().map(|(o, _)| o.clone()).collect());
+                if sc.retention_days.is_some() {
+                    uploaded.insert(sc.id.clone(), objects);
+                }
             }
             Err(e) => tracing::warn!("failed to list keys for {}: {e}", sc.path_prefix),
         }
@@ -233,10 +245,63 @@ pub async fn execute_job(
     let matchers = matchers;
     dimension_files.sort();
 
+    let fingerprints: Vec<String> =
+        cfg.mappings.iter().map(|m| incremental::fingerprint(&cfg, m, &dimension_files)).collect();
+
+    // Raw files past their source's retention, once loaded by every mapping
+    // that reads them, stop being inputs: they move from each record's files
+    // to its expired keys, which is committed with the tables, and are then
+    // deleted from the lake. The rows loaded from them stay in the tables.
+    let now = (ctx.now)();
+    for sc in &cfg.source_containers {
+        let Some(objects) = uploaded.get(&sc.id) else { continue };
+        let readers: Vec<(&crate::config::Mapping, &str)> = cfg
+            .mappings
+            .iter()
+            .zip(&fingerprints)
+            .filter(|(m, _)| m.source_container_id == sc.id)
+            .map(|(m, f)| (m, f.as_str()))
+            .collect();
+        let listed: HashSet<&SourceObject> = objects.iter().map(|(o, _)| o).collect();
+        let fresh = match sc.retention_days {
+            Some(days) => {
+                let records: Vec<_> = readers
+                    .iter()
+                    .map(|(m, f)| (publishes.get(&m.analytic_table_id).and_then(|p| p.sources.get(&m.id)), *f))
+                    .collect();
+                incremental::expired_files(objects, now - i64::from(days) * 86_400, &records)
+            }
+            None => HashSet::new(),
+        };
+        if !fresh.is_empty() {
+            tracing::info!(source = %sc.id, files = fresh.len(), "raw files past retention");
+        }
+        let mut excluded: HashSet<SourceObject> = fresh.clone();
+        for (m, _) in &readers {
+            let Some(p) = publishes.get_mut(&m.analytic_table_id) else { continue };
+            let Some(record) = p.sources.get_mut(&m.id) else { continue };
+            let before = record.expired.len();
+            // A key no longer in the lake has been deleted; forget it.
+            record.expired.retain(|o| listed.contains(o));
+            if !fresh.is_empty() {
+                record.files.retain(|o| !fresh.contains(o));
+                record.expired.extend(fresh.iter().cloned());
+                record.expired.sort();
+                record.expired.dedup();
+            }
+            if record.expired.len() != before || !fresh.is_empty() {
+                p.touched = true;
+            }
+            excluded.extend(record.expired.iter().cloned());
+        }
+        if let Some(listing) = listings.get_mut(&sc.id) {
+            listing.retain(|o| !excluded.contains(o));
+        }
+    }
+
     let empty: Vec<SourceObject> = Vec::new();
     let mut plans: Vec<(incremental::Plan, String)> = Vec::with_capacity(cfg.mappings.len());
-    for mapping in &cfg.mappings {
-        let fingerprint = incremental::fingerprint(&cfg, mapping, &dimension_files);
+    for (mapping, fingerprint) in cfg.mappings.iter().zip(fingerprints) {
         let listing = listings.get(&mapping.source_container_id).unwrap_or(&empty);
         let order_matters = cfg
             .analytic_tables
@@ -399,6 +464,7 @@ pub async fn execute_job(
 
     // Commit each table that got new output, then tidy it. A table whose
     // every mapping failed is left as it was.
+    let mut unpublished: HashSet<String> = HashSet::new();
     for table in &cfg.analytic_tables {
         let Some(publish) = publishes.remove(&table.id) else { continue };
         if !publish.touched {
@@ -423,6 +489,7 @@ pub async fn execute_job(
             Ok(snapshot) => tracing::info!(table = %table.id, snapshot, "published table version"),
             Err(e) => {
                 errors.push(format!("publish {}: {e}", table.id));
+                unpublished.insert(table.id.clone());
                 continue;
             }
         }
@@ -431,6 +498,27 @@ pub async fn execute_job(
             Ok(0) => {}
             Ok(n) => tracing::info!(table = %table.id, expired = n, "expired old snapshots"),
             Err(e) => tracing::warn!(table = %table.id, "maintenance skipped: {e}"),
+        }
+    }
+
+    // Delete the expired files of every table that committed: the record
+    // holding their keys is stored, so a failed delete is retried next run
+    // and the file is never read again.
+    let mut doomed: Vec<String> = Vec::new();
+    for table in cfg.analytic_tables.iter().filter(|t| !unpublished.contains(&t.id)) {
+        let (p, t) = (pipeline.to_string(), table.id.clone());
+        if let Ok(records) = with_lake(&ctx.lake, move |c| lake::read_records(c, &p, &t)).await {
+            doomed.extend(records.into_values().flat_map(|r| r.expired).map(|o| o.key));
+        }
+    }
+    let listed: HashSet<&str> = uploaded.values().flatten().map(|(o, _)| o.key.as_str()).collect();
+    doomed.retain(|k| listed.contains(k.as_str()));
+    doomed.sort();
+    doomed.dedup();
+    if !doomed.is_empty() {
+        match s3mod::delete_keys(&ctx.s3_client, &ctx.lake_bucket, &doomed).await {
+            Ok(n) => tracing::info!(files = n, "deleted raw files past retention"),
+            Err(e) => tracing::warn!("raw file retention: {e}"),
         }
     }
 
@@ -462,13 +550,17 @@ fn stage(df: &mut DataFrame, path: &std::path::Path) -> Result<(), String> {
 }
 
 impl TablePublish {
+    /// Keeps the record's expired keys: those files are still waiting to be
+    /// deleted, and must not be read as new ones.
     fn record(&mut self, mapping_id: &str, fingerprint: &str, files: Vec<SourceObject>) {
+        let expired = self.sources.get(mapping_id).map(|r| r.expired.clone()).unwrap_or_default();
         self.sources.insert(
             mapping_id.to_string(),
             incremental::MappingSources {
                 mapping_id: mapping_id.to_string(),
                 fingerprint: fingerprint.to_string(),
                 files,
+                expired,
             },
         );
         self.touched = true;

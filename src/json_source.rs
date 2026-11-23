@@ -217,6 +217,7 @@ mod tests {
 
     fn source(format: SourceFormat, schema: Vec<ColumnSchema>) -> SourceContainer {
         SourceContainer {
+            retention_days: None,
             id: "s".into(),
             name: "S".into(),
             path_prefix: "logs/".into(),

@@ -59,6 +59,10 @@ struct Stack {
 }
 
 async fn start() -> Stack {
+    start_with(CONFIG).await
+}
+
+async fn start_with(config: &str) -> Stack {
     let pg = GenericImage::new("postgres", "17-alpine")
         .with_exposed_port(5432.tcp())
         .with_env_var("POSTGRES_PASSWORD", "test")
@@ -94,7 +98,7 @@ async fn start() -> Stack {
     sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
     sqlx::raw_sql("CREATE DATABASE karet_lake").execute(&pool).await.unwrap();
     let (id,): (i64,) = sqlx::query_as("INSERT INTO config_versions (pipeline, config) VALUES ('p-1', $1::jsonb) RETURNING id")
-        .bind(CONFIG)
+        .bind(config)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -128,6 +132,7 @@ async fn start() -> Stack {
         lake_bucket: "karet-lake".into(),
         db: pool,
         lake: Arc::new(Lake::new(LakeCatalog::Postgres(settings))),
+        now: karet_worker::job::system_now,
     };
     Stack { _pg: pg, _s3: s3c, ctx, s3 }
 }
@@ -219,6 +224,7 @@ async fn pipelines_commit_at_the_same_time_with_a_postgres_catalog() {
     let lake = stack.ctx.lake.clone();
     let dir = tempfile::tempdir().unwrap();
     let table = karet_worker::config::AnalyticTable {
+        retention: None,
         id: "t".into(),
         name: "t".into(),
         schema: vec![],
@@ -250,6 +256,7 @@ async fn pipelines_commit_at_the_same_time_with_a_postgres_catalog() {
                             mapping_id: "m".into(),
                             fingerprint: "fp".into(),
                             files: vec![],
+                            expired: vec![],
                         },
                     )]);
                     barrier.wait();
@@ -273,4 +280,41 @@ async fn pipelines_commit_at_the_same_time_with_a_postgres_catalog() {
             }
         }
     }
+}
+
+fn in_ten_days() -> i64 {
+    karet_worker::job::system_now() + 10 * 86_400
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run with `cargo test --test integration_lake -- --ignored`"]
+async fn raw_files_past_retention_are_deleted_and_their_rows_kept() {
+    let config = CONFIG.replace(r#""path_prefix": "visa/","#, r#""path_prefix": "visa/", "retention_days": 7,"#);
+    assert_ne!(config, CONFIG);
+    let mut stack = start_with(&config).await;
+    stack.upload("visa/1-january.csv", "date,description,amount\n2024-01-05,starbucks,7.25\n2024-01-18,uber,12.8\n").await;
+    stack.upload("visa/2-february.csv", "date,description,amount\n2024-02-02,whole foods,45.1\n").await;
+    assert_eq!(stack.run(false).await.files_processed, 2);
+
+    // Ten days on, both files are past the 7-day retention.
+    stack.ctx.now = in_ten_days;
+    let expire = stack.run(false).await;
+    assert!(expire.errors.is_empty(), "{:?}", expire.errors);
+    assert_eq!(expire.files_processed, 0);
+    let left = stack.s3.list_objects_v2().bucket("karet-lake").prefix("visa/").send().await.unwrap();
+    assert_eq!(left.contents().len(), 0, "the raw files are deleted");
+    assert_eq!(stack.rows().len(), 3, "their rows stay");
+
+    // The same file uploaded again is not read twice, and is deleted again.
+    stack.upload("visa/2-february.csv", "date,description,amount\n2024-02-02,whole foods,45.1\n").await;
+    let again = stack.run(false).await;
+    assert_eq!(again.files_processed, 0);
+    let left = stack.s3.list_objects_v2().bucket("karet-lake").prefix("visa/").send().await.unwrap();
+    assert_eq!(left.contents().len(), 0);
+
+    // A new file appends; the deleted files do not make it a full run.
+    stack.upload("visa/3-march.csv", "date,description,amount\n2024-03-01,netflix,15.99\n").await;
+    let append = stack.run(false).await;
+    assert_eq!(append.files_processed, 1);
+    assert_eq!(stack.rows().len(), 4);
 }

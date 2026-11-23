@@ -54,6 +54,7 @@ impl Fixture {
 
 fn table() -> AnalyticTable {
     AnalyticTable {
+        retention: None,
         id: "t".into(),
         name: "t".into(),
         schema: vec![],
@@ -70,7 +71,7 @@ fn record(mapping_id: &str, keys: &[&str]) -> HashMap<String, MappingSources> {
     let files = keys.iter().map(|k| SourceObject { key: k.to_string(), etag: "e".into() }).collect();
     HashMap::from([(
         mapping_id.to_string(),
-        MappingSources { mapping_id: mapping_id.into(), fingerprint: "fp".into(), files },
+        MappingSources { mapping_id: mapping_id.into(), fingerprint: "fp".into(), files, expired: vec![] },
     )])
 }
 
@@ -369,4 +370,25 @@ fn the_resource_limits_apply_to_the_lake_connection() {
     };
     assert_eq!(get("SELECT current_setting('memory_limit')"), expected);
     assert_eq!(get("SELECT current_setting('threads')::VARCHAR"), "3");
+}
+
+#[test]
+fn rows_past_the_table_retention_are_deleted_on_commit() {
+    let f = Fixture::new();
+    let dated = AnalyticTable {
+        partition_keys: vec![],
+        dedup_keys: vec![],
+        retention: Some(karet_worker::config::RowRetention { column: "day".into(), days: 30 }),
+        ..table()
+    };
+    let rows = f.stage(
+        "rows",
+        "SELECT * FROM (VALUES ('old', current_date - 31), ('edge', current_date - 30), ('new', current_date)) t(k, day)",
+    );
+    lake::commit_table(
+        &f.conn,
+        &Commit { pipeline: "p-1", table: &dated, writes: &[write("m", &rows, true)], records: &HashMap::new(), clean: false, job_id: None },
+    )
+    .unwrap();
+    assert_eq!(f.rows("SELECT k FROM lake.\"p-1\".t"), vec!["edge", "new"]);
 }

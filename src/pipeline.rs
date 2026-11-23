@@ -398,6 +398,7 @@ mod tests {
         PipelineConfig {
             version: 1,
             source_containers: vec![SourceContainer {
+                retention_days: None,
                 id: "src".into(),
                 name: "Src".into(),
                 path_prefix: "raw/src/".into(),
@@ -444,6 +445,7 @@ mod tests {
                 }],
             }],
             analytic_tables: vec![AnalyticTable {
+                retention: None,
                 id: "t".into(),
                 name: "T".into(),
                 schema: vec![ColumnSchema {
@@ -757,6 +759,7 @@ mod tests {
     /// Build a minimal AnalyticTable for tests.
     fn test_table(id: &str, partition_keys: &[&str], dedup_keys: &[&str]) -> AnalyticTable {
         AnalyticTable {
+            retention: None,
             id: id.into(),
             name: id.into(),
             schema: vec![],

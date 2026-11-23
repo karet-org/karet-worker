@@ -17,7 +17,7 @@ use crate::config::{Mapping, PipelineConfig};
 /// Bump when the worker changes what a mapping produces from the same inputs.
 const OUTPUT_FORMAT: u32 = 1;
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourceObject {
     pub key: String,
     pub etag: String,
@@ -29,6 +29,12 @@ pub struct MappingSources {
     pub fingerprint: String,
     /// Sorted by key.
     pub files: Vec<SourceObject>,
+    /// Loaded files past their source's retention, from when they leave
+    /// `files` until they are no longer in the lake. They are not inputs, so a
+    /// file whose delete failed, or the same file uploaded again, is not read
+    /// twice. Sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expired: Vec<SourceObject>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -38,8 +44,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Hash of everything besides the source files that decides `mapping`'s
 /// output. `dimension_files` must be sorted.
 pub fn fingerprint(cfg: &PipelineConfig, mapping: &Mapping, dimension_files: &[SourceObject]) -> String {
-    let source = cfg.source_containers.iter().find(|s| s.id == mapping.source_container_id);
-    let table = cfg.analytic_tables.iter().find(|t| t.id == mapping.analytic_table_id);
+    // Retention does not change what a mapping produces from its files, and
+    // a full run after changing it would rebuild from the files that are left.
+    let source = cfg.source_containers.iter().find(|s| s.id == mapping.source_container_id).map(|s| {
+        let mut s = s.clone();
+        s.retention_days = None;
+        s
+    });
+    let table = cfg.analytic_tables.iter().find(|t| t.id == mapping.analytic_table_id).map(|t| {
+        let mut t = t.clone();
+        t.retention = None;
+        t
+    });
     // serde_json's map sorts keys, so the encoding is stable.
     let doc = serde_json::json!({
         "output_format": OUTPUT_FORMAT,
@@ -50,6 +66,31 @@ pub fn fingerprint(cfg: &PipelineConfig, mapping: &Mapping, dimension_files: &[S
         "dimension_files": dimension_files,
     });
     sha256_hex(doc.to_string().as_bytes())
+}
+
+/// The files of one source that are past its retention and can be deleted:
+/// uploaded before `cutoff` (Unix seconds) and loaded, with the same ETag, by
+/// every mapping that reads the source under its current config. `readers`
+/// holds each such mapping's record and current fingerprint; a source no
+/// mapping reads keeps all its files.
+pub fn expired_files(
+    listing: &[(SourceObject, Option<i64>)],
+    cutoff: i64,
+    readers: &[(Option<&MappingSources>, &str)],
+) -> HashSet<SourceObject> {
+    if readers.is_empty() {
+        return HashSet::new();
+    }
+    let loaded = |o: &SourceObject| {
+        readers.iter().all(|(record, fingerprint)| {
+            record.is_some_and(|r| r.fingerprint == *fingerprint && r.files.binary_search(o).is_ok())
+        })
+    };
+    listing
+        .iter()
+        .filter(|(o, modified)| modified.is_some_and(|m| m < cutoff) && loaded(o))
+        .map(|(o, _)| o.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +184,7 @@ mod tests {
     }
 
     fn record(files: &[SourceObject]) -> MappingSources {
-        MappingSources { mapping_id: "m".into(), fingerprint: "fp".into(), files: files.to_vec() }
+        MappingSources { mapping_id: "m".into(), fingerprint: "fp".into(), files: files.to_vec(), expired: vec![] }
     }
 
     #[test]
@@ -203,7 +244,15 @@ mod tests {
     fn cfg_with(table: AnalyticTable) -> PipelineConfig {
         PipelineConfig {
             version: 1,
-            source_containers: vec![],
+            source_containers: vec![crate::config::SourceContainer {
+                id: "src".into(),
+                name: "src".into(),
+                path_prefix: "src/".into(),
+                format: Default::default(),
+                schema: vec![],
+                record_filter: None,
+                retention_days: None,
+            }],
             dimensions: vec![],
             mappings: vec![mapping()],
             analytic_tables: vec![table],
@@ -224,6 +273,7 @@ mod tests {
 
     fn table(partition_keys: &[&str], dedup_keys: &[&str]) -> AnalyticTable {
         AnalyticTable {
+            retention: None,
             id: "t".into(),
             name: "T".into(),
             schema: vec![],
@@ -242,5 +292,35 @@ mod tests {
         assert_ne!(fingerprint(&a, &mapping(), &[]), base);
         let b = cfg_with(table(&["month"], &["id"]));
         assert_ne!(fingerprint(&b, &mapping(), &[obj("dim.csv", "1")]), base, "a dimension file is an input");
+    }
+
+    #[test]
+    fn expired_files_must_be_old_and_loaded_by_every_reader_under_the_current_config() {
+        let listing = vec![(obj("a", "1"), Some(100)), (obj("b", "1"), Some(100)), (obj("c", "1"), Some(300)), (obj("d", "1"), None)];
+        let full = MappingSources { mapping_id: "m".into(), fingerprint: "fp".into(), files: vec![obj("a", "1"), obj("b", "1"), obj("c", "1"), obj("d", "1")], expired: vec![] };
+        let partial = MappingSources { files: vec![obj("a", "1")], ..full.clone() };
+        let names = |set: HashSet<SourceObject>| { let mut v: Vec<_> = set.into_iter().map(|o| o.key).collect(); v.sort(); v };
+        // c is too new, d has no upload time.
+        assert_eq!(names(expired_files(&listing, 200, &[(Some(&full), "fp")])), vec!["a", "b"]);
+        // b is not loaded by the second mapping yet.
+        assert_eq!(names(expired_files(&listing, 200, &[(Some(&full), "fp"), (Some(&partial), "fp")])), vec!["a"]);
+        // A changed config will run in full, so nothing is deleted this run.
+        assert!(expired_files(&listing, 200, &[(Some(&full), "new")]).is_empty());
+        assert!(expired_files(&listing, 200, &[(None, "fp")]).is_empty());
+        assert!(expired_files(&listing, 200, &[]).is_empty());
+        // A replaced file (new ETag) is not the one that was loaded.
+        let replaced = vec![(obj("a", "2"), Some(100))];
+        assert!(expired_files(&replaced, 200, &[(Some(&full), "fp")]).is_empty());
+    }
+
+    #[test]
+    fn fingerprint_ignores_retention() {
+        let mut a = cfg_with(table(&["month"], &["id"]));
+        let base = fingerprint(&a, &mapping(), &[]);
+        a.analytic_tables[0].retention = Some(crate::config::RowRetention { column: "d".into(), days: 30 });
+        for s in &mut a.source_containers {
+            s.retention_days = Some(7);
+        }
+        assert_eq!(fingerprint(&a, &mapping(), &[]), base);
     }
 }
